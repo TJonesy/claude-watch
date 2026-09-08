@@ -680,6 +680,30 @@ stale_heartbeat_min = 15
 # the 60s active-agents cron). The `--no-binding-grace-secs` CLI flag
 # overrides per-run. Workload/hostjob-scoped items are exempt.
 no_binding_grace_secs = 150
+# --- Orphaned-running HARD GATE + escalation (mechanisms 1 & 2) ---
+# A `running` item whose bound agent is CONFIRMED dead (active-agents
+# alive=false AND in_flight_tool_use=false) past `hard_gate_grace_secs` is
+# written to <state-dir>/queue-hard-gate-pending.json, which the obligations
+# `eval-orphaned-running-hard-gate` evaluator reads to HARD-BLOCK the main
+# loop's non-exempt Bash until the item is RESOLVED (done/abandon/resurrect)
+# -- NOT clearable by event-ack. Set false to make the gate inert (the daemon
+# then writes an empty pending file each tick).
+hard_gate_enabled = true
+# Grace (seconds) a dead agent's transcript must be quiet before its running
+# item becomes a HARD-gate orphan. Deliberately long (>> no_binding_grace_secs)
+# so the load-bearing gate fires only well past transient snapshot staleness
+# and any legitimate quiet period. Default 600 (10 min).
+hard_gate_grace_secs = 600
+# Minimum interval (seconds) between pushover escalations for the SAME orphan,
+# so a persistent orphan re-alerts periodically (never blind) without spamming
+# every cron tick. Default 1800 (30 min).
+orphan_escalate_cooldown_secs = 1800
+# Optional release valve: auto-abandon (`session-task queue abandon
+# --confirmed-dead`, which refuses if the agent is somehow alive) a confirmed
+# orphan whose agent has been dead this many seconds, so an AFK operator's loop
+# is not hard-gated indefinitely. 0 disables (default): the operator resolves
+# via the pushover alert. When set, use a value well above hard_gate_grace_secs.
+orphan_auto_abandon_secs = 0
 
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.

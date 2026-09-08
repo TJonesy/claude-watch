@@ -81,6 +81,28 @@ pub const DEFAULT_STALE_HEARTBEAT_MIN: u64 = 15;
 /// no_binding_grace_secs` or `--no-binding-grace-secs`.
 pub const DEFAULT_NO_BINDING_GRACE_SECS: u64 = 150;
 
+/// Default grace window (seconds) before a GENUINELY-DEAD `running` item is
+/// written to the hard-gate pending file (which BLOCKS the main loop until
+/// the item is resolved). Deliberately much longer than
+/// `DEFAULT_NO_BINDING_GRACE_SECS`: the hard gate is load-bearing, so it
+/// must fire only well past transient active-agents snapshot staleness and
+/// past any legitimate agent quiet period. 600s (10 min). Overridable via
+/// `[queue_check] hard_gate_grace_secs` or `--hard-gate-grace-secs`.
+pub const DEFAULT_HARD_GATE_GRACE_SECS: u64 = 600;
+
+/// Default minimum interval (seconds) between operator escalations
+/// (pushover + tmux-inject) for the SAME orphaned qid. 1800s (30 min).
+pub const DEFAULT_ORPHAN_ESCALATE_COOLDOWN_SECS: u64 = 1800;
+
+/// Default: is the orphaned-running HARD GATE enabled? `[queue_check]
+/// hard_gate_enabled` overrides. Default true (the safety mechanism is on).
+pub const DEFAULT_HARD_GATE_ENABLED: bool = true;
+
+/// Default grace (seconds) before a confirmed-dead orphan is AUTO-ABANDONED
+/// as a release valve for an indefinite hard-gate block. 0 = disabled
+/// (default): the operator resolves via the pushover alert instead.
+pub const DEFAULT_ORPHAN_AUTO_ABANDON_SECS: u64 = 0;
+
 /// Max number of ids to list inline in the human-readable `message`.
 pub const TOP_N: usize = 3;
 
@@ -183,6 +205,14 @@ pub enum AgentLiveness {
     Dead {
         agent_id: String,
         age_secs: Option<u64>,
+        /// True iff the dead agent's freshest transcript ended on an
+        /// un-answered `tool_use` (`AgentRecord::in_flight_tool_use`) — the
+        /// agent is/was PARKED inside a long-running tool call, not
+        /// necessarily gone. The soft `queue-orphaned` event ignores this
+        /// (a stale transcript is still worth surfacing), but the
+        /// load-bearing HARD gate EXCLUDES it: a parked-but-quiet agent must
+        /// never block the main loop (`compute_hard_gate_orphans`).
+        in_flight_tool_use: bool,
     },
     /// State loaded, but NO matching agent record for this qid — the
     /// never-spawned / agent-died-without-a-transcript case. Orphaned only
@@ -423,7 +453,7 @@ where
                 // path would false-positive here).
                 continue;
             }
-            AgentLiveness::Dead { agent_id, age_secs } => {
+            AgentLiveness::Dead { agent_id, age_secs, .. } => {
                 // Grace for a JUST-registered / just-resumed item: a `Dead`
                 // verdict can come from a STALE active-agents snapshot that
                 // predates the resume. The q-bad6 incident: an agent was
@@ -773,6 +803,7 @@ fn agent_liveness_for(
         Some(rec) => AgentLiveness::Dead {
             agent_id: rec.agent_id.clone(),
             age_secs: rec.jsonl_age_seconds,
+            in_flight_tool_use: rec.in_flight_tool_use,
         },
         None => AgentLiveness::NoRecord,
     }
@@ -786,6 +817,321 @@ fn config_emit_events() -> bool {
         Err(_) => false,
     }
 }
+
+// ===========================================================================
+// Orphaned-running HARD GATE (mechanism 1) + pushover escalation (mechanism 2)
+// ===========================================================================
+//
+// The soft `compute_qualifying` path emits a single, permanently-deduped
+// `queue-orphaned` claude-event that any `event-ack ack-batch` clears -- so a
+// running item whose bound agent died sat RUNNING+ORPHAN indefinitely with no
+// re-alert (q-2026-09-08-95cd, 47 min). These two mechanisms fix that:
+//
+//   1. HARD GATE: write the CONFIRMED-dead orphan set to a pending file the
+//      obligations `eval-orphaned-running-hard-gate` evaluator reads, blocking
+//      the main loop's non-exempt Bash until the item is actually RESOLVED
+//      (done/abandon/resurrect) -- NOT satisfiable by event-ack.
+//   2. ESCALATION: fire a pushover alert per orphan on its own cooldown, so
+//      the operator is never blind to a persistent orphan.
+//
+// The gate keys STRICTLY on the authoritative active-agents liveness verdict:
+// an item is a hard-gate orphan ONLY when its bound agent is `alive=false` AND
+// `in_flight_tool_use=false` (NOT parked in a long tool call) with a KNOWN
+// transcript age past `hard_gate_grace_secs`, AND past the register grace.
+// EVERY other case (Alive, NoRecord, Unknown state, in_flight true, unknown
+// age, just-registered) DEFAULT-OPENS -- never a hard orphan.
+
+/// One confirmed orphaned-running item for the hard gate.
+#[derive(Debug, Clone)]
+pub struct HardGateOrphan {
+    pub id: String,
+    pub agent_id: String,
+    pub summary: String,
+    /// Seconds since the dead agent's freshest transcript (for the banner).
+    pub age_secs: Option<u64>,
+}
+
+/// Pure: compute the CONFIRMED hard-gate orphan set. Default-open on ANY
+/// ambiguity -- only an unambiguously-dead, long-quiet, not-in-flight,
+/// past-register-grace `running` item qualifies.
+pub fn compute_hard_gate_orphans<G>(
+    items: &[QueueItem],
+    now_epoch_secs: i64,
+    no_binding_grace_secs: i64,
+    hard_gate_grace_secs: i64,
+    mut agent_lookup: G,
+) -> Vec<HardGateOrphan>
+where
+    G: FnMut(&str) -> AgentLiveness,
+{
+    let mut out: Vec<HardGateOrphan> = Vec::new();
+    for it in items {
+        if it.id.is_empty() || it.status != "running" {
+            continue;
+        }
+        // ONLY the Dead verdict can hard-gate; Alive / NoRecord / Unknown all
+        // default-open (never block).
+        if let AgentLiveness::Dead {
+            agent_id,
+            age_secs,
+            in_flight_tool_use,
+        } = agent_lookup(&it.id)
+        {
+            // Parked inside a long-running tool call -> alive-in-spirit; NEVER
+            // a hard orphan (the load-bearing exclusion).
+            if in_flight_tool_use {
+                continue;
+            }
+            // Must be past the register grace (guards a stale active-agents
+            // snapshot that predates a just-registered / just-resumed item).
+            let past_register = register_age_secs(it, now_epoch_secs)
+                .map(|a| a >= no_binding_grace_secs)
+                .unwrap_or(false);
+            // Must have a KNOWN transcript age past the (long) hard grace.
+            // Unknown age => default-open (skip).
+            let dead_long = age_secs
+                .map(|a| a as i64 >= hard_gate_grace_secs)
+                .unwrap_or(false);
+            if past_register && dead_long {
+                let summary = it
+                    .summary
+                    .clone()
+                    .or_else(|| it.description.clone())
+                    .unwrap_or_else(|| "(no summary)".to_string());
+                out.push(HardGateOrphan {
+                    id: it.id.clone(),
+                    agent_id,
+                    summary,
+                    age_secs,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Atomically (over)write the hard-gate pending file. An EMPTY `orphans`
+/// clears it (so the obligations gate stops firing once nothing is orphaned).
+pub fn write_hard_gate_pending(
+    path: &Path,
+    orphans: &[HardGateOrphan],
+    now_iso: &str,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let pending: Vec<serde_json::Value> = orphans
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "queue_id": o.id,
+                "agent_id": o.agent_id,
+                "summary": o.summary,
+                "age_secs": o.age_secs,
+                "detected_at": now_iso,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "pending": pending, "updated_at": now_iso });
+    let s = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{\"pending\":[]}".to_string());
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, s + "\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Pure: decide which orphans to escalate (pushover) this tick and return the
+/// next per-qid last-escalation ledger (pruned to the current orphan set).
+pub fn compute_escalations(
+    orphans: &[HardGateOrphan],
+    escalate_state: &State,
+    now_epoch_secs: i64,
+    cooldown_secs: i64,
+    now_iso: &str,
+) -> (Vec<String>, State) {
+    let mut to_alert: Vec<String> = Vec::new();
+    let mut next: State = State::new();
+    for o in orphans {
+        let last = escalate_state.get(&o.id).and_then(|s| parse_iso_epoch_secs(s));
+        let due = match last {
+            Some(prev) => (now_epoch_secs - prev) >= cooldown_secs,
+            None => true,
+        };
+        if due {
+            to_alert.push(o.id.clone());
+            next.insert(o.id.clone(), now_iso.to_string());
+        } else if let Some(prev) = escalate_state.get(&o.id) {
+            next.insert(o.id.clone(), prev.clone());
+        }
+    }
+    (to_alert, next)
+}
+
+/// Resolve the hard-gate config knobs (config wins, else built-in defaults).
+fn hard_gate_knobs() -> (bool, i64, i64, i64) {
+    match crate::config::try_load_config() {
+        Ok(cfg) => (
+            cfg.queue_check.hard_gate_enabled,
+            cfg.queue_check.hard_gate_grace_secs as i64,
+            cfg.queue_check.orphan_escalate_cooldown_secs as i64,
+            cfg.queue_check.orphan_auto_abandon_secs as i64,
+        ),
+        Err(_) => (
+            DEFAULT_HARD_GATE_ENABLED,
+            DEFAULT_HARD_GATE_GRACE_SECS as i64,
+            DEFAULT_ORPHAN_ESCALATE_COOLDOWN_SECS as i64,
+            DEFAULT_ORPHAN_AUTO_ABANDON_SECS as i64,
+        ),
+    }
+}
+
+/// Synchronous pushover: mirrors `alert::send_pingme_with_priority` from the
+/// sync cron path. Runs `$CLAUDE_WATCH_NOTIFY_CMD -p <priority> <message>`
+/// with a bounded timeout; unset/empty env var => silent no-op.
+fn send_pushover_sync(message: &str, priority: &str) {
+    let cmd = match std::env::var("CLAUDE_WATCH_NOTIFY_CMD") {
+        Ok(c) if !c.is_empty() => c,
+        _ => return,
+    };
+    let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+    let (prog, rest) = match parts.split_first() {
+        Some(x) => x,
+        None => return,
+    };
+    let mut args: Vec<String> = rest.to_vec();
+    args.push("-p".to_string());
+    args.push(priority.to_string());
+    args.push(message.to_string());
+    let prog = prog.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Command::new(&prog).args(&args).output());
+    });
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(15));
+}
+
+/// Run a session-task subcommand returning raw stdout (for `queue abandon`,
+/// whose output is not the JSON array `run_session_task_json` expects).
+fn run_session_task_raw(cli: &Path, args: &[&str], timeout_secs: u64) -> Result<String, String> {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+    let cli_owned = cli.to_path_buf();
+    let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(Command::new(&cli_owned).args(&args_owned).output());
+    });
+    let out = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("session-task exec failed: {e}")),
+        Err(_) => return Err(format!("session-task timed out after {timeout_secs}s")),
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "session-task exited non-zero (rc={:?}): stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Orchestrate the hard gate: compute the confirmed orphan set, (re)write the
+/// pending file, escalate via pushover on cooldown, and optionally auto-abandon
+/// as a last-resort release valve. Best-effort throughout.
+#[allow(clippy::too_many_arguments)]
+fn run_hard_gate(
+    items: &[QueueItem],
+    agent_map: &std::collections::HashMap<String, crate::active_agents::AgentRecord>,
+    state_present: bool,
+    now_epoch: i64,
+    no_binding_grace_secs: i64,
+    state_dir: &Path,
+    cli: &Path,
+    dry_run: bool,
+) {
+    let (enabled, hard_grace, cooldown, auto_abandon) = hard_gate_knobs();
+    let orphans = if enabled {
+        compute_hard_gate_orphans(items, now_epoch, no_binding_grace_secs, hard_grace, |qid| {
+            agent_liveness_for(agent_map, state_present, qid)
+        })
+    } else {
+        Vec::new()
+    };
+
+    let now_iso = chrono::Local::now().to_rfc3339();
+    let pending_path = state_dir.join("queue-hard-gate-pending.json");
+
+    if dry_run {
+        println!(
+            "[hard-gate] would write {} orphan(s) to {}",
+            orphans.len(),
+            pending_path.display()
+        );
+        for o in &orphans {
+            println!("  - {} (agent {}, {})", o.id, o.agent_id, fmt_age(o.age_secs));
+        }
+        return;
+    }
+
+    // (1) Maintain the pending file EVERY tick (empty clears the gate).
+    if let Err(e) = write_hard_gate_pending(&pending_path, &orphans, &now_iso) {
+        eprintln!("queue-check: hard-gate pending write failed ({e}); continuing");
+    }
+
+    // (2) Pushover escalation with per-qid cooldown.
+    let esc_path = state_dir.join("queue-orphan-escalate-state.json");
+    let esc_state = load_state(&esc_path);
+    let (to_alert, next_esc) =
+        compute_escalations(&orphans, &esc_state, now_epoch, cooldown, &now_iso);
+    for qid in &to_alert {
+        if let Some(o) = orphans.iter().find(|o| &o.id == qid) {
+            let msg = format!(
+                "claude-watch: queue {} ORPHANED-RUNNING -- agent {} dead {}; main loop HARD-GATED until resolved (done/abandon/resurrect). [{}]",
+                o.id,
+                o.agent_id,
+                fmt_age(o.age_secs),
+                o.summary
+            );
+            send_pushover_sync(&msg, "high");
+            eprintln!("[hard-gate] pushover escalation for orphan {}", o.id);
+        }
+    }
+    if next_esc != esc_state {
+        if let Err(e) = save_state(&esc_path, &next_esc) {
+            eprintln!("queue-check: escalate-state save failed ({e}); continuing");
+        }
+    }
+
+    // (3) Optional auto-abandon backstop (release valve; default OFF). Uses
+    // `--confirmed-dead`, whose own live-agent guard refuses if the agent is
+    // somehow alive -- so this can never abandon a live item.
+    if auto_abandon > 0 {
+        for o in &orphans {
+            if o.age_secs.map(|a| a as i64 >= auto_abandon).unwrap_or(false) {
+                let reason = format!(
+                    "auto-abandoned by claude-watch: orphaned-running, agent {} dead {} (> {}s grace)",
+                    o.agent_id,
+                    fmt_age(o.age_secs),
+                    auto_abandon
+                );
+                match run_session_task_raw(
+                    cli,
+                    &["queue", "abandon", &o.id, "--confirmed-dead", "--reason", &reason],
+                    15,
+                ) {
+                    Ok(_) => eprintln!("[hard-gate] auto-abandoned orphan {}", o.id),
+                    Err(e) => eprintln!("[hard-gate] auto-abandon of {} failed: {}", o.id, e),
+                }
+            }
+        }
+    }
+}
+
 
 /// CLI entry point. Returns the process exit code.
 ///
@@ -840,6 +1186,24 @@ pub fn cmd_queue_check(
         grace_secs,
         pid_is_alive,
         |qid| agent_liveness_for(&agent_map, state_present, qid),
+    );
+
+    // ---- Orphaned-running HARD GATE + pushover escalation (mechanisms 1 & 2).
+    // Runs EVERY tick, independent of `emit_events` and the soft dedup ledger:
+    // the hard-gate pending file is a load-bearing SAFETY mechanism (rewritten
+    // + pruned to empty when clear so the obligations gate clears), and the
+    // pushover escalation re-fires on its OWN cooldown regardless of the soft
+    // event's permanent single-emit suppression (the root of the 47-min blind
+    // spot on q-2026-09-08-95cd).
+    run_hard_gate(
+        &all_items,
+        &agent_map,
+        state_present,
+        now_epoch,
+        grace_secs,
+        &state_dir,
+        &cli,
+        dry_run,
     );
 
     // Always persist the pruned state (cleans up finished items).
@@ -1004,6 +1368,7 @@ mod tests {
         AgentLiveness::Dead {
             agent_id: "agent-dead01".to_string(),
             age_secs: Some(240),
+            in_flight_tool_use: false,
         }
     }
     fn all_agents_no_record(_qid: &str) -> AgentLiveness {
@@ -1012,6 +1377,154 @@ mod tests {
 
     // Default grace window used by legacy tests (matches the const).
     const GRACE: i64 = 150;
+    // ---- Orphaned-running hard-gate tests (mechanisms 1 & 2) ----
+    fn running_item_registered(id: &str, reg_min_ago: i64) -> QueueItem {
+        QueueItem {
+            id: id.to_string(),
+            status: "running".to_string(),
+            summary: Some(format!("summary for {id}")),
+            description: None,
+            pid: None,
+            last_heartbeat_at: None,
+            registered_at: Some(iso_n_min_ago(reg_min_ago)),
+            started_at: None,
+            scope: Vec::new(),
+            wedged_reason: None,
+        }
+    }
+
+    fn dead_lookup(age: Option<u64>, in_flight: bool) -> impl FnMut(&str) -> AgentLiveness {
+        move |_qid: &str| AgentLiveness::Dead {
+            agent_id: "agent-x".to_string(),
+            age_secs: age,
+            in_flight_tool_use: in_flight,
+        }
+    }
+
+    const HARD_GRACE: i64 = 600;
+
+    #[test]
+    fn hard_gate_flags_confirmed_dead() {
+        let items = vec![running_item_registered("q-1", 60)];
+        let now = Utc::now().timestamp();
+        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(5683), false));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].id, "q-1");
+        assert_eq!(o[0].agent_id, "agent-x");
+    }
+
+    #[test]
+    fn hard_gate_excludes_in_flight_tool_use() {
+        // Parked in a long op (kubectl wait): stale transcript but in-flight ->
+        // NEVER a hard orphan (the load-bearing exclusion).
+        let items = vec![running_item_registered("q-1", 60)];
+        let now = Utc::now().timestamp();
+        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(5683), true));
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn hard_gate_defaults_open_on_unknown_age() {
+        let items = vec![running_item_registered("q-1", 60)];
+        let now = Utc::now().timestamp();
+        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(None, false));
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn hard_gate_respects_hard_grace() {
+        // age 300s < hard grace 600s -> not yet a hard orphan.
+        let items = vec![running_item_registered("q-1", 60)];
+        let now = Utc::now().timestamp();
+        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(300), false));
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn hard_gate_respects_register_grace() {
+        // registered just now (< register grace) -> stale-snapshot guard
+        // suppresses even a dead verdict.
+        let items = vec![running_item_registered("q-1", 0)];
+        let now = Utc::now().timestamp();
+        let o = compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, dead_lookup(Some(5683), false));
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn hard_gate_default_open_alive_norecord_unknown() {
+        let items = vec![running_item_registered("q-1", 60)];
+        let now = Utc::now().timestamp();
+        assert!(compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, all_agents_alive).is_empty());
+        assert!(compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, all_agents_no_record).is_empty());
+        assert!(compute_hard_gate_orphans(&items, now, GRACE, HARD_GRACE, no_agents).is_empty());
+    }
+
+    #[test]
+    fn hard_gate_only_running_status() {
+        let mut it = running_item_registered("q-1", 60);
+        it.status = "blocked".to_string();
+        let now = Utc::now().timestamp();
+        let o = compute_hard_gate_orphans(&[it], now, GRACE, HARD_GRACE, dead_lookup(Some(5683), false));
+        assert!(o.is_empty());
+    }
+
+    #[test]
+    fn escalation_fires_then_cooldowns() {
+        let orphans = vec![HardGateOrphan {
+            id: "q-1".to_string(),
+            agent_id: "a".to_string(),
+            summary: "s".to_string(),
+            age_secs: Some(700),
+        }];
+        let now = Utc::now().timestamp();
+        let now_iso = Utc::now().to_rfc3339();
+        let (alert1, state1) = compute_escalations(&orphans, &State::new(), now, 1800, &now_iso);
+        assert_eq!(alert1, vec!["q-1".to_string()]);
+        assert!(state1.contains_key("q-1"));
+        // within cooldown -> no re-alert
+        let (alert2, _s2) = compute_escalations(&orphans, &state1, now + 60, 1800, &now_iso);
+        assert!(alert2.is_empty());
+        // past cooldown -> fires again
+        let (alert3, _s3) =
+            compute_escalations(&orphans, &state1, now + 2000, 1800, &Utc::now().to_rfc3339());
+        assert_eq!(alert3, vec!["q-1".to_string()]);
+    }
+
+    #[test]
+    fn escalation_prunes_resolved() {
+        let orphans: Vec<HardGateOrphan> = vec![];
+        let mut prev = State::new();
+        prev.insert("q-old".to_string(), Utc::now().to_rfc3339());
+        let now = Utc::now().timestamp();
+        let (alert, next) = compute_escalations(&orphans, &prev, now, 1800, &Utc::now().to_rfc3339());
+        assert!(alert.is_empty());
+        assert!(next.is_empty(), "resolved qid pruned from escalate ledger");
+    }
+
+    #[test]
+    fn write_hard_gate_pending_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cw-hgtest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("queue-hard-gate-pending.json");
+        let orphans = vec![HardGateOrphan {
+            id: "q-1".to_string(),
+            agent_id: "a-1".to_string(),
+            summary: "sum".to_string(),
+            age_secs: Some(5683),
+        }];
+        write_hard_gate_pending(&path, &orphans, "2026-09-08T00:00:00Z").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["pending"][0]["queue_id"], "q-1");
+        assert_eq!(v["pending"][0]["agent_id"], "a-1");
+        // empty overwrite clears
+        write_hard_gate_pending(&path, &[], "2026-09-08T00:01:00Z").unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v2["pending"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn orphaned_when_pid_dead() {

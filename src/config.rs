@@ -1588,6 +1588,33 @@ pub struct QueueCheckConfig {
     /// heartbeat, not an agent transcript).
     #[serde(default = "default_queue_check_no_binding_grace_secs")]
     pub no_binding_grace_secs: u64,
+    /// Grace window (seconds) before a GENUINELY-DEAD `running` item (its
+    /// bound agent completed or is gone — NOT merely quiet / parked in a long
+    /// tool call) is written to the hard-gate pending file that BLOCKS the
+    /// main loop until the item is resolved. Much longer than
+    /// `no_binding_grace_secs`: the hard gate is load-bearing, so it must fire
+    /// only well past transient active-agents snapshot staleness. Default
+    /// 600s (10 min). `--hard-gate-grace-secs` overrides per-run.
+    #[serde(default = "default_queue_check_hard_gate_grace_secs")]
+    pub hard_gate_grace_secs: u64,
+    /// Minimum interval (seconds) between operator escalations (pushover +
+    /// tmux-inject) for the SAME orphaned item, so a persistent orphan does
+    /// not re-alert every cron tick. Default 1800s (30 min).
+    #[serde(default = "default_queue_check_orphan_escalate_cooldown_secs")]
+    pub orphan_escalate_cooldown_secs: u64,
+    /// Master switch for the orphaned-running HARD GATE (mechanism 1). When
+    /// false, the daemon writes an EMPTY hard-gate pending file each tick so
+    /// the obligations gate is inert (never blocks), and skips escalation +
+    /// auto-abandon. Default true.
+    #[serde(default = "default_queue_check_hard_gate_enabled")]
+    pub hard_gate_enabled: bool,
+    /// Grace (seconds) before a confirmed-dead orphaned `running` item is
+    /// AUTO-ABANDONED (`session-task queue abandon --confirmed-dead`) as a
+    /// release valve for an otherwise-indefinite hard-gate block while the
+    /// operator is AFK. 0 disables (default) -- the operator resolves via the
+    /// pushover alert. When set, must be well above `hard_gate_grace_secs`.
+    #[serde(default = "default_queue_check_orphan_auto_abandon_secs")]
+    pub orphan_auto_abandon_secs: u64,
 }
 
 impl Default for QueueCheckConfig {
@@ -1596,6 +1623,10 @@ impl Default for QueueCheckConfig {
             emit_events: default_queue_check_emit_events(),
             stale_heartbeat_min: default_queue_check_stale_heartbeat_min(),
             no_binding_grace_secs: default_queue_check_no_binding_grace_secs(),
+            hard_gate_grace_secs: default_queue_check_hard_gate_grace_secs(),
+            orphan_escalate_cooldown_secs: default_queue_check_orphan_escalate_cooldown_secs(),
+            hard_gate_enabled: default_queue_check_hard_gate_enabled(),
+            orphan_auto_abandon_secs: default_queue_check_orphan_auto_abandon_secs(),
         }
     }
 }
@@ -1610,6 +1641,22 @@ fn default_queue_check_stale_heartbeat_min() -> u64 {
 
 fn default_queue_check_no_binding_grace_secs() -> u64 {
     150
+}
+
+fn default_queue_check_hard_gate_grace_secs() -> u64 {
+    600
+}
+
+fn default_queue_check_orphan_escalate_cooldown_secs() -> u64 {
+    1800
+}
+
+fn default_queue_check_hard_gate_enabled() -> bool {
+    true
+}
+
+fn default_queue_check_orphan_auto_abandon_secs() -> u64 {
+    0
 }
 
 /// Config for the daemon's cadence events. The daemon emits two
