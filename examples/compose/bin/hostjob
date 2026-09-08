@@ -155,7 +155,8 @@ def elapsed_str(started_at, ended_at=None):
 
 def reconcile(label):
     """Read status; if marked running but pid is gone and no rc was recorded,
-    mark it crashed. Returns the (possibly updated) status dict or None."""
+    mark it crashed. Also self-heals a stuck-pending queue row. Returns the
+    (possibly updated) status dict or None."""
     st = read_status(label)
     if st is None:
         return None
@@ -169,6 +170,23 @@ def reconcile(label):
             st["rc"] = st.get("rc")
             st["ended_at"] = st.get("ended_at") or time.time()
             write_status(label, st)
+            return st
+        # Self-heal: `cmd_run` registers the queue item (pending -> running)
+        # BEFORE the worker is even launched, and that single attempt is
+        # fail-soft (transient lock contention, or a momentary not-ready-head
+        # race right after `queue add`, both leave it False/unset with no
+        # retry). Left alone, that permanently strands the row `pending`
+        # even though the worker is demonstrably alive here — the q-site then
+        # shows no live tail for a running job. `reconcile()` is the funnel
+        # for poll/wait/list/stop, so retry here on every call until it
+        # succeeds once (`queue_registered is not True` covers both an
+        # explicit False and status.json predating this field).
+        qid = st.get("queue_id")
+        if qid and st.get("queue_registered") is not True:
+            st_bin = shutil.which("session-task")
+            if st_bin and _queue_register(st_bin, qid, if_absent=True):
+                st["queue_registered"] = True
+                write_status(label, st)
     return st
 
 
@@ -201,6 +219,40 @@ def _describe_cmd(label, cmd):
         return label
 
 
+def _queue_register(st_bin, qid, if_absent=False):
+    """Run `session-task queue register <qid>` once (pending -> running).
+
+    Returns True iff the item is now (or was already, with if_absent) running;
+    False on any refusal/timeout/exception. NEVER raises — queue plumbing must
+    never block the actual host job. Split out from `_register_queue_item` so
+    `reconcile()` can retry this exact step later without re-adding the row.
+    """
+    argv = [st_bin, "queue", "register", qid]
+    if if_absent:
+        argv.append("--if-absent")
+    try:
+        reg = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+    except Exception as e:
+        sys.stderr.write(
+            "hostjob: queue register %s failed (%r) (continuing).\n" % (qid, e)
+        )
+        return False
+    if reg.returncode != 0:
+        sys.stderr.write(
+            "hostjob: queue register %s exited %d (continuing).\n%s\n"
+            % (qid, reg.returncode,
+               reg.stderr.decode("utf-8", "replace").strip())
+        )
+        return False
+    return True
+
+
 def _register_queue_item(label, cmd=None, depends_on=None, register=True):
     """Add (and optionally register) a session-task queue item for this hostjob.
 
@@ -215,16 +267,25 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
     command line — not just the bare label — is visible in the durable queue
     record. Passing ``None`` falls back to the bare label (legacy behavior).
 
-    Returns the q-id string on success, or None if queue integration is
-    unavailable or fails for any reason. NEVER raises — queue plumbing must
-    never block the actual host job.
+    Returns ``(qid, registered)``. ``qid`` is the q-id string on success, or
+    None if queue integration is unavailable or `queue add` itself fails.
+    ``registered`` is True once the row has actually claimed the
+    hostjob:<label> scope (or trivially True when register=False / --no-queue,
+    since skipping is intentional there) — and False when a `queue register`
+    attempt was made but refused/failed (e.g. transient lock contention, or a
+    momentary not-ready-head race right after `queue add`). A False here does
+    NOT mean the row is stuck forever: `reconcile()` retries `_queue_register`
+    on every poll/wait/list/stop call until it succeeds once, so a fail-soft
+    failure at launch time no longer leaves the row `pending` forever despite
+    a live worker (the bug this retry was added to fix). NEVER raises — queue
+    plumbing must never block the actual host job.
     """
     st_bin = shutil.which("session-task")
     if not st_bin:
         sys.stderr.write(
             "hostjob: session-task not on PATH — running UNqueued.\n"
         )
-        return None
+        return None, None
     scope = "hostjob:%s" % label
     description = _describe_cmd(label, cmd)
     try:
@@ -249,13 +310,13 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
         sys.stderr.write(
             "hostjob: queue add failed (%r) — running UNqueued.\n" % e
         )
-        return None
+        return None, None
     if proc.returncode != 0:
         sys.stderr.write(
             "hostjob: queue add exited %d — running UNqueued.\n%s\n"
             % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip())
         )
-        return None
+        return None, None
     try:
         info = json.loads(proc.stdout.decode("utf-8", "replace"))
         qid = info.get("id")
@@ -265,34 +326,17 @@ def _register_queue_item(label, cmd=None, depends_on=None, register=True):
         sys.stderr.write(
             "hostjob: queue add gave no q-id — running UNqueued.\n"
         )
-        return None
+        return None, None
     # When register=False (--no-queue), STOP here: the row exists (pending,
     # visible, dependable) but does NOT claim/serialize the hostjob:<label>
     # scope. The reaper still auto-closes it (done/abandon work on any status).
     if not register:
-        return qid
+        return qid, True
     # Claim the slot. register can refuse on scope conflict; treat any
     # non-zero / error as fail-soft (job runs, reaper just won't be able to
     # flip a registered item — done/abandon on a pending item still works).
-    try:
-        reg = subprocess.run(
-            [st_bin, "queue", "register", qid],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20,
-        )
-        if reg.returncode != 0:
-            sys.stderr.write(
-                "hostjob: queue register %s exited %d (continuing).\n%s\n"
-                % (qid, reg.returncode,
-                   reg.stderr.decode("utf-8", "replace").strip())
-            )
-    except Exception as e:
-        sys.stderr.write(
-            "hostjob: queue register %s failed (%r) (continuing).\n" % (qid, e)
-        )
-    return qid
+    # `reconcile()` retries this if it comes back False.
+    return qid, _queue_register(st_bin, qid)
 
 
 # --------------------------------------------------------------------------
@@ -601,7 +645,7 @@ def cmd_run(args):
     # skips the scope-claiming `register` step (register=False → row stays
     # pending/non-serializing but visible + dependable). Fail-soft: queue_id
     # stays None if anything goes wrong.
-    queue_id = _register_queue_item(
+    queue_id, queue_registered = _register_queue_item(
         label,
         cmd=cmd,
         depends_on=getattr(args, "depends_on", None),
@@ -632,6 +676,7 @@ def cmd_run(args):
             "started_at": started,
             "ended_at": None,
             "queue_id": queue_id,
+            "queue_registered": queue_registered,
         },
     )
 
@@ -644,6 +689,11 @@ def cmd_run(args):
     env["HOSTJOB_STARTED"] = repr(started)
     env["HOSTJOB_CMD_JSON"] = json.dumps(cmd)
     env["HOSTJOB_QUEUE_ID"] = queue_id or ""
+    # So the reaper's own status.json rewrites (once it knows the worker pid,
+    # and on exit) don't clobber a successful registration back to "unknown"
+    # -- which would just make reconcile()'s self-heal redo a harmless but
+    # wasteful --if-absent register call on the next poll.
+    env["HOSTJOB_QUEUE_REGISTERED"] = "1" if queue_registered else ""
     # The reaper tees each worker line to this broker ingest URL (best-effort).
     env["HOSTJOB_BROKER_URL"] = broker_url or ""
 
@@ -695,6 +745,7 @@ cwd = os.environ.get("HOSTJOB_CWD") or None
 started = float(os.environ["HOSTJOB_STARTED"])
 cmd = json.loads(os.environ["HOSTJOB_CMD_JSON"])
 queue_id = os.environ.get("HOSTJOB_QUEUE_ID") or None
+queue_registered = os.environ.get("HOSTJOB_QUEUE_REGISTERED") == "1"
 
 def write_status(data):
     tmp = sp + ".tmp.%d" % os.getpid()
@@ -744,6 +795,35 @@ def finalize_queue(rc):
         except Exception:
             pass
 
+def register_when_live():
+    # Flip the auto-created queue item pending -> running now that the worker
+    # is actually live. cmd_run attempts this once at launch, but that attempt
+    # is fail-soft (transient lock contention / momentary not-ready-head race
+    # right after `queue add`); if it did not take, the row is stranded
+    # `pending` and the q-site shows NO live tail for a demonstrably-running
+    # job. Retry here from the detached reaper -- the one process guaranteed
+    # to run the instant the worker goes live -- so the transition does not
+    # hinge on someone later calling `hostjob poll`. `--if-absent` makes it
+    # idempotent (no-op when already running). Best-effort: a missing CLI,
+    # non-zero exit, or timeout is swallowed and left for reconcile() to
+    # retry; queue plumbing must never block or crash the reaper.
+    global queue_registered
+    if not queue_id or queue_registered:
+        return
+    st_bin = shutil.which("session-task")
+    if not st_bin:
+        return
+    try:
+        r = subprocess.run(
+            [st_bin, "queue", "register", queue_id, "--if-absent"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=20)
+        if r.returncode == 0:
+            queue_registered = True
+    except Exception:
+        pass
+
 broker_url = os.environ.get("HOSTJOB_BROKER_URL") or None
 
 def _post_line(line_bytes):
@@ -778,10 +858,14 @@ try:
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True,
     )
     worker_pid = proc.pid
+    # Now that the worker is confirmed live, ensure the queue row is
+    # running (pending -> running) so the q-site renders its live tail.
+    register_when_live()
     write_status({
         "label": label, "cmd": cmd, "cwd": cwd, "status": "running",
         "rc": None, "pid": worker_pid, "reaper_pid": os.getpid(),
         "started_at": started, "ended_at": None, "queue_id": queue_id,
+        "queue_registered": queue_registered,
     })
     # Line-buffered pump: readline() yields a chunk ending in a newline
     # (or the final partial line at EOF). Append the raw bytes to the log
@@ -812,6 +896,7 @@ write_status({
     "label": label, "cmd": cmd, "cwd": cwd, "status": status,
     "rc": rc, "pid": worker_pid, "reaper_pid": os.getpid(),
     "started_at": started, "ended_at": time.time(), "queue_id": queue_id,
+    "queue_registered": queue_registered,
 })
 
 # Queue/event finalization is the LAST thing the reaper does, and is fully
