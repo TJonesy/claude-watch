@@ -144,12 +144,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -160,12 +159,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -176,12 +174,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           },
@@ -192,12 +189,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           }
@@ -293,12 +289,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -309,12 +304,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -325,12 +319,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           },
@@ -341,12 +334,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           }
@@ -590,12 +582,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -606,12 +597,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -622,12 +612,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           },
@@ -638,12 +627,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           }
@@ -744,12 +732,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -760,12 +747,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#dc322f"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#dc322f"
+                }
               }
             ]
           },
@@ -776,12 +762,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#268bd2"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#268bd2"
+                }
               }
             ]
           },
@@ -792,12 +777,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#b58900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#b58900"
+                }
               }
             ]
           },
@@ -808,12 +792,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#d33682"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d33682"
+                }
               }
             ]
           },
@@ -824,12 +807,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#586e75"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#586e75"
+                }
               }
             ]
           },
@@ -840,12 +822,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#2aa198"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2aa198"
+                }
               }
             ]
           }
@@ -929,12 +910,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#859900"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
               }
             ]
           },
@@ -945,12 +925,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#586e75"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#586e75"
+                }
               }
             ]
           },
@@ -961,12 +940,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#d33682"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d33682"
+                }
               }
             ]
           },
@@ -977,12 +955,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#268bd2"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#268bd2"
+                }
               },
               {
                 "id": "custom.lineStyle",
@@ -1003,12 +980,11 @@
             },
             "properties": [
               {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#2aa198"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2aa198"
+                }
               },
               {
                 "id": "custom.lineStyle",
