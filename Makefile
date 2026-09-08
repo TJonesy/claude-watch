@@ -263,6 +263,7 @@ test-event-must-act: ## event-must-act toolchain self-tests
 	python3 tools/event-must-act/event-classify --self-test
 	python3 tools/event-must-act/event-ack --self-test
 	python3 tools/event-must-act/eval-event-must-act --self-test
+	python3 container/bin/eval-orphaned-running-hard-gate --self-test
 	tools/event-must-act/tests/cw-watcher-health-check.test
 	tools/event-must-act/tests/producer-tier-e2e.test
 
@@ -699,6 +700,7 @@ TOOL_LINKS := \
 	event-classify=tools/event-must-act/event-classify \
 	event-ack=tools/event-must-act/event-ack \
 	eval-event-must-act=tools/event-must-act/eval-event-must-act \
+	eval-orphaned-running-hard-gate=container/bin/eval-orphaned-running-hard-gate \
 	user-prompt-ambient-inject-hook=tools/event-must-act/user-prompt-ambient-inject-hook \
 	cw-watcher-health-check=tools/event-must-act/cw-watcher-health-check \
 	cw-agent-stats=tools/cw-agent-stats/cw-agent-stats \

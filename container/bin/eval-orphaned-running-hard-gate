@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""eval-orphaned-running-hard-gate - obligations evaluator (hard gate).
+
+Blocks the MAIN LOOP's non-exempt Bash tool calls while one or more queue
+items are ORPHANED-RUNNING: status still ``running`` but the bound agent is
+confirmed dead (``alive=false`` AND ``in_flight_tool_use=false``) past a long
+grace window.
+
+WHY (Andrew #7362-7365; q-2026-09-08-95cd sat RUNNING+ORPHAN 47 min): the soft
+``queue-orphaned`` claude-event is single-emit-deduped and Tier-2 ACTIONABLE,
+so ANY ``event-ack ack-batch`` satisfied it -- acking was decoupled from
+RESOLVING. This gate re-couples them: cleared ONLY by resolving the item
+(``session-task queue done|abandon|resurrect``) or by the agent coming back
+alive -- never by an event-ack.
+
+DIVISION OF LABOR: the claude-watch daemon (``queue-check``, cron) is the
+AUTHORITATIVE detector; it does the active-agents liveness join with full
+default-open semantics (``compute_hard_gate_orphans`` in src/queue_check.rs)
+and writes ONLY unambiguously-dead items to the pending file. THIS evaluator
+does not re-do that join; it reads the confirmed set and only CLEARS entries
+the operator has since resolved -- so it can only ever REDUCE blocking.
+
+Pending file (daemon-written): ``<state-dir>/queue-hard-gate-pending.json``,
+state-dir = $CLAUDE_WATCH_STATE_DIR or /var/lib/claude-watch; full override
+$CLAUDE_HARD_GATE_PENDING_FILE.
+
+exit 0 = ALLOW, exit 1 = DENY, stderr = banner. Default-open: missing/empty/
+corrupt pending file, exempt command, or any unexpected exception -> ALLOW.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+
+def _state_dir() -> Path:
+    d = os.environ.get("CLAUDE_WATCH_STATE_DIR", "").strip()
+    return Path(d) if d else Path("/var/lib/claude-watch")
+
+
+def _pending_file() -> Path:
+    o = os.environ.get("CLAUDE_HARD_GATE_PENDING_FILE", "").strip()
+    return Path(o) if o else _state_dir() / "queue-hard-gate-pending.json"
+
+
+def _queue_file() -> Path:
+    o = os.environ.get("CLAUDE_QUEUE_FILE", "").strip()
+    return Path(o) if o else Path(os.path.expanduser("~/.config/session/queue.json"))
+
+
+def _active_agents_file() -> Path:
+    o = os.environ.get("CLAUDE_AGENTS_STATE", "").strip()
+    return Path(o) if o else _state_dir() / "active-agents.json"
+
+
+# Exempt commands (same recovery surface as eval-agent-ack-pending).
+# session-task queue is ALSO floored by the framework universal-recovery
+# exempts; mirrored here so the evaluator short-circuits before reading state.
+_EXEMPT_PATTERNS = [
+    r"session-task\s+queue(\s|$)",
+    r"obligations(\s|$)",
+    r"agent-ack(\s|$)",
+    r"agent-msg(\s|$)",
+    r"agent-tail(\s|$)",
+    r"event-ack(\s|$)",
+    r"event-classify(\s|$)",
+    r"claude-watch-ack(\s|$)",
+    r"claude-watch-dispatch(\s|$)",
+    r"signal-history(\s|$)",
+    r"signal-ack(\s|$)",
+    r"signal-mark-read(\s|$)",
+    r"botchat-send(\s|$)",
+    r"botchat-unread-check(\s|$)",
+    r"botchat-history(\s|$)",
+    r"botchat-show(\s|$)",
+    r"botchat-wait(\s|$)",
+    r"/opt/claude-container/watchers/",
+]
+_EXEMPT_RE = re.compile(r"^\s*(" + "|".join(_EXEMPT_PATTERNS) + r")")
+
+
+def _is_exempt(cmd: str) -> bool:
+    return bool(_EXEMPT_RE.match(cmd))
+
+
+def _get_pending() -> list:
+    pf = _pending_file()
+    if not pf.exists():
+        return []
+    try:
+        data = json.loads(pf.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    pending = data.get("pending", [])
+    if not isinstance(pending, list):
+        return []
+    return [p for p in pending if isinstance(p, dict) and p.get("queue_id")]
+
+
+_QUEUE_UNREADABLE = object()
+
+
+def _read_queue_map():
+    """Return {id: item} or _QUEUE_UNREADABLE on any read/parse error."""
+    qf = _queue_file()
+    if not qf.exists():
+        return {}
+    try:
+        data = json.loads(qf.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return _QUEUE_UNREADABLE
+    items = None
+    if isinstance(data, dict):
+        for key in ("items", "queue", "tasks"):
+            v = data.get(key)
+            if isinstance(v, list):
+                items = v
+                break
+        if items is None and data and all(isinstance(v, dict) for v in data.values()):
+            return {v.get("id", k): v for k, v in data.items() if isinstance(v, dict)}
+    elif isinstance(data, list):
+        items = data
+    if items is None:
+        return _QUEUE_UNREADABLE
+    return {it["id"]: it for it in items if isinstance(it, dict) and it.get("id")}
+
+
+def _agent_alive(agent_id, queue_id) -> bool:
+    af = _active_agents_file()
+    if not af.exists():
+        return False
+    try:
+        data = json.loads(af.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    agents = data.get("agents", [])
+    if not isinstance(agents, list):
+        return False
+    for rec in agents:
+        if not isinstance(rec, dict):
+            continue
+        if agent_id and rec.get("agent_id") == agent_id and rec.get("alive") is True:
+            return True
+        if rec.get("queue_id") == queue_id and rec.get("alive") is True:
+            return True
+    return False
+
+
+def _is_resolved(entry, qmap) -> bool:
+    qid = entry.get("queue_id")
+    if not qid:
+        return True
+    if qmap is _QUEUE_UNREADABLE:
+        return False
+    it = qmap.get(qid)
+    if it is None:
+        return True
+    if it.get("status") != "running":
+        return True
+    return _agent_alive(entry.get("agent_id"), qid)
+
+
+def _emit_deny(unresolved) -> None:
+    lines = [
+        "ORPHANED-RUNNING-HARD-GATE: %d queue item(s) are RUNNING but their "
+        "bound agent is confirmed DEAD (alive=false, not in a tool call) past "
+        "the grace window. The main loop is BLOCKED until each is RESOLVED "
+        "(acking the event is NOT enough)." % len(unresolved),
+        "",
+        "Orphaned-running items:",
+    ]
+    for e in unresolved:
+        qid = e.get("queue_id", "?")
+        aid = e.get("agent_id", "unknown")
+        summ = e.get("summary", "")
+        age = e.get("age_secs")
+        age_s = ", agent stale ~%dm" % (int(age) // 60) if isinstance(age, (int, float)) else ""
+        lines.append("  - %s  [%s]  (agent %s%s)" % (qid, summ, aid, age_s))
+    lines.extend([
+        "",
+        "For EACH item, decide and RESOLVE (any one clears the gate):",
+        "  - done:      session-task queue done <queue-id>",
+        "  - abandon:   session-task queue abandon <queue-id> --reason \"...\"",
+        "  - reassign:  session-task queue resurrect <queue-id>",
+        "",
+        "event-ack ack-batch does NOT clear this gate -- acking is not resolving.",
+        "Escape hatch (last resort): obligations override \"<reason>\" --duration <N>.",
+    ])
+    print("\n".join(lines), file=sys.stderr)
+
+
+def evaluate(cmd: str) -> int:
+    if not cmd or not cmd.strip():
+        return 0
+    if _is_exempt(cmd):
+        return 0
+    pending = _get_pending()
+    if not pending:
+        return 0
+    qmap = _read_queue_map()
+    unresolved = [e for e in pending if not _is_resolved(e, qmap)]
+    if not unresolved:
+        return 0
+    _emit_deny(unresolved)
+    return 1
+
+
+def _self_test() -> int:
+    import tempfile
+    failures = []
+
+    def fail(m):
+        failures.append(m)
+
+    def _setup(td, pending=None, queue=None, agents=None):
+        os.environ["CLAUDE_HARD_GATE_PENDING_FILE"] = str(td / "pending.json")
+        os.environ["CLAUDE_QUEUE_FILE"] = str(td / "queue.json")
+        os.environ["CLAUDE_AGENTS_STATE"] = str(td / "active-agents.json")
+        if pending is not None:
+            (td / "pending.json").write_text(json.dumps({"pending": pending}))
+        if queue is not None:
+            (td / "queue.json").write_text(json.dumps({"items": queue}))
+        if agents is not None:
+            (td / "active-agents.json").write_text(json.dumps({"agents": agents}))
+
+    dead = {"queue_id": "q-1", "agent_id": "a-1", "summary": "x", "age_secs": 5683}
+
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td))
+        if evaluate("ls") != 0:
+            fail("no pending file should allow")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[])
+        if evaluate("ls") != 0:
+            fail("empty pending should allow")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[{"id": "q-1", "status": "running"}], agents=[])
+        if evaluate("ls") != 1:
+            fail("unresolved orphan should DENY")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[{"id": "q-1", "status": "running"}], agents=[])
+        if evaluate("event-ack ack-batch --override-reason done") != 0:
+            fail("event-ack should be exempt")
+        if evaluate("ls") != 1:
+            fail("event-ack did not resolve -> ls still DENIED")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[{"id": "q-1", "status": "quarantined"}], agents=[])
+        if evaluate("ls") != 0:
+            fail("quarantined should clear -> ALLOW")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[{"id": "q-1", "status": "done"}], agents=[])
+        if evaluate("ls") != 0:
+            fail("done should clear -> ALLOW")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[], agents=[])
+        if evaluate("ls") != 0:
+            fail("gone item should clear -> ALLOW")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[{"id": "q-1", "status": "running"}],
+               agents=[{"agent_id": "a-1", "queue_id": "q-1", "alive": True}])
+        if evaluate("ls") != 0:
+            fail("agent alive again should clear -> ALLOW")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead], queue=[{"id": "q-1", "status": "running"}], agents=[])
+        for c in ("session-task queue abandon q-1 --reason x",
+                  "session-task queue done q-1",
+                  "obligations override x --duration 30",
+                  "agent-msg inbox a-1"):
+            if evaluate(c) != 0:
+                fail("exempt command should allow: %r" % c)
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["CLAUDE_HARD_GATE_PENDING_FILE"] = str(Path(td) / "pending.json")
+        (Path(td) / "pending.json").write_text("{not json")
+        if evaluate("rm -rf /tmp/x") != 0:
+            fail("corrupt pending should ALLOW (default-open)")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["CLAUDE_HARD_GATE_PENDING_FILE"] = str(Path(td) / "pending.json")
+        os.environ["CLAUDE_QUEUE_FILE"] = str(Path(td) / "queue.json")
+        os.environ["CLAUDE_AGENTS_STATE"] = str(Path(td) / "aa.json")
+        (Path(td) / "pending.json").write_text(json.dumps({"pending": [dead]}))
+        (Path(td) / "queue.json").write_text("{not json")
+        if evaluate("ls") != 1:
+            fail("unreadable queue.json should keep blocking")
+    with tempfile.TemporaryDirectory() as td:
+        _setup(Path(td), pending=[dead, {"queue_id": "q-2", "agent_id": "a-2"}],
+               queue=[{"id": "q-1", "status": "done"}, {"id": "q-2", "status": "running"}],
+               agents=[])
+        if evaluate("ls") != 1:
+            fail("mixed: one still unresolved -> DENY")
+
+    for k in ("CLAUDE_HARD_GATE_PENDING_FILE", "CLAUDE_QUEUE_FILE", "CLAUDE_AGENTS_STATE"):
+        os.environ.pop(k, None)
+
+    if failures:
+        print("FAIL: %d case(s):" % len(failures), file=sys.stderr)
+        for f in failures:
+            print("  " + f, file=sys.stderr)
+        return 1
+    print("OK: all cases pass.")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        return _self_test()
+    cmd = sys.stdin.read()
+    try:
+        return evaluate(cmd)
+    except Exception:  # noqa: BLE001 -- default-open on unexpected
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

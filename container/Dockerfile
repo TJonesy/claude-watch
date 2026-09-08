@@ -1159,6 +1159,13 @@ COPY tools/event-must-act/eval-event-must-act /usr/local/bin/eval-event-must-act
 # missing/corrupt state.
 COPY container/bin/eval-agent-ack-pending /usr/local/bin/eval-agent-ack-pending
 
+# eval-orphaned-running-hard-gate - obligations evaluator (mechanism 1) that
+# blocks the main loop's non-exempt Bash while a running queue item's bound
+# agent is confirmed dead (per the daemon-written hard-gate pending file),
+# until the item is RESOLVED (session-task queue done/abandon/resurrect). NOT
+# satisfiable by event-ack. Default-open on missing/corrupt state.
+COPY container/bin/eval-orphaned-running-hard-gate /usr/local/bin/eval-orphaned-running-hard-gate
+
 # eval-queue-ready-unspawned — obligations evaluator that blocks Bash tool
 # calls when session-task queue has items with status=pending and
 # ready_now=true. Forces the main loop to spawn agents for ready work
