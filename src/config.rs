@@ -64,6 +64,12 @@ pub struct Config {
     /// See `AskQuestionMonitorConfig`.
     #[serde(default)]
     pub ask_question_monitor: AskQuestionMonitorConfig,
+    /// Detection + auto-DENY of a stale TOOL-PERMISSION prompt ("Do you want
+    /// to proceed?"). Alerts at `alert_seconds`, sends Escape at
+    /// `auto_deny_seconds`. Default ON. Can only ever decline a tool call —
+    /// never approve one. See `PermissionPromptMonitorConfig`.
+    #[serde(default)]
+    pub permission_prompt_monitor: PermissionPromptMonitorConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1796,6 +1802,110 @@ fn default_ask_question_explanation() -> String {
         .to_string()
 }
 
+/// Detection + auto-DENY of a stale TOOL-PERMISSION prompt ("Do you want to
+/// proceed?"), the dialog Claude Code raises when a tool call needs approval.
+///
+/// Motivating incident: a subagent's Bash call tripped a guarded-command
+/// check, the permission dialog opened in the main-loop pane, and nobody was
+/// at the keyboard. It sat there for four and a half hours. Nothing in the
+/// daemon could tell that state apart from a dead agent — the transcript is
+/// frozen and the tool call is in-flight in both cases — so the loop
+/// misdiagnosed it as an API death and respawned the agent; when a human
+/// finally dismissed the dialog, the original woke up and dispatched a stale
+/// duplicate of work that had already been redone.
+///
+/// This monitor closes that gap in two steps: NAME the state (a claude-event
+/// carrying the dialog text, so the loop knows a tool call is blocked rather
+/// than guessing), then, if still unanswered, DECLINE it so the work fails
+/// fast and visibly instead of hanging.
+///
+/// **It can only ever decline.** The single keystroke it is able to send is
+/// `Escape` (`tmux::PERMISSION_PROMPT_DENY_KEY`); there is no code path, and
+/// no config value, that approves a tool call.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PermissionPromptMonitorConfig {
+    /// Master switch for detection + alerting. Default true. With this off
+    /// the daemon neither alerts nor denies (a stale dialog then surfaces
+    /// only via the slower, less specific `ask-question-stale` alarm).
+    #[serde(default = "default_permission_prompt_enabled")]
+    pub enabled: bool,
+    /// Grace period, in seconds, before the `permission-prompt` claude-event
+    /// fires. Default 120 — long enough that an operator typing an answer is
+    /// never alerted on, short enough that an unattended block is named in
+    /// minutes rather than hours.
+    #[serde(default = "default_permission_prompt_alert_seconds")]
+    pub alert_seconds: u64,
+    /// Gate for the auto-DENY action. Default true. Set false to keep the
+    /// monitor in alert-only mode (detection + claude-event, no keystroke).
+    #[serde(default = "default_permission_prompt_auto_deny_enabled")]
+    pub auto_deny_enabled: bool,
+    /// TOTAL seconds a permission dialog may sit unanswered before Escape is
+    /// sent. Measured from first observation of the dialog, not from the
+    /// alert, so it is the whole budget: default 300 = alert at 2 min, deny
+    /// at 5.
+    #[serde(default = "default_permission_prompt_auto_deny_seconds")]
+    pub auto_deny_seconds: u64,
+    /// Seconds between the two confirming captures taken immediately before
+    /// the deny keystroke. The dialog must be byte-identical across both or
+    /// the deny is abandoned for this cycle — that is what makes a transient
+    /// mid-render frame unable to trigger a keystroke. Default 3.
+    #[serde(default = "default_permission_prompt_confirm_secs")]
+    pub confirm_secs: u64,
+    /// How many times Escape may be sent for one dialog before the daemon
+    /// gives up and escalates to a `permission-prompt-deny-failed` alert.
+    /// Default 2. Bounded on purpose: a dialog that survives two Escapes is
+    /// not a dialog this daemon understands, and hammering keys at it is how
+    /// a recovery path becomes the incident.
+    #[serde(default = "default_permission_prompt_max_deny_attempts")]
+    pub max_deny_attempts: u32,
+    /// Lines of pane context captured ABOVE the question line (the tool name
+    /// and command preview) for the alert payload. Default 16.
+    #[serde(default = "default_permission_prompt_context_lines")]
+    pub context_lines: usize,
+}
+
+impl Default for PermissionPromptMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_permission_prompt_enabled(),
+            alert_seconds: default_permission_prompt_alert_seconds(),
+            auto_deny_enabled: default_permission_prompt_auto_deny_enabled(),
+            auto_deny_seconds: default_permission_prompt_auto_deny_seconds(),
+            confirm_secs: default_permission_prompt_confirm_secs(),
+            max_deny_attempts: default_permission_prompt_max_deny_attempts(),
+            context_lines: default_permission_prompt_context_lines(),
+        }
+    }
+}
+
+fn default_permission_prompt_enabled() -> bool {
+    true
+}
+
+fn default_permission_prompt_alert_seconds() -> u64 {
+    120
+}
+
+fn default_permission_prompt_auto_deny_enabled() -> bool {
+    true
+}
+
+fn default_permission_prompt_auto_deny_seconds() -> u64 {
+    300
+}
+
+fn default_permission_prompt_confirm_secs() -> u64 {
+    3
+}
+
+fn default_permission_prompt_max_deny_attempts() -> u32 {
+    2
+}
+
+fn default_permission_prompt_context_lines() -> usize {
+    16
+}
+
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
 /// Exits the process on failure — suitable for the daemon, not for
 /// best-effort subcommands. Use `try_load_config` for those.
@@ -2588,6 +2698,45 @@ cooldown = 300
         assert_eq!(config.ask_question_monitor.stale_seconds, 120);
         assert!(config.ask_question_monitor.reject_enabled);
         assert_eq!(config.ask_question_monitor.explanation, "custom");
+    }
+
+    #[test]
+    fn test_permission_prompt_monitor_defaults() {
+        // No [permission_prompt_monitor] in SAMPLE_CONFIG -> shipped defaults:
+        // alert at 2 min, deny at 5, two attempts.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(config.permission_prompt_monitor.enabled);
+        assert_eq!(config.permission_prompt_monitor.alert_seconds, 120);
+        assert!(config.permission_prompt_monitor.auto_deny_enabled);
+        assert_eq!(config.permission_prompt_monitor.auto_deny_seconds, 300);
+        assert_eq!(config.permission_prompt_monitor.confirm_secs, 3);
+        assert_eq!(config.permission_prompt_monitor.max_deny_attempts, 2);
+        assert_eq!(config.permission_prompt_monitor.context_lines, 16);
+        // The alert must come strictly BEFORE the deny, or the loop would
+        // learn about a blocked tool call only by being told it was denied.
+        assert!(
+            config.permission_prompt_monitor.alert_seconds
+                < config.permission_prompt_monitor.auto_deny_seconds
+        );
+    }
+
+    #[test]
+    fn test_permission_prompt_monitor_override() {
+        let cfg_str = format!(
+            "{}\n[permission_prompt_monitor]\nenabled = true\nalert_seconds = 60\n\
+             auto_deny_enabled = false\nauto_deny_seconds = 900\nconfirm_secs = 5\n\
+             max_deny_attempts = 1\ncontext_lines = 30\n",
+            SAMPLE_CONFIG
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert!(config.permission_prompt_monitor.enabled);
+        assert_eq!(config.permission_prompt_monitor.alert_seconds, 60);
+        // Alert-only mode: detection + claude-event, never a keystroke.
+        assert!(!config.permission_prompt_monitor.auto_deny_enabled);
+        assert_eq!(config.permission_prompt_monitor.auto_deny_seconds, 900);
+        assert_eq!(config.permission_prompt_monitor.confirm_secs, 5);
+        assert_eq!(config.permission_prompt_monitor.max_deny_attempts, 1);
+        assert_eq!(config.permission_prompt_monitor.context_lines, 30);
     }
 
     #[test]

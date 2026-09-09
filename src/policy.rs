@@ -5497,6 +5497,327 @@ pub(crate) fn ask_question_timer_step(
     }
 }
 
+/// What the permission-prompt monitor should do this cycle. Pure decision,
+/// separated from I/O (pane capture, event emit, keystroke) so the whole
+/// escalation ladder is unit-testable without a tmux server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionPromptDecision {
+    /// Monitor disabled, or no permission dialog on screen — clear the timer.
+    Clear,
+    /// Dialog pending, no threshold crossed this cycle.
+    Pending,
+    /// `alert_seconds` reached on a not-yet-alerted dialog — emit the
+    /// `permission-prompt` claude-event once.
+    Alert { pending_secs: u64 },
+    /// `auto_deny_seconds` reached — send the deny keystroke. Carries the
+    /// attempt number (1-based) so the caller can log/escalate.
+    Deny { pending_secs: u64, attempt: u32 },
+}
+
+/// Pure lifecycle for the tool-permission prompt monitor.
+///
+/// Escalation ladder for ONE dialog: observe → (alert_seconds) alert once →
+/// (auto_deny_seconds) deny, up to `max_deny_attempts` times → give up.
+///
+/// The `signature` argument is the identity of the dialog currently on screen
+/// (`None` = no dialog). Everything hinges on it:
+///
+///   * a NEW signature restarts the clock — so the elapsed time can only ever
+///     accumulate over captures showing the SAME dialog, and a mid-render
+///     frame or a different question cannot inherit an older dialog's age;
+///   * `None` clears the timer entirely, which is also how "the operator
+///     answered it" and "the dialog was denied" resolve.
+///
+/// `deny_allowed` is the caller's veto (self-clear in flight, auto-deny
+/// disabled, …). When false the ladder stops at `Pending` WITHOUT consuming a
+/// deny attempt — a suppressed deny is a deferral, not a failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn permission_prompt_timer_step(
+    state: &mut State,
+    enabled: bool,
+    alert_seconds: u64,
+    auto_deny_seconds: u64,
+    max_deny_attempts: u32,
+    deny_allowed: bool,
+    signature: Option<u64>,
+    now: &str,
+) -> PermissionPromptDecision {
+    let sig = match (enabled, signature) {
+        (true, Some(sig)) => sig,
+        _ => {
+            state.permission_prompt_since = None;
+            state.permission_prompt_signature = None;
+            state.permission_prompt_alerted = false;
+            state.permission_prompt_deny_attempts = 0;
+            return PermissionPromptDecision::Clear;
+        }
+    };
+
+    // New or CHANGED dialog: start this dialog's own clock. Never reuse the
+    // previous dialog's elapsed time — that is exactly how a freshly-raised
+    // prompt would get an instant keystroke.
+    if state.permission_prompt_signature != Some(sig) {
+        state.permission_prompt_signature = Some(sig);
+        state.permission_prompt_since = Some(now.to_string());
+        state.permission_prompt_alerted = false;
+        state.permission_prompt_deny_attempts = 0;
+        return PermissionPromptDecision::Pending;
+    }
+
+    let started = match state.permission_prompt_since.as_deref() {
+        Some(ts) => ts.to_string(),
+        None => {
+            state.permission_prompt_since = Some(now.to_string());
+            return PermissionPromptDecision::Pending;
+        }
+    };
+    // A malformed timestamp reads as 0 elapsed: fail safe toward NOT acting.
+    let elapsed = elapsed_since(&started).unwrap_or(0.0);
+    let pending_secs = elapsed.max(0.0) as u64;
+
+    // Alert first, and only once. When both thresholds are crossed in the
+    // same cycle the alert still goes out ahead of the keystroke — the loop
+    // should never learn about a blocked tool call only from its denial.
+    if !state.permission_prompt_alerted && pending_secs >= alert_seconds {
+        state.permission_prompt_alerted = true;
+        return PermissionPromptDecision::Alert { pending_secs };
+    }
+
+    if deny_allowed
+        && pending_secs >= auto_deny_seconds
+        && state.permission_prompt_deny_attempts < max_deny_attempts
+    {
+        state.permission_prompt_deny_attempts += 1;
+        return PermissionPromptDecision::Deny {
+            pending_secs,
+            attempt: state.permission_prompt_deny_attempts,
+        };
+    }
+
+    PermissionPromptDecision::Pending
+}
+
+/// Tool-permission prompt monitor: detect → alert → auto-deny.
+///
+/// A permission dialog ("Do you want to proceed?") blocks the tool call that
+/// raised it and, with it, whatever the agent was doing. From outside, that
+/// state is indistinguishable from a dead agent — frozen transcript, tool
+/// call still in flight — which is how one such prompt went unanswered for
+/// four and a half hours: it was diagnosed as an API death, the agent was
+/// respawned, and the original later woke and re-dispatched stale work.
+///
+/// So this monitor does two things the generic stale-question alarm cannot:
+/// it NAMES the state (the claude-event carries the dialog text, so the loop
+/// knows a tool call is blocked and on what), and, if still unanswered, it
+/// DECLINES the call so the work fails fast instead of hanging.
+///
+/// Returns whether a permission dialog is currently on screen, so the caller
+/// can suppress the broader `ask-question-stale` alarm for the same dialog
+/// rather than paging twice about one block.
+///
+/// ## What keeps a keystroke from landing in a live session
+///
+///  1. A narrow four-marker signature (`tmux::permission_prompt_visible`)
+///     that fails closed on anything it does not recognize.
+///  2. The dialog must persist UNCHANGED across the whole
+///     `auto_deny_seconds` window — any change restarts the clock.
+///  3. A final two-capture confirmation `confirm_secs` apart, immediately
+///     before the keystroke, both of which must show the identical dialog.
+///  4. A `self-clear` interlock: no keystroke while a self-clear holds the
+///     pane, mirroring `tmux::interrupt_and_wait`.
+///  5. The only key it can send is `Escape` — decline, never approve.
+async fn check_permission_prompt(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    now: &str,
+) -> bool {
+    let cfg = &config.permission_prompt_monitor;
+    if !cfg.enabled || pane.is_empty() {
+        // Run the step anyway so a disabled monitor clears stale timer state.
+        permission_prompt_timer_step(state, false, 0, 0, 0, false, None, now);
+        return false;
+    }
+
+    let prompt = tmux::detect_permission_prompt(pane, cfg.context_lines).await;
+    // A self-clear owns the pane while it drives `/clear` + the resume
+    // prompt; an Escape into that sequence clobbers it. Same interlock
+    // `interrupt_and_wait` applies, and it only DEFERS the deny.
+    let self_clear_busy = tmux::self_clear_in_progress()
+        || tmux::self_clear_handoff_recent(tmux::self_clear_handoff_grace_secs_env());
+    let deny_allowed = cfg.auto_deny_enabled && !self_clear_busy;
+
+    let decision = permission_prompt_timer_step(
+        state,
+        cfg.enabled,
+        cfg.alert_seconds,
+        cfg.auto_deny_seconds,
+        cfg.max_deny_attempts,
+        deny_allowed,
+        prompt.as_ref().map(|p| p.signature),
+        now,
+    );
+
+    let prompt = match prompt {
+        Some(p) => p,
+        None => return false,
+    };
+
+    match decision {
+        PermissionPromptDecision::Clear | PermissionPromptDecision::Pending => {}
+        PermissionPromptDecision::Alert { pending_secs } => {
+            let msg = format!(
+                "claude-watch: a TOOL-PERMISSION prompt has blocked the pane for ~{}s \
+                 (>{}s). A tool call is waiting on an approval nobody has given — this \
+                 is NOT a dead agent, do not respawn it. {}\n\n{}\n\nAnswer it, or \
+                 claude-watch will send Escape (decline) at {}s.",
+                pending_secs,
+                cfg.alert_seconds,
+                if cfg.auto_deny_enabled {
+                    "Auto-deny is armed."
+                } else {
+                    "Auto-deny is DISABLED — it will block until answered."
+                },
+                prompt.context,
+                cfg.auto_deny_seconds,
+            );
+            warn!(
+                pending_secs,
+                threshold_secs = cfg.alert_seconds,
+                question = %prompt.question,
+                "permission prompt pending past alert threshold"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "permission_prompt_pending",
+                serde_json::json!({
+                    "pending_secs": pending_secs,
+                    "threshold_secs": cfg.alert_seconds,
+                    "auto_deny_enabled": cfg.auto_deny_enabled,
+                    "auto_deny_seconds": cfg.auto_deny_seconds,
+                    "question": prompt.question,
+                    "context": prompt.context,
+                }),
+            );
+            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "permission-prompt",
+                stuck_reason: "tool-permission prompt unanswered past grace period",
+                stale_minutes: Some(pending_secs / 60),
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &msg,
+            });
+            alert::send_pingme_with_priority(&msg, "high").await;
+        }
+        PermissionPromptDecision::Deny {
+            pending_secs,
+            attempt,
+        } => {
+            // FINAL confirmation, taken as late as possible: two captures
+            // `confirm_secs` apart that must both show the IDENTICAL dialog.
+            // Everything before this point is history; this is the only check
+            // that speaks to the state of the pane at the instant the key
+            // lands.
+            let before = tmux::detect_permission_prompt(pane, cfg.context_lines).await;
+            tokio::time::sleep(std::time::Duration::from_secs(cfg.confirm_secs)).await;
+            let after = tmux::detect_permission_prompt(pane, cfg.context_lines).await;
+            let stable = match (&before, &after) {
+                (Some(b), Some(a)) => b.signature == a.signature && a.signature == prompt.signature,
+                _ => false,
+            };
+            if !stable {
+                info!(
+                    attempt,
+                    "permission prompt: dialog changed during pre-deny confirmation — \
+                     NOT sending Escape this cycle"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "permission_prompt_deny_aborted",
+                    serde_json::json!({
+                        "reason": "dialog not stable across confirmation captures",
+                        "attempt": attempt,
+                    }),
+                );
+                return true;
+            }
+
+            warn!(
+                pending_secs,
+                attempt,
+                key = tmux::PERMISSION_PROMPT_DENY_KEY,
+                question = %prompt.question,
+                "permission prompt stale — sending DENY keystroke"
+            );
+            let cleared = tmux::deny_permission_prompt(pane, cfg.context_lines).await;
+            write_jsonl_log(
+                &config.general.log_file,
+                "permission_prompt_auto_deny",
+                serde_json::json!({
+                    "pending_secs": pending_secs,
+                    "attempt": attempt,
+                    "max_attempts": cfg.max_deny_attempts,
+                    "cleared": cleared,
+                    "key": tmux::PERMISSION_PROMPT_DENY_KEY,
+                    "question": prompt.question,
+                    "context": prompt.context,
+                }),
+            );
+
+            if cleared {
+                // The dialog is gone, so the tool call was DECLINED — the
+                // agent will see a rejection and react. Tell the loop plainly:
+                // whatever that tool call was going to do did not happen.
+                let msg = format!(
+                    "claude-watch: AUTO-DENIED a tool-permission prompt that sat \
+                     unanswered for ~{}s. Escape was sent; the dialog cleared. The \
+                     blocked tool call was REJECTED — the agent will report a \
+                     permission denial, and any work depending on it did NOT run. \
+                     Re-drive it deliberately if it was wanted.\n\n{}",
+                    pending_secs, prompt.context,
+                );
+                alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "permission-prompt-denied",
+                    stuck_reason: "auto-denied a stale tool-permission prompt",
+                    stale_minutes: Some(pending_secs / 60),
+                    affected_watchers: vec![],
+                    severity: crate::event_bus::Severity::High,
+                    message: &msg,
+                });
+                alert::send_pingme_with_priority(&msg, "high").await;
+                // Clear the timer: this dialog is resolved. A fresh one gets
+                // its own clock and its own attempt budget.
+                state.permission_prompt_since = None;
+                state.permission_prompt_signature = None;
+                state.permission_prompt_alerted = false;
+                state.permission_prompt_deny_attempts = 0;
+                return false;
+            }
+
+            if attempt >= cfg.max_deny_attempts {
+                let msg = format!(
+                    "claude-watch: a tool-permission prompt SURVIVED {} Escape \
+                     attempt(s) and is still blocking the pane after ~{}s. Giving up \
+                     — no further keystrokes will be sent. Answer it by hand.\n\n{}",
+                    attempt, pending_secs, prompt.context,
+                );
+                warn!(attempt, "permission prompt auto-deny failed — escalating");
+                alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "permission-prompt-deny-failed",
+                    stuck_reason: "auto-deny keystroke did not clear the prompt",
+                    stale_minutes: Some(pending_secs / 60),
+                    affected_watchers: vec![],
+                    severity: crate::event_bus::Severity::High,
+                    message: &msg,
+                });
+                alert::send_pingme_with_priority(&msg, "high").await;
+            }
+        }
+    }
+
+    true
+}
+
 /// AskUserQuestion stale monitor (Phase 1: detect + alarm ONLY).
 ///
 /// Detects when an interactive `AskUserQuestion` / tool-permission /
@@ -5510,9 +5831,21 @@ pub(crate) fn ask_question_timer_step(
 /// Phase 1 does NOT Escape / auto-reject / inject. The reject path (Phase 2
 /// Escape, Phase 3 inject of `explanation`) hooks in at the marked TODO
 /// below, gated on `config.ask_question_monitor.reject_enabled`.
-async fn check_ask_question_stale(config: &Config, state: &mut State, pane: &str, now: &str) {
+///
+/// `permission_prompt_active` is the permission-prompt monitor's claim on the
+/// dialog currently on screen. That monitor is the narrower, better-informed
+/// one — it knows the dialog is a tool-permission prompt, carries its text,
+/// and can act on it — so when it is handling the dialog this alarm stands
+/// down rather than paging a second time about a single block.
+async fn check_ask_question_stale(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    now: &str,
+    permission_prompt_active: bool,
+) {
     let cfg = &config.ask_question_monitor;
-    if !cfg.enabled || pane.is_empty() {
+    if !cfg.enabled || pane.is_empty() || permission_prompt_active {
         // Still run the timer step so a disabled monitor clears any stale
         // timer state (idempotent reset).
         ask_question_timer_step(state, cfg.enabled, cfg.stale_seconds, false, now);
@@ -6687,12 +7020,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // starts at the first ack.
     }
 
+    // --- Tool-permission prompt detection (detect -> alert -> auto-deny) ---
+    // A "Do you want to proceed?" dialog blocks the tool call that raised it
+    // and looks exactly like a dead agent from outside. Runs BEFORE the
+    // AskUserQuestion monitor and tells it to stand down when it owns the
+    // dialog, so one block never pages twice.
+    let permission_prompt_active =
+        check_permission_prompt(config, state, &effective_pane, &now).await;
+
     // --- AskUserQuestion stale detection (Phase 1: detect + alarm) ---
     // A pending interactive question blocks the main loop but reads as
     // Idle, so the prolonged-thinking detector misses it. Fire a fast,
     // specific alarm when it sits pending past the configured threshold.
     // ALARM ONLY in Phase 1 — no Escape / reject / inject.
-    check_ask_question_stale(config, state, &effective_pane, &now).await;
+    check_ask_question_stale(
+        config,
+        state,
+        &effective_pane,
+        &now,
+        permission_prompt_active,
+    )
+    .await;
 
     // --- Foreground blocking detection ---
     // Delegated to check_foreground() which runs on its own timer in the main loop.
@@ -13059,6 +13407,214 @@ pane_unchanged_secs = 600
         assert_eq!(d, AskQuestionTimerDecision::Clear);
         assert!(state.ask_question_pending_since.is_none());
         assert!(!state.ask_question_alerted);
+    }
+
+    // --- Tool-permission prompt monitor: alert -> auto-deny ladder ---
+
+    /// Defaults matching `[permission_prompt_monitor]`: alert at 120s, deny at
+    /// 300s, 2 attempts, deny permitted.
+    fn perm_step(
+        state: &mut State,
+        signature: Option<u64>,
+        now: &str,
+    ) -> PermissionPromptDecision {
+        permission_prompt_timer_step(state, true, 120, 300, 2, true, signature, now)
+    }
+
+    #[test]
+    fn test_permission_prompt_ladder_alerts_then_denies_once_each() {
+        let mut state = State::default();
+        let sig = Some(42u64);
+
+        // Cycle 1: dialog appears. Clock starts, nothing fires.
+        let d = perm_step(&mut state, sig, &Utc::now().to_rfc3339());
+        assert_eq!(d, PermissionPromptDecision::Pending);
+        assert_eq!(state.permission_prompt_signature, sig);
+        assert!(state.permission_prompt_since.is_some());
+
+        // Cycle 2: still inside the grace period — an operator typing an
+        // answer must never be alerted on, let alone keyed at.
+        state.permission_prompt_since = Some(ask_q_now_offset(60));
+        assert_eq!(
+            perm_step(&mut state, sig, &Utc::now().to_rfc3339()),
+            PermissionPromptDecision::Pending
+        );
+
+        // Cycle 3: past the grace period → alert, exactly once.
+        state.permission_prompt_since = Some(ask_q_now_offset(125));
+        match perm_step(&mut state, sig, &Utc::now().to_rfc3339()) {
+            PermissionPromptDecision::Alert { pending_secs } => assert!(pending_secs >= 120),
+            other => panic!("expected Alert, got {:?}", other),
+        }
+        assert!(state.permission_prompt_alerted);
+        assert_eq!(
+            perm_step(&mut state, sig, &Utc::now().to_rfc3339()),
+            PermissionPromptDecision::Pending,
+            "the alert must fire once per dialog, not once per cycle"
+        );
+
+        // Cycle 4: past the deny threshold → first Escape.
+        state.permission_prompt_since = Some(ask_q_now_offset(305));
+        match perm_step(&mut state, sig, &Utc::now().to_rfc3339()) {
+            PermissionPromptDecision::Deny { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Deny, got {:?}", other),
+        }
+
+        // Cycle 5: dialog survived → second (and final) attempt.
+        match perm_step(&mut state, sig, &Utc::now().to_rfc3339()) {
+            PermissionPromptDecision::Deny { attempt, .. } => assert_eq!(attempt, 2),
+            other => panic!("expected Deny, got {:?}", other),
+        }
+
+        // Cycle 6+: the attempt budget is spent. A dialog that shrugged off
+        // two Escapes is not one this daemon understands; it must stop
+        // keying at it rather than hammer indefinitely.
+        for _ in 0..5 {
+            assert_eq!(
+                perm_step(&mut state, sig, &Utc::now().to_rfc3339()),
+                PermissionPromptDecision::Pending
+            );
+        }
+        assert_eq!(state.permission_prompt_deny_attempts, 2);
+    }
+
+    #[test]
+    fn test_permission_prompt_clears_when_dialog_gone() {
+        let mut state = State::default();
+        perm_step(&mut state, Some(7), &Utc::now().to_rfc3339());
+        state.permission_prompt_since = Some(ask_q_now_offset(400));
+        state.permission_prompt_alerted = true;
+        state.permission_prompt_deny_attempts = 1;
+
+        // Answered (or denied): every trace of the dialog's clock goes away,
+        // so the next dialog starts from zero with a full attempt budget.
+        let d = perm_step(&mut state, None, &Utc::now().to_rfc3339());
+        assert_eq!(d, PermissionPromptDecision::Clear);
+        assert!(state.permission_prompt_since.is_none());
+        assert!(state.permission_prompt_signature.is_none());
+        assert!(!state.permission_prompt_alerted);
+        assert_eq!(state.permission_prompt_deny_attempts, 0);
+    }
+
+    #[test]
+    fn test_permission_prompt_new_dialog_restarts_the_clock() {
+        // THE safety property: a different dialog must never inherit the
+        // previous one's elapsed time. Without this, a prompt raised seconds
+        // ago gets denied on sight because an unrelated one had been sitting
+        // there for ten minutes.
+        let mut state = State::default();
+        perm_step(&mut state, Some(1), &Utc::now().to_rfc3339());
+        state.permission_prompt_since = Some(ask_q_now_offset(9999));
+        state.permission_prompt_alerted = true;
+        state.permission_prompt_deny_attempts = 1;
+
+        let d = perm_step(&mut state, Some(2), &Utc::now().to_rfc3339());
+        assert_eq!(d, PermissionPromptDecision::Pending);
+        assert_eq!(state.permission_prompt_signature, Some(2));
+        assert!(!state.permission_prompt_alerted);
+        assert_eq!(state.permission_prompt_deny_attempts, 0);
+        // …and the restarted clock is young enough that the very next cycle
+        // does nothing.
+        assert_eq!(
+            perm_step(&mut state, Some(2), &Utc::now().to_rfc3339()),
+            PermissionPromptDecision::Pending
+        );
+    }
+
+    #[test]
+    fn test_permission_prompt_deny_veto_defers_without_spending_an_attempt() {
+        // `deny_allowed = false` (auto-deny disabled, or a self-clear holding
+        // the pane) is a DEFERRAL: no keystroke, and the attempt budget stays
+        // intact so the deny can still happen once the veto lifts.
+        let mut state = State::default();
+        permission_prompt_timer_step(
+            &mut state,
+            true,
+            120,
+            300,
+            2,
+            false,
+            Some(9),
+            &Utc::now().to_rfc3339(),
+        );
+        state.permission_prompt_since = Some(ask_q_now_offset(9999));
+        state.permission_prompt_alerted = true;
+
+        for _ in 0..3 {
+            let d = permission_prompt_timer_step(
+                &mut state,
+                true,
+                120,
+                300,
+                2,
+                false,
+                Some(9),
+                &Utc::now().to_rfc3339(),
+            );
+            assert_eq!(d, PermissionPromptDecision::Pending);
+        }
+        assert_eq!(state.permission_prompt_deny_attempts, 0);
+
+        // Veto lifted → the deny goes ahead.
+        match perm_step(&mut state, Some(9), &Utc::now().to_rfc3339()) {
+            PermissionPromptDecision::Deny { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Deny once the veto lifts, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_permission_prompt_alert_precedes_deny_in_the_same_cycle() {
+        // A dialog first seen when it is ALREADY past both thresholds (daemon
+        // restart, long poll gap) must still alert before it denies — the
+        // loop should never learn a tool call was blocked only by being told
+        // it was denied.
+        let mut state = State::default();
+        perm_step(&mut state, Some(5), &Utc::now().to_rfc3339());
+        state.permission_prompt_since = Some(ask_q_now_offset(9999));
+
+        assert!(matches!(
+            perm_step(&mut state, Some(5), &Utc::now().to_rfc3339()),
+            PermissionPromptDecision::Alert { .. }
+        ));
+        assert!(matches!(
+            perm_step(&mut state, Some(5), &Utc::now().to_rfc3339()),
+            PermissionPromptDecision::Deny { attempt: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_permission_prompt_disabled_never_acts() {
+        let mut state = State::default();
+        state.permission_prompt_since = Some(ask_q_now_offset(99999));
+        state.permission_prompt_signature = Some(3);
+        let d = permission_prompt_timer_step(
+            &mut state,
+            false,
+            1,
+            1,
+            2,
+            true,
+            Some(3),
+            &Utc::now().to_rfc3339(),
+        );
+        assert_eq!(d, PermissionPromptDecision::Clear);
+        assert!(state.permission_prompt_since.is_none());
+        assert_eq!(state.permission_prompt_deny_attempts, 0);
+    }
+
+    #[test]
+    fn test_permission_prompt_malformed_timestamp_fails_safe() {
+        // An unparseable `since` reads as zero elapsed, which means NOT
+        // acting. The failure mode of a corrupt timer must be silence, not a
+        // keystroke.
+        let mut state = State::default();
+        perm_step(&mut state, Some(11), &Utc::now().to_rfc3339());
+        state.permission_prompt_since = Some("not-a-timestamp".to_string());
+        assert_eq!(
+            perm_step(&mut state, Some(11), &Utc::now().to_rfc3339()),
+            PermissionPromptDecision::Pending
+        );
+        assert_eq!(state.permission_prompt_deny_attempts, 0);
     }
 
     // -------------------------------------------------------------------

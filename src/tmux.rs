@@ -659,6 +659,275 @@ pub async fn accept_bypass_permissions_dialog(pane: &str) {
     }
 }
 
+// -----------------------------------------------------------------------
+// Tool-permission prompt detection (`permission_prompt_monitor`)
+// -----------------------------------------------------------------------
+
+/// A TOOL-PERMISSION dialog observed on the pane — the "Do you want to
+/// proceed?" confirmation Claude Code renders when a tool call needs
+/// approval (a guarded Bash command, an edit outside the workspace, an MCP
+/// tool call, …).
+///
+/// This is deliberately a DIFFERENT thing from the broader "interactive
+/// prompt" / "blocking question" detectors:
+///
+///   * `interactive_prompt_visible` — biased toward true, answers "is
+///     ANYTHING selectable on screen" (inject suppression).
+///   * `blocking_question_visible` — narrower, answers "is a human being
+///     asked something" (the `ask-question-stale` alarm).
+///   * `permission_prompt_visible` (this) — narrowest, answers "is a TOOL
+///     CALL blocked on an approval this daemon may safely DECLINE".
+///
+/// Only the narrowest of the three may drive a keystroke, because only for
+/// this dialog class is the safe answer knowable without a human: declining
+/// a tool call returns control to the agent with a rejection it can react to,
+/// whereas declining an operator question invents an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionPrompt {
+    /// The dialog's question line, box chrome stripped
+    /// (e.g. `Do you want to proceed?`).
+    pub question: String,
+    /// The dialog block as rendered — the tool/command lines above the
+    /// question plus the option rows below it, box chrome stripped and
+    /// length-capped. Carried into the claude-event so the main loop can see
+    /// WHICH tool call is blocked without re-capturing the pane.
+    pub context: String,
+    /// Stable hash of the normalized dialog (question + options + context).
+    /// The monitor's timer only advances while this value is UNCHANGED, so a
+    /// re-render into a different dialog restarts the clock instead of
+    /// inheriting the previous dialog's elapsed time.
+    pub signature: u64,
+}
+
+/// Maximum characters of captured dialog context carried into an alert.
+/// Keeps a runaway pane capture from producing a multi-kilobyte pingme.
+const PERMISSION_PROMPT_CONTEXT_MAX_CHARS: usize = 1200;
+
+/// The keystroke claude-watch sends to DECLINE a stale permission prompt.
+///
+/// ## Why Escape and never a digit
+///
+/// 1. **Claude Code documents Escape as the decline affordance on this very
+///    dialog** — the deny row renders its own hint, either as a trailing
+///    `(esc)` on the "No, and tell Claude what to do differently" row or as
+///    an `Esc to cancel` footer. Escape is the dialog's own contract, not an
+///    inference about its layout.
+/// 2. **Option numbering is not stable.** The deny row is `2.` on a two-option
+///    dialog and `3.` when Claude Code also offers a "Yes, and don't ask
+///    again for …" row. Sending `2` therefore lands on *"Yes, and don't ask
+///    again"* on exactly the dialogs where a blanket approval is most
+///    dangerous — the guarded ones. A daemon that can accidentally approve is
+///    strictly worse than one that cannot act at all.
+/// 3. **Escape has no approving interpretation.** Its failure mode is
+///    "nothing happened" (verified by re-capturing the pane afterwards),
+///    never "a tool call the operator never saw was approved". Auto-APPROVAL
+///    is not a capability this monitor has, by construction: this constant is
+///    the only key it ever sends.
+pub const PERMISSION_PROMPT_DENY_KEY: &str = "Escape";
+
+/// Strip tmux/Claude-Code box chrome (borders, rule lines, the selection
+/// cursor) from one captured line, leaving the human text.
+fn strip_box_chrome(line: &str) -> &str {
+    line.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\u{2502}' // │
+                | '\u{2503}' // ┃
+                | '|'
+                | '\u{250c}' | '\u{2510}' | '\u{2514}' | '\u{2518}' // ┌┐└┘
+                | '\u{256d}' | '\u{256e}' | '\u{256f}' | '\u{2570}' // ╭╮╯╰
+                | '\u{2500}' | '\u{2501}' | '\u{2550}' // ─━═
+            )
+    })
+}
+
+/// Parse one captured line as a numbered option row (`1. Yes`,
+/// `❯ 2. No, and tell Claude what to do differently (esc)`), returning
+/// `(number, lowercased label)`.
+///
+/// The `❯` selection cursor is optional — only ONE row carries it, and which
+/// row that is depends on where the operator last moved the selection, so the
+/// signature must not depend on it.
+fn parse_option_row(line: &str) -> Option<(u32, String)> {
+    let mut rest = strip_box_chrome(line);
+    if let Some(stripped) = rest.strip_prefix('\u{276f}') {
+        rest = stripped.trim_start();
+    }
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let after = &rest[digits.len()..];
+    let label = after.strip_prefix('.')?.trim();
+    let n = digits.parse::<u32>().ok()?;
+    Some((n, label.to_lowercase()))
+}
+
+/// Pure function: does the pane show a TOOL-PERMISSION dialog that is safe to
+/// decline unattended? Returns the parsed dialog (question + context +
+/// stability signature) or `None`.
+///
+/// ## The signature — all four markers required
+///
+/// Claude Code renders the dialog as a bordered box, in one of two shapes
+/// seen in the wild:
+///
+/// ```text
+///   Bash command
+///     rm -f /tmp/pc.json /tmp_stderr.log
+///     Remove scratch files
+///   Dangerous rm operation on critical path: /tmp_stderr.log
+///   Do you want to proceed?
+///   ❯ 1. Yes
+///     2. No                                    Esc to cancel · Tab to amend
+/// ```
+/// ```text
+///   Edit file
+///   Do you want to make this edit to config.rs?
+///   ❯ 1. Yes
+///     2. Yes, and don't ask again this session
+///     3. No, and tell Claude what to do differently (esc)
+/// ```
+///
+/// A match requires ALL of:
+///
+///   1. A question line beginning `Do you want to …` (box chrome stripped).
+///   2. An option row `1.` whose label begins `yes` — every permission dialog
+///      offers approval as the FIRST option. Operator questions
+///      (`AskUserQuestion`) carry model-written labels instead.
+///   3. Another numbered option row whose label begins `no` — the decline
+///      row Escape maps to.
+///   4. An Escape affordance in the dialog region: a trailing `(esc)` on the
+///      deny row, or an `Esc to cancel` footer.
+///
+/// ## Fails CLOSED
+///
+/// Any missing marker returns `None`, which means "no auto-deny". A dialog
+/// this detector does not recognize is still caught by the broader
+/// `blocking_question_visible` / `ask-question-stale` alarm path, so the
+/// operator is told about it — the daemon just does not touch it. That
+/// asymmetry is deliberate: an unrecognized dialog costs a notification, a
+/// mis-recognized one costs a keystroke into a live session.
+///
+/// Deliberately NOT matched:
+///
+///   * The folder-trust dialog (`Do you trust the files in this folder?`) —
+///     its question does not start with "Do you want to", and declining it
+///     makes Claude Code exit rather than continue. A startup consent dialog
+///     is an operator decision, not a blocked tool call.
+///   * The Bypass-Permissions launch dialog — same reasoning; it has its own
+///     handler (`accept_bypass_permissions_dialog`) driven by explicit
+///     config, and its rows carry no numbers at all.
+///   * `AskUserQuestion` menus — question text is model-written and the
+///     options are not Yes/No, so markers (1)-(3) do not line up.
+///   * Prose that merely contains the word "proceed" in scrollback.
+/// `context_lines` is how many lines above the question to keep as context.
+pub(crate) fn permission_prompt_visible(
+    pane_output: &str,
+    context_lines: usize,
+) -> Option<PermissionPrompt> {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    // Scan a generous tail: the dialog box plus the tool preview above it can
+    // run 20+ rows, and the question sits in the middle of it.
+    let scan_start = lines.len().saturating_sub(40);
+    let tail = &lines[scan_start..];
+
+    // (1) The question line — take the LAST one so a dialog quoted earlier in
+    // scrollback never wins over the live one.
+    let q_idx = tail.iter().rposition(|l| {
+        let s = strip_box_chrome(l).to_lowercase();
+        s.starts_with("do you want to")
+    })?;
+    let question = strip_box_chrome(tail[q_idx]).to_string();
+
+    // (2)/(3) Option rows below the question.
+    let mut yes_first = false;
+    let mut deny_row: Option<u32> = None;
+    let mut esc_affordance = false;
+    let mut last_option_idx = q_idx;
+    for (offset, line) in tail[q_idx + 1..].iter().enumerate() {
+        let idx = q_idx + 1 + offset;
+        let lower = strip_box_chrome(line).to_lowercase();
+        // (4) The Escape affordance may ride on a deny row or a footer line.
+        if lower.contains("(esc)") || lower.contains("esc to cancel") {
+            esc_affordance = true;
+        }
+        if let Some((n, label)) = parse_option_row(line) {
+            last_option_idx = idx;
+            if n == 1 && label.starts_with("yes") {
+                yes_first = true;
+            }
+            if n > 1 && label.starts_with("no") && deny_row.is_none() {
+                deny_row = Some(n);
+            }
+        }
+    }
+
+    if !yes_first || deny_row.is_none() || !esc_affordance {
+        return None;
+    }
+
+    // Context block: the tool/command preview above the question through the
+    // last option row, chrome-stripped, blank rows collapsed. The `❯`
+    // selection cursor is dropped as well — it says where the operator last
+    // moved the highlight, which is not part of the dialog's identity (see
+    // the signature note below).
+    let ctx_start = q_idx.saturating_sub(context_lines);
+    let mut context_rows: Vec<String> = Vec::new();
+    for line in &tail[ctx_start..=last_option_idx] {
+        let s = strip_box_chrome(line);
+        let s = s.strip_prefix('\u{276f}').map(str::trim_start).unwrap_or(s);
+        if s.is_empty() {
+            continue;
+        }
+        context_rows.push(s.to_string());
+    }
+    let mut context = context_rows.join("\n");
+    if context.chars().count() > PERMISSION_PROMPT_CONTEXT_MAX_CHARS {
+        context = context
+            .chars()
+            .take(PERMISSION_PROMPT_CONTEXT_MAX_CHARS)
+            .collect::<String>()
+            + "…";
+    }
+
+    // Stability signature, over the CHROME-STRIPPED, CURSOR-FREE text. The
+    // cursor exclusion is load-bearing, not tidiness: an operator arrowing
+    // between "Yes" and "No" repaints the highlight onto a different row, and
+    // if that read as a new dialog the stale clock would reset every time
+    // anyone glanced at the prompt — the monitor would never reach a
+    // threshold on exactly the dialogs someone is hesitating over. Reuses the
+    // hasher behind the pane-unchanged respawn signal.
+    let signature = crate::respawn::hash_pane_content(&format!("{}\n{}", question, context));
+
+    Some(PermissionPrompt {
+        question,
+        context,
+        signature,
+    })
+}
+
+/// Async wrapper: capture the pane and run `permission_prompt_visible`.
+pub async fn detect_permission_prompt(pane: &str, context_lines: usize) -> Option<PermissionPrompt> {
+    let out = capture_pane(pane).await?;
+    permission_prompt_visible(&out, context_lines)
+}
+
+/// Send the DECLINE keystroke to a permission dialog and report whether the
+/// dialog actually cleared.
+///
+/// One `Escape`, a settle window, then a re-capture: the return value is the
+/// OBSERVED outcome, not the fact that a key was sent. "I pressed a key" is
+/// not evidence the prompt was answered — a pane that has scrolled, a dialog
+/// that re-rendered, or a send-keys that landed in the wrong pane all look
+/// identical from the sender's side.
+pub async fn deny_permission_prompt(pane: &str, context_lines: usize) -> bool {
+    send_keys(pane, &[PERMISSION_PROMPT_DENY_KEY]).await;
+    sleep(std::time::Duration::from_millis(1500)).await;
+    detect_permission_prompt(pane, context_lines).await.is_none()
+}
+
 /// Check if pane shows exit teardown indicators ("Goodbye!" or "Background command was stopped").
 /// During /exit, Claude Code prints these before the process fully terminates.
 pub async fn is_exit_teardown(pane: &str) -> bool {
@@ -3824,6 +4093,285 @@ mod tests {
         let output = "  Background work is running\n\
                         The following will stop when you exit:";
         assert!(!blocking_question_visible(output));
+    }
+
+    // -------------------------------------------------------------------
+    // permission_prompt_visible — the NARROWEST detector, the only one
+    // allowed to drive a keystroke. Fixtures are the dialog shapes Claude
+    // Code actually renders, plus the neighbours that must never match.
+    // -------------------------------------------------------------------
+
+    /// The dialog from the incident this monitor exists for: a guarded `rm`
+    /// raised a permission prompt in the main pane and nobody was there to
+    /// answer it for four and a half hours.
+    const GUARDED_RM_DIALOG: &str = "\u{25cf} Bash(rm -f /tmp/pc.json /tmp_stderr.log)\n\
+         \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}\n\
+         \u{2502} Bash command                                          \u{2502}\n\
+         \u{2502}                                                       \u{2502}\n\
+         \u{2502}   rm -f /tmp/pc.json /tmp_stderr.log                  \u{2502}\n\
+         \u{2502}   Remove scratch files                                \u{2502}\n\
+         \u{2502}                                                       \u{2502}\n\
+         \u{2502} Dangerous rm operation on critical path: /tmp_stderr.log \u{2502}\n\
+         \u{2502}                                                       \u{2502}\n\
+         \u{2502} Do you want to proceed?                               \u{2502}\n\
+         \u{2502} \u{276f} 1. Yes                                            \u{2502}\n\
+         \u{2502}   2. No                                               \u{2502}\n\
+         \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n\
+         Esc to cancel \u{00b7} Tab to amend";
+
+    #[test]
+    fn permission_prompt_fires_on_guarded_rm_dialog() {
+        let p = permission_prompt_visible(GUARDED_RM_DIALOG, 16)
+            .expect("the guarded-rm permission dialog must be detected");
+        assert_eq!(p.question, "Do you want to proceed?");
+        assert!(
+            p.context.contains("rm -f /tmp/pc.json"),
+            "captured context must carry the blocked COMMAND — that is the \
+             whole point of the payload: {}",
+            p.context
+        );
+        assert!(
+            p.context.contains("Dangerous rm operation"),
+            "captured context must carry the reason the prompt was raised: {}",
+            p.context
+        );
+    }
+
+    #[test]
+    fn permission_prompt_fires_on_tell_claude_deny_row() {
+        // The other shape in the wild: three options, with the Escape
+        // affordance riding on the deny row as a trailing "(esc)" instead of
+        // a footer. Note option 2 is a "Yes, and don't ask again" — sending
+        // the digit `2` here would grant a BLANKET approval, which is why the
+        // deny key is Escape and never a digit.
+        let output = "\u{25cf} Update(src/config.rs)\n\
+                      Edit file\n\
+                      Do you want to make this edit to config.rs?\n\
+                      \u{276f} 1. Yes\n\
+                        2. Yes, and don't ask again this session\n\
+                        3. No, and tell Claude what to do differently (esc)";
+        let p = permission_prompt_visible(output, 16).expect("edit permission dialog");
+        assert_eq!(p.question, "Do you want to make this edit to config.rs?");
+    }
+
+    #[test]
+    fn permission_prompt_fires_on_mcp_tool_dialog() {
+        let output = "MCP tool call\n\
+                      \u{2502} mcp__github__create_issue                    \u{2502}\n\
+                      \u{2502} Do you want to allow this tool call?          \u{2502}\n\
+                      \u{2502} \u{276f} 1. Yes                                    \u{2502}\n\
+                      \u{2502}   2. No, and tell Claude what to do differently (esc) \u{2502}";
+        assert!(permission_prompt_visible(output, 16).is_some());
+    }
+
+    #[test]
+    fn permission_prompt_selection_cursor_does_not_change_signature() {
+        // The operator arrowing the selection from "Yes" to "No" repaints the
+        // cursor onto a different row. That is the SAME dialog — if the
+        // signature moved, the stale clock would reset every time someone
+        // looked at it, and the monitor would never reach its thresholds.
+        let on_yes = "Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No, and tell Claude what to do differently (esc)";
+        let on_no = "Do you want to proceed?\n\
+                       1. Yes\n\
+                     \u{276f} 2. No, and tell Claude what to do differently (esc)";
+        let a = permission_prompt_visible(on_yes, 16).expect("cursor on yes");
+        let b = permission_prompt_visible(on_no, 16).expect("cursor on no");
+        assert_eq!(
+            a.signature, b.signature,
+            "moving the selection cursor must not read as a NEW dialog"
+        );
+    }
+
+    #[test]
+    fn permission_prompt_different_command_changes_signature() {
+        // A different tool call IS a different dialog and must restart the
+        // clock — otherwise a newly-raised prompt inherits an old one's age
+        // and gets denied on sight.
+        let first = "Bash command\n\
+                       rm -rf /tmp/a\n\
+                     Do you want to proceed?\n\
+                     \u{276f} 1. Yes\n\
+                       2. No, and tell Claude what to do differently (esc)";
+        let second = "Bash command\n\
+                        rm -rf /tmp/b\n\
+                      Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No, and tell Claude what to do differently (esc)";
+        let a = permission_prompt_visible(first, 16).expect("first");
+        let b = permission_prompt_visible(second, 16).expect("second");
+        assert_ne!(a.signature, b.signature);
+    }
+
+    #[test]
+    fn permission_prompt_not_fired_on_prose_containing_proceed() {
+        // Ordinary assistant output that happens to discuss proceeding. No
+        // option rows, no Escape affordance.
+        let output = "\u{25cf} I'll go ahead and proceed with the migration now.\n\
+                      Do you want to review the plan first? Let me know.\n\
+                      ─────────────\n\
+                      \u{276f}\n\
+                      -- INSERT -- \u{23f5}\u{23f5} bypass permissions on   90000 tokens";
+        assert!(
+            permission_prompt_visible(output, 16).is_none(),
+            "prose must never be treated as a dialog a keystroke can answer"
+        );
+    }
+
+    #[test]
+    fn permission_prompt_not_fired_on_folder_trust_dialog() {
+        // The startup folder-trust dialog. Declining it makes Claude Code
+        // EXIT, so it is an operator decision, not a blocked tool call —
+        // and its question does not open with "Do you want to".
+        let output = "Do you trust the files in this folder?\n\
+                      /home/user/repos/some-repo\n\
+                      \u{276f} 1. Yes, proceed\n\
+                        2. No, exit\n\
+                      Enter to confirm \u{00b7} Esc to cancel";
+        assert!(
+            permission_prompt_visible(output, 16).is_none(),
+            "the folder-trust dialog must never be auto-denied"
+        );
+    }
+
+    #[test]
+    fn permission_prompt_not_fired_on_bypass_permissions_dialog() {
+        // The launch consent screen: unnumbered rows, and its own handler.
+        let output = "WARNING: Claude Code running in Bypass Permissions mode\n\
+                      In Bypass Permissions mode, Claude Code will not ask for your\n\
+                      approval before running potentially dangerous commands.\n\
+                      \u{276f} No, exit\n\
+                        Yes, I accept\n\
+                      Enter to confirm \u{00b7} Esc to cancel";
+        assert!(permission_prompt_visible(output, 16).is_none());
+        // …and the dedicated detector still owns it.
+        assert!(bypass_permissions_dialog_visible(output));
+    }
+
+    #[test]
+    fn permission_prompt_not_fired_on_ask_user_question_menu() {
+        // A real operator question: model-written options, no Yes/No pair.
+        // The generic `blocking_question_visible` alarm still covers it.
+        let output = "Which approach should I take?\n\
+                      \u{276f} 1. Refactor in place\n\
+                        2. Rewrite from scratch\n\
+                        3. Leave as-is\n\
+                      \u{2191}/\u{2193} to select \u{00b7} Enter to confirm \u{00b7} Esc to cancel";
+        assert!(permission_prompt_visible(output, 16).is_none());
+        assert!(
+            blocking_question_visible(output),
+            "an operator question must still reach the stale-question alarm"
+        );
+    }
+
+    #[test]
+    fn permission_prompt_not_fired_on_fleetview_agent_view() {
+        let output = "\u{276f} \n\
+                      ───────────────\n\
+                      -- INSERT -- \u{2191}/\u{2193} to select \u{00b7} Enter to view   413051 tokens\n\
+                      \u{276f} \u{25cf} main\n\
+                      \u{25ef} general-purpose  Add coverage… 1h 4m 0s";
+        assert!(permission_prompt_visible(output, 16).is_none());
+    }
+
+    #[test]
+    fn permission_prompt_not_fired_on_partial_render() {
+        // A mid-repaint frame: the question line has landed but the option
+        // rows have not. Fails closed — the next capture, once the dialog is
+        // whole, starts the clock.
+        let output = "Bash command\n\
+                        rm -f /tmp/pc.json\n\
+                      Do you want to proceed?";
+        assert!(permission_prompt_visible(output, 16).is_none());
+    }
+
+    #[test]
+    fn permission_prompt_requires_escape_affordance() {
+        // Yes/No options but no "(esc)" and no "Esc to cancel" footer: this
+        // is not a dialog we know Escape answers, so we do not touch it.
+        let output = "Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No";
+        assert!(permission_prompt_visible(output, 16).is_none());
+    }
+
+    #[test]
+    fn permission_prompt_requires_yes_as_first_option() {
+        // Question phrased like a permission prompt, but the options are not
+        // the approve/decline pair — so it is not the dialog class Escape has
+        // a defined meaning on.
+        let output = "Do you want to pick a branch?\n\
+                      \u{276f} 1. main\n\
+                        2. No branch (esc)";
+        assert!(permission_prompt_visible(output, 16).is_none());
+    }
+
+    #[test]
+    fn permission_prompt_takes_the_live_dialog_not_a_scrollback_quote() {
+        // An older dialog quoted in scrollback above a live one: the LIVE
+        // (last) question must win, or the daemon would deny based on the
+        // text of a prompt that is already answered.
+        let output = "Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No, and tell Claude what to do differently (esc)\n\
+                      \u{25cf} Bash(git push)\n\
+                      Bash command\n\
+                        git push --force\n\
+                      Do you want to proceed with the force push?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No, and tell Claude what to do differently (esc)";
+        let p = permission_prompt_visible(output, 16).expect("live dialog");
+        assert_eq!(p.question, "Do you want to proceed with the force push?");
+    }
+
+    #[test]
+    fn permission_prompt_deny_key_is_escape() {
+        // Load-bearing: a digit could land on "Yes, and don't ask again"
+        // because option numbering shifts between dialogs. The monitor must
+        // have exactly one key, and it must be the non-approving one.
+        assert_eq!(PERMISSION_PROMPT_DENY_KEY, "Escape");
+    }
+
+    #[test]
+    fn permission_prompt_context_is_length_capped() {
+        // A pathological pane must not turn into a multi-kilobyte pingme.
+        let mut output = String::new();
+        for i in 0..40 {
+            output.push_str(&format!("  filler line {} {}\n", i, "x".repeat(200)));
+        }
+        output.push_str(
+            "Do you want to proceed?\n\
+             \u{276f} 1. Yes\n\
+               2. No, and tell Claude what to do differently (esc)",
+        );
+        let p = permission_prompt_visible(&output, 30).expect("dialog under filler");
+        assert!(
+            p.context.chars().count() <= PERMISSION_PROMPT_CONTEXT_MAX_CHARS + 1,
+            "context must be capped, got {} chars",
+            p.context.chars().count()
+        );
+    }
+
+    #[test]
+    fn parse_option_row_accepts_cursored_and_plain_rows() {
+        assert_eq!(
+            parse_option_row("\u{276f} 1. Yes"),
+            Some((1, "yes".to_string()))
+        );
+        assert_eq!(
+            parse_option_row("  2. No, and tell Claude what to do differently (esc)"),
+            Some((
+                2,
+                "no, and tell claude what to do differently (esc)".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_option_row("\u{2502}   3. Maybe   \u{2502}"),
+            Some((3, "maybe".to_string()))
+        );
+        assert_eq!(parse_option_row("Do you want to proceed?"), None);
+        assert_eq!(parse_option_row("\u{276f}"), None);
     }
 
     // background_work_exit_dialog_visible — the 2.1.x "Background work is
