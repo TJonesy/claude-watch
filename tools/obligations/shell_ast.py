@@ -718,6 +718,102 @@ def command_name_present(cmd: str, targets) -> bool:
     return any(name_matches(n, s) for n in names for s in specs)
 
 
+def invocation_names(cmd: str) -> set:
+    """Set of BASENAMES of every command-POSITION word across all top-level
+    segments AND every ``$(...)`` / backtick command substitution.
+
+    A "command-position word" is the first word of a command context: the
+    head of a segment, and -- because a wrapper like ``sudo`` / ``env`` /
+    ``nohup`` RUNS a following command -- each wrapper word in the leading
+    wrapper chain PLUS the final wrapped head. So::
+
+        invocation_names("sudo apt-get install x") == {"sudo", "apt-get"}
+        invocation_names("nohup sudo tee f")       == {"nohup", "sudo", "tee"}
+        invocation_names("grep sudo file")         == {"grep"}
+        invocation_names("echo 'sudo rm'")         == {"echo"}
+        invocation_names("x && sudo y")            == {"x", "sudo", "y"}
+        invocation_names("msg=$(sudo id)")         == {"sudo", "id"}
+
+    This is the DUAL of ``command_names`` (which STRIPS the wrapper chain to
+    expose only the effective head, so it can never report ``sudo`` itself):
+    here the wrapper words are exactly the point, because a privilege gate
+    cares about ``sudo`` being RUN, not about the command it wraps.
+
+    Leading ``VAR=val`` env-assignments are skipped (not commands), and
+    option flags immediately following a wrapper (``sudo -E apt-get``) are
+    skipped so the wrapped command head is still reported. Occurrences inside
+    quoted args / heredoc bodies are never command-position words (they were
+    absorbed into a single data word during tokenization). Raises
+    ``ShellParseError`` on parse failure so the caller FAILS CLOSED.
+    """
+    parsed = parse(cmd)
+    out: set = set()
+    for seg in parsed.segments:
+        out |= _invocation_words(seg.words)
+        for word in seg.words:
+            for inner in _substitution_bodies(word):
+                out |= invocation_names(inner)
+    return out
+
+
+def _invocation_words(words: List[str]) -> set:
+    """Basenames of the command-position words of ONE segment.
+
+    Walk the leading words: skip ``VAR=val`` env-assignments; skip an option
+    flag (``-x``) that follows a wrapper (it belongs to the wrapper, not a
+    new command); every other word is a command-position word. If that word
+    is a known wrapper (``_PREFIX_WRAPPERS`` -- ``sudo`` / ``env`` /
+    ``nohup`` / ...), CONTINUE the walk to the command it wraps; otherwise it
+    is the head and the walk stops.
+
+    NOTE: value-taking wrapper options (``sudo -u root cmd``) are a known
+    limitation -- the value word (``root``) is reported as a head and the
+    walk stops there. This never hides the WRAPPER itself (``sudo`` is always
+    reported as the first command-position word), which is all the
+    privilege-escalation gate needs; it can only under-report the ultimate
+    wrapped command in that uncommon flag-with-value shape.
+    """
+    out: set = set()
+    for w in words:
+        if _is_env_assignment(w):
+            continue
+        base = os.path.basename(w)
+        if base.startswith("-"):
+            # An option flag to the wrapper we just saw (e.g. ``sudo -E``):
+            # not a command word. Keep looking for the wrapped command.
+            continue
+        out.add(base)
+        if base in _PREFIX_WRAPPERS:
+            continue
+        break
+    return out
+
+
+def command_invokes(cmd: str, targets) -> bool:
+    """True iff any ``targets`` name is a real command-position word (a head
+    OR a wrapper such as ``sudo`` -- see ``invocation_names``) of ``cmd``.
+
+    This is the AST answer to "does this command actually RUN <name>?" -- the
+    question a raw ``\\bname\\b`` regex over the command string cannot
+    answer, because the regex matches the name inside a quoted string, a
+    comment, an argument, or a heredoc body just as readily as a real
+    invocation. It is the matcher behind the privilege-escalation gate:
+    ``command_invokes(cmd, ["sudo", "doas"])`` blocks ``sudo apt-get`` /
+    ``foo | sudo bar`` / ``x && sudo y`` / ``$(sudo z)`` but NOT
+    ``grep 'sudo x'`` / ``echo sudoers`` / a heredoc mentioning sudo.
+
+    ``targets`` is any iterable of name specs (literal or glob -- see
+    ``name_matches``); empty / falsy entries are ignored. Raises
+    ``ShellParseError`` on parse failure so the caller FAILS CLOSED (an
+    unparseable command is exactly where a hidden ``sudo`` would live).
+    """
+    specs = [t for t in (targets or []) if t]
+    if not specs:
+        return False
+    names = invocation_names(cmd)
+    return any(name_matches(n, s) for n in names for s in specs)
+
+
 def name_matches(name: str, spec: str) -> bool:
     """Does a command-head BASENAME match a name spec?
 
@@ -1385,6 +1481,67 @@ def _run_tests() -> int:
         ok("sole: unparseable raises", False, "no exception")
     except ShellParseError:
         ok("sole: unparseable raises", True)
+
+    # --- invocation_names / command_invokes: the privilege-escalation gate ---
+    # command_invokes answers "does this command RUN <name>?" -- catching a
+    # wrapper word like sudo that command_names STRIPS. It must BLOCK a real
+    # sudo invocation and NOT trip on sudo as a string / arg / comment.
+    ESC = ["sudo", "doas"]
+
+    def invokes(c):
+        return command_invokes(c, ESC)
+
+    # must-BLOCK: sudo is an actual command / wrapper.
+    ok("sudo apt-get -> invokes", invokes("sudo apt-get install x"))
+    ok("bare sudo -> invokes", invokes("sudo -v"))
+    ok("pipe RHS sudo -> invokes", invokes("foo | sudo bar"))
+    ok("&& sudo -> invokes", invokes("x && sudo y"))
+    ok("; sudo -> invokes", invokes("echo hi ; sudo rm -rf /x"))
+    ok("$(sudo) substitution -> invokes", invokes("msg=$(sudo id)"))
+    ok("backtick sudo -> invokes", invokes("v=`sudo id`"))
+    ok("nohup sudo wrapper chain -> invokes", invokes("nohup sudo tee f"))
+    ok("env VAR=1 sudo -> invokes", invokes("env FOO=1 sudo apt-get update"))
+    ok("VAR=1 sudo -> invokes", invokes("FOO=1 sudo apt-get update"))
+    ok("sudo -E flag then cmd -> invokes", invokes("sudo -E apt-get update"))
+    ok("abs-path /usr/bin/sudo -> invokes", invokes("/usr/bin/sudo apt-get"))
+    ok("doas escalator -> invokes", invokes("doas pkg_add x"))
+    ok("subshell (sudo x) -> invokes", invokes("(sudo systemctl restart y)"))
+    # invocation_names exposes BOTH the wrapper and the wrapped head.
+    ok("invocation_names sees sudo AND wrapped head",
+       invocation_names("sudo apt-get install x") == {"sudo", "apt-get"})
+    ok("invocation_names wrapper chain",
+       invocation_names("nohup sudo tee f") == {"nohup", "sudo", "tee"})
+
+    # must-PASS (NOT invoked): sudo only as string / arg / comment / heredoc.
+    ok("grep 'sudo x' -> not invoked", not invokes("grep 'sudo x' file"))
+    ok("sudo as a plain arg -> not invoked", not invokes("echo sudo apt-get"))
+    ok("double-quoted sudo -> not invoked", not invokes('echo "run sudo now"'))
+    ok("sudoers substring in word -> not invoked",
+       not invokes("cat /etc/sudoers.d/foo"))
+    ok("sudoers text arg -> not invoked",
+       not invokes("grep -r sudoers /etc"))
+    ok("write text containing sudoers -> not invoked",
+       not invokes("echo 'add NOPASSWD to sudoers' >> notes.txt"))
+    ok("heredoc body mentioning sudo -> not invoked",
+       not invokes("cat <<'EOF'\nremember: sudo apt-get install\nEOF"))
+    ok("sudo inside single-quoted arg -> not invoked",
+       not invokes("session-task queue add 'must not run sudo apt-get'"))
+    ok("empty targets -> not invoked",
+       not command_invokes("sudo apt-get", []))
+    # A non-escalation head is not a false match.
+    ok("plain command not matched as escalator", not invokes("apt-get update"))
+    # command_invokes generalizes to any name (superset of command_names):
+    # a wrapped normal command is still 'invoked'.
+    ok("wrapped normal command invoked",
+       command_invokes("nohup watcher-ctl run x", ["watcher-ctl"]))
+    ok("arg-only normal command NOT invoked",
+       not command_invokes("echo watcher-ctl", ["watcher-ctl"]))
+    # Parse failure raises so callers fail closed.
+    try:
+        command_invokes("sudo 'unterminated", ESC)
+        ok("command_invokes unparseable raises", False, "no exception")
+    except ShellParseError:
+        ok("command_invokes unparseable raises", True)
 
     passed = sum(1 for _, c, _ in cases if c)
     for name, cond, detail in cases:

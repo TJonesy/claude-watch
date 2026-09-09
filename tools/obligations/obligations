@@ -2928,6 +2928,38 @@ def _command_names_present(names, command_string):
     )
 
 
+def _command_invokes(names, command_string):
+    """AST-aware: True iff any name in ``names`` is a real command-POSITION
+    word (a head OR a privilege/wrapper word like ``sudo`` / ``doas`` -- see
+    ``shell_ast.command_invokes``) of ``command_string``.
+
+    This is the ``Bashinvoke:`` / host-bash ``invoke:`` engine and the fix for
+    the privilege-escalation gate: unlike ``_command_names_present`` (whose
+    ``command_names`` STRIPS ``sudo`` to expose the wrapped head, so it can
+    never see ``sudo`` itself), this reports the wrapper word too. A name that
+    appears only inside a quoted arg / heredoc body / comment / as an argument
+    does NOT match -- eliminating the ``\bsudo\b`` regex false positives
+    (``grep 'sudo x'``, ``echo sudoers``, a PR body mentioning sudo).
+
+    FAIL-CLOSED for the escalation use case: shell_ast missing OR the command
+    unparseable => fall back to a whole-word match on the RAW string (the
+    pre-AST ``\bsudo\b`` behavior), so a real ``sudo`` hidden behind a
+    construct we cannot parse still trips the gate. (This is the SAME
+    fail-safe direction as ``_command_names_present``; a parse failure never
+    silently allows a real invocation.)"""
+    if not names:
+        return False
+    if _shell_ast is not None:
+        try:
+            return _shell_ast.command_invokes(command_string or "", names)
+        except _shell_ast.ShellParseError:
+            pass  # fall through to fail-safe word-boundary match
+    return any(
+        re.search(_bashcmd_name_fallback_re(n), command_string or "")
+        for n in names
+    )
+
+
 def _command_is_sole(names, command_string):
     """AST-aware: True iff ``command_string`` is a SINGLE simple command whose
     effective HEAD basename matches one of ``names``, with NO pipeline, NO
@@ -3110,6 +3142,20 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                                      (parser missing / unparseable => NO match
                                      => the exemption does not fire), the safe
                                      direction for an exemption.
+        'Bashinvoke:<names>'      => like 'Bashcmd:', but a WRAPPER word
+                                     ('sudo' / 'doas') counts as a match too.
+                                     'Bashcmd:' strips the wrapper chain to
+                                     expose the wrapped head, so it can never
+                                     see 'sudo' itself; 'Bashinvoke:' reports
+                                     every command-POSITION word (head AND
+                                     wrappers), firing on a REAL 'sudo apt-get'
+                                     / 'foo | sudo bar' / 'x && sudo y' /
+                                     '$(sudo z)' but NOT on 'sudo' inside a
+                                     quoted arg / comment / heredoc. The AST
+                                     replacement for the privilege-escalation
+                                     gate's old 'Bash:\bsudo\b' regex.
+                                     FAIL-CLOSED (unparseable => word-boundary
+                                     fallback). Only matches the Bash tool.
         'mcp__host-bash__run_command:<spec>' / '..._run_script:<spec>'
                                   => matches when tool_name == the host-bash
                                      MCP tool AND, when <spec> is a bare
@@ -3123,6 +3169,12 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                                      regex (anchors / groups / ...) it stays a
                                      body-wide re.search for backward compat
                                      (the arg-conditional clear-path exempts).
+                                     An ``invoke:<names>`` spec (e.g.
+                                     ``invoke:sudo,doas``) is the host-bash
+                                     analogue of ``Bashinvoke:`` -- a
+                                     command-INVOCATION match (wrapper words
+                                     count) against the real body, for the
+                                     privilege-escalation gate.
         '<head>:<regex>'          => matches when tool_name == <head> AND
                                      command_string matches <regex>
         '<name>'                  => matches when tool_name == <name>
@@ -3148,6 +3200,19 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                 return False
             names = {n.strip() for n in rest.split(",") if n.strip()}
             return _command_is_sole(names, command_string)
+        if head == "Bashinvoke":
+            # Command-INVOCATION match: like Bashcmd:, but a wrapper word
+            # (``sudo`` / ``doas``) counts too -- Bashcmd: strips the wrapper
+            # chain to expose the wrapped head, so it cannot see ``sudo``
+            # itself. This is the AST replacement for the ``Bash:\bsudo\b``
+            # regex tool_pattern of the privilege-escalation gate: it fires on
+            # a REAL ``sudo`` invocation but NOT on ``sudo`` in a quoted arg /
+            # comment / heredoc. Only ever matches the Bash tool. FAIL-CLOSED
+            # (unparseable => word-boundary fallback, per _command_invokes).
+            if tool_name != "Bash":
+                return False
+            names = {n.strip() for n in rest.split(",") if n.strip()}
+            return _command_invokes(names, command_string)
         if tool_name != head:
             return False
         # host-bash MCP tools: a bare command-NAME spec is matched AST-aware
@@ -3157,6 +3222,17 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
         # quoted arg / heredoc / PR body. A regex spec (anchors, groups, ...)
         # is left on the re.search path so the arg-conditional lookahead
         # clear-path exempts keep working unchanged.
+        if head in _HOSTBASH_MCP_HEADS and rest.startswith("invoke:"):
+            # AST command-INVOCATION match against the REAL command / script
+            # body a host-bash tool_input carries (the privilege-escalation
+            # gate for host-bash): a wrapper word (``sudo`` / ``doas``) counts,
+            # and a name inside a quoted arg / heredoc / --body does NOT. This
+            # replaces the ``...:\bsudo\b`` regex tool_pattern. FAIL-CLOSED
+            # via _command_invokes. Spec form: ``invoke:sudo,doas``.
+            spec = rest[len("invoke:"):]
+            names = {n.strip() for n in spec.split(",") if n.strip()}
+            cmd_text = _hostbash_command_text(head, command_string)
+            return _command_invokes(names, cmd_text)
         if head in _HOSTBASH_MCP_HEADS and _is_command_name_spec(rest):
             names = {n.strip() for n in rest.split(",") if n.strip()}
             cmd_text = _hostbash_command_text(head, command_string)
