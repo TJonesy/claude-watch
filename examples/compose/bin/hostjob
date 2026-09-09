@@ -736,7 +736,7 @@ def cmd_run(args):
 # hostjob-done claude-event — all fail-soft (guarded by shutil.which, wrapped
 # in try/except) so queue/event plumbing never crashes the reaper.
 _REAPER_TEMPLATE = r"""
-import json, os, shutil, subprocess, sys, time
+import json, os, shutil, subprocess, sys, threading, time
 
 label = os.environ["HOSTJOB_LABEL"]
 sp = os.environ["HOSTJOB_STATUS"]
@@ -824,6 +824,55 @@ def register_when_live():
     except Exception:
         pass
 
+def _registration_retry_loop(stop_event, worker_pid):
+    # register_when_live() gets exactly one shot, called once right after
+    # Popen. If that single attempt fails (transient lock contention on the
+    # queue DB, or the item momentarily not-ready right after `queue add`),
+    # nothing else retries it FOR A QUIET WORKER: the main thread is blocked
+    # on proc.stdout.readline() in the pump loop below, which for a
+    # low/no-output long-lived job (a kubectl port-forward, a `watch` loop)
+    # can block for the job's entire lifetime. The only other retry path,
+    # reconcile()'s self-heal, only runs when a human/agent later calls
+    # `hostjob poll/wait/list/stop` on this label -- which a fire-and-forget
+    # background watch may never get. That combination is exactly what
+    # stranded ots-watch/prom-pf/qwen-pf-style jobs `pending` for their whole
+    # run despite a demonstrably-live worker.
+    #
+    # This background thread closes that gap: it keeps retrying
+    # register_when_live() on its own clock, independent of both worker I/O
+    # and external polling, for as long as the worker stays alive and the
+    # item isn't registered yet. Backoff (5s -> doubling, capped at 5min)
+    # keeps it responsive to transient failures without hammering the queue
+    # DB indefinitely for a job that's *structurally* blocked (e.g. serialized
+    # behind another same-scope item) rather than just unlucky on timing.
+    delay = 5.0
+    while not stop_event.wait(delay):
+        if queue_registered:
+            return
+        if not pid_alive(worker_pid):
+            return
+        register_when_live()
+        if queue_registered:
+            try:
+                write_status({
+                    "label": label, "cmd": cmd, "cwd": cwd,
+                    "status": "running", "rc": None, "pid": worker_pid,
+                    "reaper_pid": os.getpid(), "started_at": started,
+                    "ended_at": None, "queue_id": queue_id,
+                    "queue_registered": queue_registered,
+                })
+            except Exception:
+                pass
+            return
+        delay = min(delay * 2, 300.0)
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
 broker_url = os.environ.get("HOSTJOB_BROKER_URL") or None
 
 def _post_line(line_bytes):
@@ -867,6 +916,20 @@ try:
         "started_at": started, "ended_at": None, "queue_id": queue_id,
         "queue_registered": queue_registered,
     })
+    # If the single register_when_live() attempt above didn't take, keep
+    # retrying on a background thread rather than relying on the pump loop
+    # below (which blocks on worker I/O -- see _registration_retry_loop) or
+    # on someone calling `hostjob poll/wait/list/stop` later. Daemon thread:
+    # never blocks process exit, and is signalled to stop as soon as the
+    # worker's stdout closes.
+    retry_stop = threading.Event()
+    retry_thread = None
+    if queue_id and not queue_registered:
+        retry_thread = threading.Thread(
+            target=_registration_retry_loop, args=(retry_stop, worker_pid),
+            daemon=True,
+        )
+        retry_thread.start()
     # Line-buffered pump: readline() yields a chunk ending in a newline
     # (or the final partial line at EOF). Append the raw bytes to the log
     # file verbatim (preserving the existing byte-for-byte log) and tee
@@ -877,6 +940,7 @@ try:
         except Exception:
             pass
         _post_line(chunk)
+    retry_stop.set()
     try:
         proc.stdout.close()
     except Exception:
