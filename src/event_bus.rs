@@ -80,7 +80,17 @@ pub struct ClaudeWatchAlert<'a> {
     /// Discriminator string matching the codebase alert paths:
     ///   `heartbeat-stale`, `prolonged-thinking`, `watcher-down`,
     ///   `fresh-clear-stuck`, `claude-crashed`, `auto-update-failed`,
-    ///   `auto-update-complete`, `reauth-needed`, `wedged-pane`.
+    ///   `auto-update-complete`, `reauth-needed`, `wedged-pane`,
+    ///   `permission-prompt`, `permission-prompt-denied`,
+    ///   `permission-prompt-deny-failed`.
+    ///
+    /// NOTE on the `permission-prompt*` family: these name a BLOCKED TOOL
+    /// CALL, not an unhealthy session. `permission-prompt` says a tool call is
+    /// waiting on an approval nobody has given — the session is alive and must
+    /// NOT be respawned (mistaking that state for a dead agent is the incident
+    /// the monitor exists for). `permission-prompt-denied` says claude-watch
+    /// declined it: the call was REJECTED and whatever depended on it did not
+    /// run.
     ///
     /// NOTE on `heartbeat-stale`: the CONDITION it names is now "the main loop
     /// has not acked any event in `[ack] stale_minutes`" — see

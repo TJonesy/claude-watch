@@ -491,6 +491,31 @@ pub struct State {
     /// Transient — cleared on daemon load alongside the timer.
     #[serde(default)]
     pub ask_question_alerted: bool,
+
+    // --- Tool-permission prompt monitor (detect -> alert -> auto-deny) ---
+    /// RFC3339 timestamp of when the CURRENT tool-permission dialog was first
+    /// observed. The whole monitor's clock hangs off this: alert at
+    /// `alert_seconds` past it, deny at `auto_deny_seconds` past it.
+    /// Transient — cleared on daemon load, since daemon downtime makes the
+    /// elapsed measurement (and therefore a keystroke decision) unreliable.
+    #[serde(default)]
+    pub permission_prompt_since: Option<String>,
+    /// Stability signature of the dialog the timer belongs to
+    /// (`tmux::PermissionPrompt::signature`). A DIFFERENT signature means a
+    /// different question is on screen, so the timer restarts rather than
+    /// inheriting elapsed time from a dialog that is already gone. This is
+    /// what makes "unchanged across consecutive captures" a precondition of
+    /// ever reaching the deny threshold.
+    #[serde(default)]
+    pub permission_prompt_signature: Option<u64>,
+    /// Whether the `permission-prompt` alert has already fired for the
+    /// current dialog — the alert fires exactly once per dialog.
+    #[serde(default)]
+    pub permission_prompt_alerted: bool,
+    /// Escape keystrokes already sent for the current dialog. Bounded by
+    /// `max_deny_attempts`; reset when the dialog changes or clears.
+    #[serde(default)]
+    pub permission_prompt_deny_attempts: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -775,6 +800,14 @@ pub fn load_state_with_now(path: &str, startup_now: &str) -> State {
     // starts fresh (mirrors thinking_start).
     state.ask_question_pending_since = None;
     state.ask_question_alerted = false;
+    // Same reasoning, with more at stake: this timer's terminal action is a
+    // KEYSTROKE. A `since` stamp that predates daemon downtime would make a
+    // dialog that appeared seconds ago look hours old and trigger an
+    // immediate deny on the first post-restart cycle. Start the clock fresh.
+    state.permission_prompt_since = None;
+    state.permission_prompt_signature = None;
+    state.permission_prompt_alerted = false;
+    state.permission_prompt_deny_attempts = 0;
     state
 }
 
@@ -1211,6 +1244,39 @@ mod tests {
         let loaded2 = load_state(path2);
         assert!(loaded2.ask_question_pending_since.is_none());
         assert!(!loaded2.ask_question_alerted);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn test_permission_prompt_fields_cleared_on_load() {
+        // The permission-prompt timer is transient, and here that is a safety
+        // property rather than hygiene: its terminal action is a KEYSTROKE.
+        // A `since` stamp surviving a daemon restart would make a dialog
+        // raised seconds ago look hours old, and the first post-restart cycle
+        // would deny it on sight.
+        let path = "/tmp/claude-watch-test-permission-prompt.json";
+        let mut state = State::default();
+        state.permission_prompt_since = Some("2026-09-08T20:12:00-04:00".to_string());
+        state.permission_prompt_signature = Some(123456);
+        state.permission_prompt_alerted = true;
+        state.permission_prompt_deny_attempts = 1;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert!(loaded.permission_prompt_since.is_none());
+        assert!(loaded.permission_prompt_signature.is_none());
+        assert!(!loaded.permission_prompt_alerted);
+        assert_eq!(loaded.permission_prompt_deny_attempts, 0);
+        let _ = std::fs::remove_file(path);
+
+        // Old state file (fields absent) deserializes to the same clean slate.
+        let path2 = "/tmp/claude-watch-test-permission-prompt-default.json";
+        std::fs::write(path2, "{}").unwrap();
+        let loaded2 = load_state(path2);
+        assert!(loaded2.permission_prompt_since.is_none());
+        assert!(loaded2.permission_prompt_signature.is_none());
+        assert!(!loaded2.permission_prompt_alerted);
+        assert_eq!(loaded2.permission_prompt_deny_attempts, 0);
         let _ = std::fs::remove_file(path2);
     }
 

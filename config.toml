@@ -808,3 +808,75 @@ reject_enabled = false
 # proceeds autonomously and safely. Carried now so the schema is stable
 # across the phased rollout.
 explanation = "claude-watch auto-rejected this prompt because it blocked the main loop while the operator was away. Do NOT ask again — use your judgement and proceed autonomously with the safest reasonable default, noting the assumption you made."
+
+[permission_prompt_monitor]
+# Detection + auto-DENY of a stale TOOL-PERMISSION prompt — the
+# "Do you want to proceed?" dialog Claude Code raises when a tool call
+# needs approval (a guarded Bash command, an edit outside the workspace,
+# an MCP tool call).
+#
+# Motivating incident: a subagent's Bash call tripped a guarded-command
+# check, the permission dialog opened in the main-loop pane, and nobody
+# was at the keyboard. It sat there four and a half hours. Nothing could
+# tell that state apart from a dead agent — frozen transcript, tool call
+# still in flight — so it was diagnosed as an API death and the agent was
+# respawned; when a human finally dismissed the dialog, the original woke
+# up and dispatched a stale duplicate of work already redone.
+#
+# Two steps: NAME the state (a `permission-prompt` claude-event carrying
+# the dialog text, so the loop knows a tool call is blocked and on what),
+# then, if still unanswered, DECLINE it so the work fails fast and
+# visibly instead of hanging.
+#
+# IT CAN ONLY EVER DECLINE. The single keystroke it can send is Escape —
+# the affordance the dialog documents itself, via a trailing "(esc)" on
+# the deny row or an "Esc to cancel" footer. Never a digit: the deny row
+# is `2.` on a two-option dialog and `3.` when Claude Code also offers
+# "Yes, and don't ask again", so a digit would grant a blanket approval
+# on exactly the guarded dialogs where that is most dangerous. There is
+# no config value that approves a tool call.
+#
+# Four things stand between a rendering artifact and a keystroke:
+#   1. a four-marker signature (question opens "Do you want to", option
+#      1 is "Yes", another option is "No", an Escape affordance is
+#      present) that fails CLOSED on anything unrecognized;
+#   2. the dialog must persist UNCHANGED for the whole auto_deny_seconds
+#      window — any change restarts the clock;
+#   3. two confirming captures `confirm_secs` apart immediately before
+#      the keystroke, which must show the identical dialog;
+#   4. a self-clear interlock (no keystroke while a self-clear owns the
+#      pane).
+# An unrecognized dialog is left alone and still surfaces through the
+# broader ask-question-stale alarm — an unmatched dialog costs a
+# notification, a mis-matched one costs a keystroke into a live session.
+#
+# Events emitted (all HIGH): `permission-prompt` (blocked, grace period
+# elapsed), `permission-prompt-denied` (Escape sent, dialog cleared — the
+# tool call was REJECTED and dependent work did NOT run),
+# `permission-prompt-deny-failed` (dialog survived every attempt; the
+# daemon stops and asks for hands).
+#
+# Master switch for detection + alerting. Default true.
+enabled = true
+# Seconds a permission dialog may sit unanswered before the
+# `permission-prompt` claude-event fires. Default 120 — long enough that
+# an operator mid-answer is never alerted on.
+alert_seconds = 120
+# Gate for the auto-deny ACTION. Set false for alert-only mode
+# (detection + claude-event, no keystroke ever). Default true.
+auto_deny_enabled = true
+# TOTAL seconds pending before Escape is sent, measured from first
+# observation of the dialog (not from the alert). Default 300 = alert at
+# 2 min, deny at 5.
+auto_deny_seconds = 300
+# Seconds between the two confirming captures taken immediately before
+# the deny keystroke. Both must show the identical dialog. Default 3.
+confirm_secs = 3
+# How many Escapes one dialog may receive before the daemon gives up and
+# escalates. Default 2 — a dialog that shrugs off two Escapes is not one
+# this daemon understands, and hammering keys at it is how a recovery
+# path becomes the incident.
+max_deny_attempts = 2
+# Lines of pane context captured ABOVE the question line (tool name and
+# command preview) for the alert payload. Default 16.
+context_lines = 16
