@@ -12,6 +12,8 @@ Covers:
   * `queue unblock <id>` from blocked -> running, refreshes heartbeat,
     preserves blocked_at + block_reason as audit
   * `queue unblock` refuses on non-blocked statuses
+  * `queue unblock` on a scope conflict ALWAYS lifts the block -- lands in
+    pending (serialized behind the peer) instead of refusing
   * a blocked item RELEASES its scope (peer with overlapping scope
     becomes ready -- blocked is not in-flight; #371)
   * `queue done` and `queue abandon` accept blocked items (terminal
@@ -571,13 +573,20 @@ def test_block_unbridges_already_formed_group_live():
 # -------------------- unblock re-acquires + serializes scope ----------------
 
 
-def test_unblock_reacquires_scope_refuses_on_running_conflict():
-    """Unblocking an item whose scope is now held by a running peer REFUSES.
+def test_unblock_reacquires_scope_lands_pending_on_running_conflict():
+    """Unblocking an item whose scope is now held by a running peer ALWAYS
+    lifts the block -- it lands in status=pending (serialized behind the
+    peer), it does NOT refuse.
 
     While blocked the item held no scope, so a peer started running in the
-    same scope. Returning to running would double-occupy the scope, so
-    unblock refuses (exit 3) and the operator must let the peer finish (or
-    abandon) first -- the same serialization guarantee `register` enforces.
+    same scope. Returning straight to running would double-occupy the
+    scope, so unblock can't do that -- but unblocking (clearing the
+    external-blocker state) and running (actually executing) are different
+    things, and the old behavior wrongly conflated them by hard-refusing
+    (exit 3) the whole unblock. The fix: always succeed at clearing
+    `blocked`; if the scope is busy, park the item in the ordinary pending
+    queue instead, where the normal group-head / spawn-check gating takes
+    over and lets it run once the peer's scope frees.
     """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
@@ -590,16 +599,38 @@ def test_unblock_reacquires_scope_refuses_on_running_conflict():
         b = _add(env, "peer", ["repo:reacq"], "--summary", "b")
         _register(env, b["id"])
 
-        # Unblocking `a` would re-acquire repo:reacq, but `b` holds it -> refuse.
-        r = _run(env, "queue", "unblock", a["id"], "--silent")
-        assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
-        assert "cannot re-acquire" in r.stderr.lower()
-        assert b["id"] in r.stderr
-        # `a` stays blocked (the refusal did not flip it).
-        assert _show(env, a["id"])["status"] == "blocked"
+        # Unblocking `a` can't re-acquire repo:reacq (`b` holds it) -> the
+        # block still lifts, but `a` lands in pending, not running.
+        r = _run(env, "queue", "unblock", a["id"], "--silent", "--json",
+                  expect_exit=0)
+        out = json.loads(r.stdout)
+        assert out["status"] == "pending", out
+        assert out["unblocked_at"]
+        # blocked_at/block_reason survive as audit trail.
+        assert out["block_reason"] == "ext"
+        assert out["blocked_at"]
 
-        # --force overrides.
-        r2 = _run(env, "queue", "unblock", a["id"], "--force", "--silent",
+        shown = _show(env, a["id"])
+        assert shown["status"] == "pending"
+
+        # It is NOT ready yet -- `b` still holds the scope.
+        rc, sc = _spawn_check(env, a["id"])
+        assert sc["ok"] is False, sc
+
+        # Once `b` finishes (releases the scope), `a` becomes ready.
+        _run(env, "queue", "done", b["id"], "--silent", expect_exit=0)
+        rc2, sc2 = _spawn_check(env, a["id"])
+        assert sc2["ok"] is True, sc2
+
+        # No --force required for any of the above; the option remains
+        # available to force straight to running despite the conflict.
+        c = _add(env, "second", ["repo:reacq-force"], "--summary", "c")
+        _register(env, c["id"])
+        _run(env, "queue", "block", c["id"], "--reason", "ext2",
+             "--silent", expect_exit=0)
+        d = _add(env, "peer2", ["repo:reacq-force"], "--summary", "d")
+        _register(env, d["id"])
+        r2 = _run(env, "queue", "unblock", c["id"], "--force", "--silent",
                   "--json", expect_exit=0)
         assert json.loads(r2.stdout)["status"] == "running"
 
