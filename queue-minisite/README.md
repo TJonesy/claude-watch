@@ -195,7 +195,26 @@ brand identity lives outside the public image.
 | `QUEUE_SITE_LOGO_URL` | (empty) | Header logo URL (absolute or under `/static/`). Empty = no logo unless `QUEUE_SITE_LOGO_DEFAULT=1`. |
 | `QUEUE_SITE_LOGO_DEFAULT` | (unset) | Set to `1`/`true` to render the bundled `static/claude-watch-logo.png` when `QUEUE_SITE_LOGO_URL` is empty. |
 | `QUEUE_SITE_BRAND` | (empty) | Footer brand string. Empty = no footer. |
-| `QUEUE_SITE_FAVICON_URL` | (empty) | Favicon override. Empty falls back to the bundled generic favicons. |
+| `QUEUE_SITE_FAVICON_URL` | (empty) | Favicon override. Empty falls back to the bundled generic favicons in `static/branding/`. |
+
+### Overriding the whole icon set: `static/branding/`
+
+The favicon set and `logo.svg` live in **`static/branding/`**, not `static/`
+itself, so a deploy can replace all of them by mounting ONE read-only folder
+over `static/branding` — shadowing nothing else. Two constraints make that the
+only safe shape:
+
+- Mounting the files individually pins each host inode, so a later atomic
+  rewrite on the host (write-temp-then-rename, which is how most tooling
+  updates a file) never becomes visible inside the container.
+- Mounting `static/` itself would shadow the app's own frontend —
+  `refresh.js`, `live-log.js`, `style.css`, the vendored morphdom — straight
+  out of the image.
+
+The files in `static/branding/` are the bundled generic defaults; a mount
+layers over them, and `QUEUE_SITE_LOGO_URL` should then point at
+`/static/branding/<file>`. `static/claude-watch-logo.png` stays outside that
+folder on purpose: it is the app's own default logo, not a brand slot.
 
 ## Environment
 

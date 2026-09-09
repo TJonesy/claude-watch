@@ -408,7 +408,17 @@ _HOSTJOB_EXIT_RE = re.compile(r"^hostjob exit (\d+)$")
 #   QUEUE_SITE_BRAND        — short brand string rendered in the
 #                             footer. Empty = no brand text.
 #   QUEUE_SITE_FAVICON_URL  — favicon override. Empty falls back to
-#                             the bundled generic favicon.
+#                             the bundled generic favicons in
+#                             static/branding/.
+#
+# The favicon set and logo.svg live in static/BRANDING/ rather than static/
+# itself so a deploy can replace every brand asset with ONE read-only folder
+# mount over static/branding. Mounting the files one by one pins each host
+# inode (an atomic rewrite on the host then never reaches the container), and
+# mounting static/ would shadow this app's own frontend — refresh.js,
+# live-log.js, style.css, vendored morphdom — right out of the image.
+# static/claude-watch-logo.png stays OUTSIDE that folder deliberately: it is
+# the app's own default logo, not a brand slot for a deploy to overwrite.
 SITE_TITLE = os.environ.get("QUEUE_SITE_TITLE", "queue").strip() or "queue"
 SITE_LOGO_URL = os.environ.get("QUEUE_SITE_LOGO_URL", "").strip()
 SITE_BRAND = os.environ.get("QUEUE_SITE_BRAND", "").strip()
