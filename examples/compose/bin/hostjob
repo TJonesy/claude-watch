@@ -187,6 +187,19 @@ def reconcile(label):
             if st_bin and _queue_register(st_bin, qid, if_absent=True):
                 st["queue_registered"] = True
                 write_status(label, st)
+    elif st.get("status") == "stopped":
+        # Safety net for a 'stopped' row whose queue item was never closed —
+        # either because it predates the stop-time finalize in
+        # `_mark_stopped`, or because that finalize itself failed (queue CLI
+        # transiently unavailable, etc). `reconcile()` is the funnel for
+        # poll/wait/list/stop, so retry here on every call until it succeeds
+        # once (mirrors the pending->running self-heal above).
+        qid = st.get("queue_id")
+        if qid and not st.get("queue_finalized"):
+            st_bin = shutil.which("session-task")
+            if st_bin and _finalize_stopped_queue_item(st_bin, qid, st.get("stop_note")):
+                st["queue_finalized"] = True
+                write_status(label, st)
     return st
 
 
@@ -248,6 +261,51 @@ def _queue_register(st_bin, qid, if_absent=False):
             "hostjob: queue register %s exited %d (continuing).\n%s\n"
             % (qid, reg.returncode,
                reg.stderr.decode("utf-8", "replace").strip())
+        )
+        return False
+    return True
+
+
+def _finalize_stopped_queue_item(st_bin, qid, reason):
+    """Run `session-task queue abandon <qid>` for a hostjob that ended in
+    'stopped' state (killed via SIGTERM/SIGKILL through `hostjob stop`, so it
+    never produced a clean rc for the reaper's own `finalize_queue` to act
+    on).
+
+    This is the CLI-side counterpart to the reaper's `finalize_queue`: the
+    reaper only reaches that call if it survives to see the worker exit, and
+    a `hostjob stop` group-kill can take the reaper down WITH the worker (see
+    the `start_new_session=True` comment on the worker's Popen above) —
+    without this, a stopped job's queue item is orphaned `pending`/`running`
+    forever. `queue abandon` is idempotent on an already-terminal item (a
+    no-op, exit 0), so calling this from both `_mark_stopped` (stop-time) and
+    `reconcile()` (safety net for anything that slipped through, including
+    every already-stuck row predating this fix) is safe — whichever call
+    lands first wins, the other is a harmless no-op.
+
+    Returns True iff the abandon call succeeded (or was already a no-op);
+    False on any refusal/timeout/exception. NEVER raises — queue plumbing
+    must never block the actual stop/poll operation.
+    """
+    argv = [st_bin, "queue", "abandon", qid, "--reason", reason or "hostjob stopped"]
+    try:
+        r = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+    except Exception as e:
+        sys.stderr.write(
+            "hostjob: queue abandon %s failed (%r) (continuing).\n" % (qid, e)
+        )
+        return False
+    if r.returncode != 0:
+        sys.stderr.write(
+            "hostjob: queue abandon %s exited %d (continuing).\n%s\n"
+            % (qid, r.returncode,
+               r.stderr.decode("utf-8", "replace").strip())
         )
         return False
     return True
@@ -905,6 +963,17 @@ try:
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True,
+        # Give the WORKER its own process group, distinct from the reaper's.
+        # The reaper is the session/group leader (spawned with
+        # start_new_session=True in cmd_run); without this, the worker
+        # inherits the reaper's pgid, and _stop_one's group-kill
+        # (`os.killpg(os.getpgid(worker_pid), sig)`) resolves to that SAME
+        # pgid -- SIGTERM/SIGKILL then hits the reaper too, killing it
+        # before it reaches `finalize_queue()` below. That is exactly why a
+        # `hostjob stop`'d job's queue item was never closed: the CLI wrote
+        # status "stopped" itself, but the reaper -- the only thing that
+        # calls `finalize_queue` -- died mid-flight and never ran it.
+        start_new_session=True,
     )
     worker_pid = proc.pid
     # Now that the worker is confirmed live, ensure the queue row is
@@ -1191,6 +1260,18 @@ def _mark_stopped(label, st, rc=None, note=None):
     st["ended_at"] = st.get("ended_at") or time.time()
     if note:
         st["stop_note"] = note
+    # Close the queue item HERE, synchronously, rather than assuming the
+    # reaper's own `finalize_queue` will get to it: `hostjob stop`'s
+    # group-kill can (or, pre-fix, always did) take the reaper down
+    # alongside the worker, in which case the reaper NEVER calls
+    # `finalize_queue` and the queue item is orphaned pending/running
+    # forever. See `_finalize_stopped_queue_item` for why this is safe to
+    # call unconditionally (idempotent server-side).
+    qid = st.get("queue_id")
+    if qid and not st.get("queue_finalized"):
+        st_bin = shutil.which("session-task")
+        if st_bin and _finalize_stopped_queue_item(st_bin, qid, note or st.get("stop_note")):
+            st["queue_finalized"] = True
     write_status(label, st)
     return st
 

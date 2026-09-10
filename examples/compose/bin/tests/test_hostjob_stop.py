@@ -186,6 +186,53 @@ class StopTest(unittest.TestCase):
         rc = self.mod.cmd_stop(_StopArgs(label="no-such-job-xyz", grace=2))
         self.assertEqual(rc, 1)
 
+    def test_stop_closes_queue_item(self):
+        """Regression for the queue-reap leak: a `hostjob stop`'s group-kill
+        used to take the reaper down WITH the worker (same pgid), so the
+        reaper never reached `finalize_queue()` and the queue row was
+        orphaned pending/running forever (Andrew #7702 -- mm-watch-nano,
+        mm-watch-nano2, nano-flashinfer-wait all stuck this way).
+
+        The worker now gets its own process group (`start_new_session=True`
+        on its Popen), so the group-kill only hits the worker, and
+        `_mark_stopped` closes the queue item itself rather than relying on
+        the (possibly-dead) reaper. Assert the queue shim actually saw a
+        `queue abandon` for this label's queue item after stop.
+        """
+        label = "stop-queue-job"
+        self.mod.cmd_run(_RunArgs(label, ["sleep", "120"]))
+        pid = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            st = self.mod.read_status(label)
+            if st and st.get("pid"):
+                pid = st["pid"]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pid, "reaper never recorded a worker pid")
+
+        rc = self.mod.cmd_stop(_StopArgs(label=label, grace=2))
+        self.assertEqual(rc, 0, "stop returned non-zero")
+        self.assertTrue(self._wait_pid_dead(pid), "worker pid still alive after stop")
+
+        st = self.mod.read_status(label)
+        self.assertEqual(st.get("status"), "stopped", st)
+        self.assertTrue(
+            st.get("queue_finalized"),
+            "status.json must record the queue item as finalized: %r" % st,
+        )
+
+        qid = st.get("queue_id")
+        self.assertIsNotNone(qid, "stopped job must carry its queue_id")
+        abandons = self.iso.calls_starting("queue abandon %s" % qid)
+        self.assertTrue(
+            abandons,
+            "`hostjob stop` must close the queue item via `queue abandon "
+            "%s`, not orphan it: %r" % (qid, self.iso.calls()),
+        )
+
+        self.mod.cmd_clean(_CleanArgs(label=label))
+
     def test_run_queue_traffic_stays_inside_the_harness(self):
         """Regression guard: these tests used to leak rows into the operator's
         live queue. `run` DOES create a queue row even with --no-queue, so the
