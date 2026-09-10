@@ -52,7 +52,10 @@ Usage:
                                                  # external blocker (human
                                                  # decision, third-party API,
                                                  # branch-protection, etc.)
-    session-task queue unblock <id>              # blocked -> running
+    session-task queue unblock <id>              # blocked -> running (or
+                                                 # pending if a peer holds
+                                                 # the scope; always lifts
+                                                 # the block, never refuses)
     session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
     session-task queue force-start <id> --reason TEXT [--no-interrupt]
                                                        # MANUAL OVERRIDE: promote
@@ -253,7 +256,8 @@ HOSTJOB_STARTING_WINDOW_SECONDS = float(
 #                 "running without live agent") does NOT fire on blocked
 #                 items -- by design, blocked items have no live agent.
 #                 Set via `queue block <id> --reason ...`. Cleared via
-#                 `queue unblock <id>` (back to running), `queue done <id>`
+#                 `queue unblock <id>` (back to running, or pending if a
+#                 peer now holds the scope), `queue done <id>`
 #                 (work was actually complete) or `queue abandon <id>`.
 #   quarantined -- `queue abandon` was called on an item that OWNED ITS
 #                 SCOPE (running/wedged) without positive evidence that the
@@ -5761,8 +5765,9 @@ def cmd_queue_register(args):
             # but it is still THIS item -- re-registering it in place would
             # lose the block_reason audit trail and race the external action
             # in flight. The operator must explicitly unblock (back to
-            # running, which re-acquires the scope lock and serializes like
-            # any running item) or move it to a terminal state first.
+            # running if the scope is free, else pending -- serialized
+            # behind whichever peer now holds it) or move it to a terminal
+            # state first.
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             print("", file=sys.stderr)
@@ -6714,7 +6719,9 @@ def cmd_queue_block(args):
                      now parked; releases the scope lock it held.
 
     Recovery:
-      * `queue unblock <id>` -- blocked -> running (blocker cleared)
+      * `queue unblock <id>` -- blocked -> running (blocker cleared), or
+                                -> pending if a peer now holds the scope
+                                (serialized; runs when the scope frees)
       * `queue done <id>`    -- blocked -> done (work was actually
                                 complete, just needed acknowledgement)
       * `queue abandon <id>` -- blocked -> abandoned (operator gives up)
@@ -6853,24 +6860,43 @@ def cmd_queue_block(args):
 
 
 def cmd_queue_unblock(args):
-    """Flip a blocked queue item back to status=running.
+    """Flip a blocked queue item back to status=running, or to status=pending
+    (serialized) if a peer now holds its scope.
 
     Used when the external blocker clears -- Andrew greenlit, the
     branch-protection toggle landed, the third-party API window opened,
     etc. The agent (or a fresh agent registered against this id) can
     resume work.
 
-    Behavior:
+    `unblock` ALWAYS lifts the block -- unblocking (clearing the external
+    parked-on-blocker state) and running (actually executing) are different
+    things, and conflating them is exactly the bug this fixes. Behavior:
       * Item must exist and be in status=blocked. Any other status
-        refuses.
-      * RE-ACQUIRES the scope lock. While blocked the item held no scope,
-        so a peer may have started running in an overlapping scope. Returning
-        to running would double-occupy that scope, so unblock REFUSES (exit
-        3) if any other running/wedged item now overlaps this item's scope --
-        the operator must let that work finish (or abandon this item) first,
-        exactly like a fresh `register` serializes. `--force` overrides.
-      * Flips status=running. Refreshes `last_heartbeat_at` so the
-        exporter doesn't immediately re-flag the item as stale.
+        refuses (exit 1) -- that's the only genuine error case left.
+      * While blocked the item held no scope, so a peer may have started
+        running in an overlapping scope since. Re-checks that via
+        `_running_scope_conflicts`, mirroring `register`'s serialization
+        guarantee, but the OUTCOME differs from register:
+          - No conflict (or `--force`) -> status=running. Re-acquires the
+            scope lock, refreshes `last_heartbeat_at` so the exporter
+            doesn't immediately re-flag the item as stale.
+          - Conflict, no `--force` -> status=pending. The block is still
+            lifted (no refusal, no exit 3, no `--force` required) -- the
+            item just can't re-acquire the scope RIGHT NOW because a
+            running/wedged peer holds it. It rejoins the normal pending
+            queue and becomes eligible the instant that peer's scope
+            frees, via the SAME `_item_is_ready` / spawn-check gating any
+            other pending item goes through (`_recompute_group_heads`
+            re-attaches it to the peer's group so the existing group-head
+            logic serializes it -- no bespoke tracking needed). This is
+            the fix: unblock used to HARD-REFUSE (exit 3, "cannot
+            re-acquire its scope ... or pass --force") in this case, which
+            wrongly conflated "can't run this instant" with "can't
+            unblock". A blocked item must always be unblockable; whether
+            it then runs immediately or waits is a separate, ordinary
+            scheduling question.
+      * `--force` still means what it always did: force status=running
+        even with a conflict, for when concurrent execution is known safe.
       * Records `unblocked_at` (ISO timestamp). Preserves `blocked_at` /
         `block_reason` on the row for post-mortem -- they are now the
         audit trail, not current state.
@@ -6898,35 +6924,34 @@ def cmd_queue_unblock(args):
             fh.close()
             sys.exit(1)
 
-        # Re-acquire the scope lock: refuse if another running/wedged item
-        # now holds an overlapping scope (a peer may have spawned while this
-        # item was blocked and holding nothing). Mirrors register's
-        # serialization guarantee. `--force` overrides.
+        # Check whether another running/wedged item now holds an overlapping
+        # scope (a peer may have spawned while this item was blocked and
+        # holding nothing). Unlike `register`, this NEVER refuses the
+        # unblock -- it only decides whether the item lands in running
+        # (scope free, or --force) or pending (serialized behind the peer;
+        # the normal spawn-gating path takes it from there).
+        reacquire_conflicts = []
         if not getattr(args, "force", False):
             reacquire_conflicts = _running_scope_conflicts(
                 items, target.get("scope", []), exclude_id=target.get("id"),
             )
-            if reacquire_conflicts:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-                fh.close()
-                ids = ", ".join(
-                    f"{c['id']}({c.get('group_id')})" for c in reacquire_conflicts
-                )
-                print(
-                    f"unblock refused: {args.id} cannot re-acquire its scope "
-                    f"-- {len(reacquire_conflicts)} running/wedged item(s) now "
-                    f"hold an overlapping scope: {ids}. Let that work finish "
-                    f"(or `queue abandon {args.id}`) first, or pass --force if "
-                    f"concurrent execution is safe.",
-                    file=sys.stderr,
-                )
-                sys.exit(3)
 
         prior_reason = target.get("block_reason") or "(unspecified)"
         now = _fmt_ts()
-        target["status"] = "running"
         target["unblocked_at"] = now
-        target["last_heartbeat_at"] = now
+        serialized_ids = None
+        if reacquire_conflicts:
+            # Lift the block, but don't re-acquire the scope out from under
+            # the peer that now holds it. Land in pending -- the group-head /
+            # `_item_is_ready` machinery that already gates every pending
+            # item will let this one run once the scope frees.
+            target["status"] = "pending"
+            serialized_ids = ", ".join(
+                f"{c['id']}({c.get('group_id')})" for c in reacquire_conflicts
+            )
+        else:
+            target["status"] = "running"
+            target["last_heartbeat_at"] = now
         # Intentionally preserve blocked_at + block_reason on the row --
         # they are now the audit trail, not current state.
         _recompute_group_heads(items)
@@ -6938,13 +6963,16 @@ def cmd_queue_unblock(args):
         raise
 
     log_completed(
-        f"[queue {target['id']} UNBLOCKED] {target.get('description','')}",
+        f"[queue {target['id']} UNBLOCKED -> {target['status'].upper()}] "
+        f"{target.get('description','')}",
         extra={
             "source": "queue",
             "event": "unblock",
             "id": target["id"],
             "group_id": target.get("group_id"),
             "prior_reason": prior_reason,
+            "new_status": target["status"],
+            "serialized_behind": serialized_ids,
         },
     )
 
@@ -6954,6 +6982,11 @@ def cmd_queue_unblock(args):
             f"{_item_summary(target)}\n"
             f"prior reason: {prior_reason} | "
             f"scope: {','.join(target.get('scope', []))}"
+            + (
+                f"\nserialized behind: {serialized_ids}"
+                if serialized_ids
+                else ""
+            )
         ),
         priority="low",
         silent=getattr(args, "silent", False),
@@ -6971,6 +7004,8 @@ def cmd_queue_unblock(args):
             "summary": _item_summary(target),
             "prior_reason": prior_reason,
             "unblocked_at": now,
+            "new_status": target["status"],
+            "serialized_behind": serialized_ids,
             "tier": "ambient",
         },
         priority="low",
@@ -6979,6 +7014,11 @@ def cmd_queue_unblock(args):
 
     if args.json:
         print(json.dumps(updated, indent=2))
+    elif serialized_ids:
+        print(
+            f"unblocked -> pending (serialized behind {serialized_ids}): "
+            f"{args.id} prior_reason={prior_reason!r} unblocked_at={now}"
+        )
     else:
         print(
             f"unblocked: {args.id} prior_reason={prior_reason!r} "
@@ -9176,7 +9216,10 @@ def build_parser():
     q_unblock = qsub.add_parser(
         "unblock",
         help=(
-            "Flip a blocked item back to status=running. Use when the "
+            "Flip a blocked item back to status=running (scope free) or "
+            "status=pending (a running/wedged peer holds the scope -- "
+            "serialized, becomes eligible once that peer clears). ALWAYS "
+            "lifts the block; never refuses on scope overlap. Use when the "
             "external blocker clears (operator greenlit, branch-protection "
             "toggle landed, API window opened). Preserves blocked_at + "
             "block_reason as audit trail."
@@ -9187,11 +9230,11 @@ def build_parser():
     q_unblock.add_argument(
         "--force", action="store_true",
         help=(
-            "Unblock even if another running/wedged item now holds an "
-            "overlapping scope. Default REFUSES such an unblock (returning "
-            "to running would re-acquire the scope lock and double-occupy "
-            "it). Pass --force only if you know the conflicting work is safe "
-            "to run concurrently."
+            "Force status=running even if another running/wedged item "
+            "now holds an overlapping scope, instead of the default "
+            "status=pending (serialized behind that peer). Pass --force "
+            "only if you know the conflicting work is safe to run "
+            "concurrently."
         ),
     )
     q_unblock.add_argument(
