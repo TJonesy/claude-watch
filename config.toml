@@ -852,18 +852,26 @@ explanation = "claude-watch auto-rejected this prompt because it blocked the mai
 # then, if still unanswered, DECLINE it so the work fails fast and
 # visibly instead of hanging.
 #
-# IT CAN ONLY EVER DECLINE. The single keystroke it can send is Escape —
-# the affordance the dialog documents itself, via a trailing "(esc)" on
-# the deny row or an "Esc to cancel" footer. Never a digit: the deny row
-# is `2.` on a two-option dialog and `3.` when Claude Code also offers
-# "Yes, and don't ask again", so a digit would grant a blanket approval
-# on exactly the guarded dialogs where that is most dangerous. There is
-# no config value that approves a tool call.
+# IT CAN ONLY EVER DECLINE. The single keystroke it can send is Escape.
+# Never a digit: the deny row is `2.` on a two-option dialog and `3.`
+# when Claude Code also offers "Yes, and don't ask again", so a digit
+# would grant a blanket approval on exactly the guarded dialogs where
+# that is most dangerous. There is no config value that approves a tool
+# call.
 #
 # Four things stand between a rendering artifact and a keystroke:
 #   1. a four-marker signature (question opens "Do you want to", option
-#      1 is "Yes", another option is "No", an Escape affordance is
-#      present) that fails CLOSED on anything unrecognized;
+#      1 is "Yes", another option is "No"/"Deny", and the box identifies
+#      itself as a TOOL-consent dialog — either by an Escape affordance
+#      it prints itself, a trailing "(esc)" on the deny row or an "Esc to
+#      cancel" footer, or by a recognized tool header above the question
+#      such as "Bash command" / "Edit file" / "MCP tool call") that fails
+#      CLOSED on anything unrecognized. Accepting the header as a second
+#      form is deliberate: a Claude Code build that prints no key hint at
+#      all used to make every real dialog unmatchable, which left the
+#      monitor inert while dialogs sat unanswered. The folder-trust and
+#      Bypass-Permissions dialogs are additionally vetoed by text, since
+#      declining either makes Claude Code EXIT;
 #   2. the dialog must persist UNCHANGED for the whole auto_deny_seconds
 #      window — any change restarts the clock;
 #   3. two confirming captures `confirm_secs` apart immediately before

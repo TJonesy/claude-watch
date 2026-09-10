@@ -764,14 +764,61 @@ fn parse_option_row(line: &str) -> Option<(u32, String)> {
     Some((n, label.to_lowercase()))
 }
 
+/// Tool-consent dialog headers: the title line Claude Code renders at the top
+/// of a TOOL-permission box, immediately above the command / file / tool
+/// preview and the question.
+///
+/// This is marker (4)'s second form, and it exists because the first form —
+/// an Escape affordance printed *by the dialog* — is not something every
+/// Claude Code build renders. A build that dropped both the trailing `(esc)`
+/// on the deny row and the `Esc to cancel` footer made the whole monitor
+/// inert: every real dialog failed marker (4), fell through the fail-closed
+/// path, and sat unanswered exactly as it had before the monitor existed.
+/// Keying the dialog's IDENTITY off its title instead of off a keyboard hint
+/// survives that, because the title names the tool whose call is blocked and
+/// is the same string the box has carried across versions.
+///
+/// Matched as a case-insensitive PREFIX of a chrome-stripped line, so
+/// decorated variants (`Bash command (unsandboxed)`, `Bash command (runs on
+/// …)`, `MCP tool call`) match the bare stem.
+///
+/// Every entry names a blocked TOOL CALL — the only dialog class where the
+/// safe unattended answer is knowable: declining returns a rejection the
+/// agent can read and adapt to. Startup consent screens and operator
+/// questions are deliberately absent (see `PERMISSION_DIALOG_NEVER_MATCH`).
+const PERMISSION_DIALOG_TOOL_HEADERS: &[&str] = &[
+    "bash command",
+    "edit file",
+    "create file",
+    "write file",
+    "overwrite file",
+    "edit notebook",
+    "read file",
+    "mcp tool",
+    "network request outside of sandbox",
+];
+
+/// Dialog text that vetoes a match outright, whatever else lines up.
+///
+/// These are the two dialogs where a keystroke is not a rejected tool call but
+/// a decision with its own consequences: declining folder-trust or the
+/// Bypass-Permissions launch screen makes Claude Code EXIT. Both already miss
+/// the question marker today; the veto is here so that a future rewording
+/// (`Do you want to trust the files in this folder?`) cannot quietly promote
+/// either one into the auto-deny path.
+const PERMISSION_DIALOG_NEVER_MATCH: &[&str] = &[
+    "trust the files in this folder",
+    "bypass permissions",
+];
+
 /// Pure function: does the pane show a TOOL-PERMISSION dialog that is safe to
 /// decline unattended? Returns the parsed dialog (question + context +
 /// stability signature) or `None`.
 ///
 /// ## The signature — all four markers required
 ///
-/// Claude Code renders the dialog as a bordered box, in one of two shapes
-/// seen in the wild:
+/// Claude Code renders the dialog as a bordered box. Three shapes seen in the
+/// wild:
 ///
 /// ```text
 ///   Bash command
@@ -789,6 +836,22 @@ fn parse_option_row(line: &str) -> Option<(u32, String)> {
 ///     2. Yes, and don't ask again this session
 ///     3. No, and tell Claude what to do differently (esc)
 /// ```
+/// ```text
+///   Bash command
+///     rm -f $SP/*.m4v $SP/*.mkv
+///     Clean up scratch files
+///   Dangerous rm operation on possibly-empty variable path: $SP/*.m4v
+///   Do you want to proceed?
+///   ❯ 1. Yes
+///     2. No
+/// ```
+///
+/// The third shape is the one that motivated marker (4)'s second form: no
+/// trailing `(esc)`, no `Esc to cancel` footer, nothing on screen that names a
+/// key at all. A dialog of that shape blocked a subagent's Bash call for
+/// eighteen minutes and was cleared by a human, while the monitor logged
+/// nothing — it had failed closed on the missing Escape affordance. Escape
+/// still answers the dialog; the build simply stopped advertising it.
 ///
 /// A match requires ALL of:
 ///
@@ -796,10 +859,23 @@ fn parse_option_row(line: &str) -> Option<(u32, String)> {
 ///   2. An option row `1.` whose label begins `yes` — every permission dialog
 ///      offers approval as the FIRST option. Operator questions
 ///      (`AskUserQuestion`) carry model-written labels instead.
-///   3. Another numbered option row whose label begins `no` — the decline
-///      row Escape maps to.
-///   4. An Escape affordance in the dialog region: a trailing `(esc)` on the
-///      deny row, or an `Esc to cancel` footer.
+///   3. Another numbered option row whose label begins `no` (or `deny`) — the
+///      decline row Escape maps to.
+///   4. The dialog identifies itself as a TOOL-consent box, by EITHER:
+///      a. an Escape affordance in the dialog region — a trailing `(esc)` on
+///         the deny row, or an `Esc to cancel` footer; OR
+///      b. a recognized tool-consent header above the question
+///         (`PERMISSION_DIALOG_TOOL_HEADERS`) — `Bash command`, `Edit file`,
+///         `MCP tool call`, …
+///
+/// …and no entry of `PERMISSION_DIALOG_NEVER_MATCH` anywhere in the dialog
+/// region.
+///
+/// Form (b) is narrower than it looks: it is reached only by something that
+/// has already cleared markers (1)-(3), so "a Yes/No dialog, about a named
+/// tool call, asking whether to proceed". What it does NOT do is make the
+/// detector match on the header alone — a pane with a `Bash command` preview
+/// and no Yes/No question still returns `None`.
 ///
 /// ## Fails CLOSED
 ///
@@ -815,12 +891,19 @@ fn parse_option_row(line: &str) -> Option<(u32, String)> {
 ///   * The folder-trust dialog (`Do you trust the files in this folder?`) —
 ///     its question does not start with "Do you want to", and declining it
 ///     makes Claude Code exit rather than continue. A startup consent dialog
-///     is an operator decision, not a blocked tool call.
+///     is an operator decision, not a blocked tool call. Also vetoed by text,
+///     so a reworded question cannot promote it.
 ///   * The Bypass-Permissions launch dialog — same reasoning; it has its own
 ///     handler (`accept_bypass_permissions_dialog`) driven by explicit
-///     config, and its rows carry no numbers at all.
+///     config, its rows carry no numbers at all, and it is vetoed by text too.
 ///   * `AskUserQuestion` menus — question text is model-written and the
-///     options are not Yes/No, so markers (1)-(3) do not line up.
+///     options are not Yes/No, so markers (1)-(3) do not line up. The residual
+///     case is a menu that happens to read `Do you want to …` over literal
+///     `1. Yes` / `2. No` rows: such a menu still carries no tool-consent
+///     header, so it matches only through its `Esc to cancel` footer, which is
+///     exactly the exposure this detector has always had. Escape there SKIPS
+///     the question rather than inventing an answer, and only after the same
+///     five-minute unanswered ladder.
 ///   * Prose that merely contains the word "proceed" in scrollback.
 /// `context_lines` is how many lines above the question to keep as context.
 pub(crate) fn permission_prompt_visible(
@@ -849,7 +932,9 @@ pub(crate) fn permission_prompt_visible(
     for (offset, line) in tail[q_idx + 1..].iter().enumerate() {
         let idx = q_idx + 1 + offset;
         let lower = strip_box_chrome(line).to_lowercase();
-        // (4) The Escape affordance may ride on a deny row or a footer line.
+        // (4a) The Escape affordance may ride on a deny row or a footer line.
+        // Present on some Claude Code builds and absent on others, which is
+        // why it is one of two accepted forms rather than a hard requirement.
         if lower.contains("(esc)") || lower.contains("esc to cancel") {
             esc_affordance = true;
         }
@@ -858,13 +943,19 @@ pub(crate) fn permission_prompt_visible(
             if n == 1 && label.starts_with("yes") {
                 yes_first = true;
             }
-            if n > 1 && label.starts_with("no") && deny_row.is_none() {
+            // "Deny, and tell Claude what to do differently" is the same row
+            // under a different word; accepting both keeps a rename from
+            // silencing the monitor the way the missing Escape hint did.
+            if n > 1
+                && (label.starts_with("no") || label.starts_with("deny"))
+                && deny_row.is_none()
+            {
                 deny_row = Some(n);
             }
         }
     }
 
-    if !yes_first || deny_row.is_none() || !esc_affordance {
+    if !yes_first || deny_row.is_none() {
         return None;
     }
 
@@ -874,6 +965,38 @@ pub(crate) fn permission_prompt_visible(
     // moved the highlight, which is not part of the dialog's identity (see
     // the signature note below).
     let ctx_start = q_idx.saturating_sub(context_lines);
+
+    // (4b) A recognized tool-consent header ABOVE the question — the dialog
+    // naming the tool whose call is blocked. Searched over the same window
+    // that becomes the alert context, so whatever the operator would be shown
+    // is what the decision was made on.
+    let tool_header = tail[ctx_start..q_idx].iter().any(|line| {
+        let s = strip_box_chrome(line).to_lowercase();
+        PERMISSION_DIALOG_TOOL_HEADERS
+            .iter()
+            .any(|h| s.starts_with(h))
+    });
+
+    if !esc_affordance && !tool_header {
+        return None;
+    }
+
+    // The veto: a dialog whose decline is an operator decision with its own
+    // consequences, not a rejected tool call. Checked over the whole dialog
+    // region (preview + question + rows) and AFTER the markers, so it can only
+    // ever subtract matches.
+    let region_lower = tail[ctx_start..=last_option_idx]
+        .iter()
+        .map(|l| strip_box_chrome(l).to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if PERMISSION_DIALOG_NEVER_MATCH
+        .iter()
+        .any(|veto| region_lower.contains(veto))
+    {
+        return None;
+    }
+
     let mut context_rows: Vec<String> = Vec::new();
     for line in &tail[ctx_start..=last_option_idx] {
         let s = strip_box_chrome(line);
@@ -4287,12 +4410,126 @@ mod tests {
     }
 
     #[test]
-    fn permission_prompt_requires_escape_affordance() {
-        // Yes/No options but no "(esc)" and no "Esc to cancel" footer: this
-        // is not a dialog we know Escape answers, so we do not touch it.
+    fn permission_prompt_requires_escape_affordance_or_tool_header() {
+        // Yes/No options, no "(esc)", no "Esc to cancel" footer AND no
+        // tool-consent header: nothing here says this box is a blocked tool
+        // call, so we do not touch it.
         let output = "Do you want to proceed?\n\
                       \u{276f} 1. Yes\n\
                         2. No";
+        assert!(permission_prompt_visible(output, 16).is_none());
+    }
+
+    /// The dialog from the incident that motivated marker (4b): a subagent's
+    /// scratch cleanup tripped the dangerous-`rm` guard and the box rendered
+    /// NO Escape affordance at all — no trailing `(esc)` on the deny row, no
+    /// `Esc to cancel` footer. The monitor failed closed, logged nothing, and
+    /// the dialog blocked the pane for eighteen minutes until a human cleared
+    /// it. The `Bash command` header is what now identifies it.
+    const GUARDED_RM_DIALOG_NO_ESC_HINT: &str =
+        "\u{25cf} Bash(rm -f $SP/*.m4v $SP/*.mkv)\n\
+         \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}\n\
+         \u{2502} Bash command                                          \u{2502}\n\
+         \u{2502}                                                       \u{2502}\n\
+         \u{2502}   rm -f $SP/*.m4v $SP/*.avi $SP/*.mkv                 \u{2502}\n\
+         \u{2502}   Clean up scratch files                              \u{2502}\n\
+         \u{2502}                                                       \u{2502}\n\
+         \u{2502} Dangerous rm operation on possibly-empty variable path: $SP/*.m4v \u{2502}\n\
+         \u{2502}                                                       \u{2502}\n\
+         \u{2502} Do you want to proceed?                               \u{2502}\n\
+         \u{2502} \u{276f} 1. Yes                                            \u{2502}\n\
+         \u{2502}   2. No                                               \u{2502}\n\
+         \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}";
+
+    #[test]
+    fn permission_prompt_fires_on_guarded_rm_dialog_without_escape_hint() {
+        let p = permission_prompt_visible(GUARDED_RM_DIALOG_NO_ESC_HINT, 16)
+            .expect("a Yes/No tool-consent dialog must match on its header alone");
+        assert_eq!(p.question, "Do you want to proceed?");
+        assert!(
+            p.context.contains("possibly-empty variable path"),
+            "captured context must carry the reason the prompt was raised: {}",
+            p.context
+        );
+        assert!(
+            p.context.contains("rm -f $SP/*.m4v"),
+            "captured context must carry the blocked COMMAND: {}",
+            p.context
+        );
+    }
+
+    #[test]
+    fn permission_prompt_fires_on_header_only_edit_and_mcp_dialogs() {
+        // Every tool-consent class, stripped of the Escape hint: the header is
+        // the only thing identifying them, and all of them are safe to decline.
+        for header in [
+            "Bash command (unsandboxed)",
+            "Edit file",
+            "Create file",
+            "Write file",
+            "Overwrite file",
+            "Edit notebook",
+            "Read file",
+            "MCP tool call",
+            "Network request outside of sandbox",
+        ] {
+            let output = format!(
+                "{}\n  some/target\nDo you want to proceed?\n\u{276f} 1. Yes\n  2. No",
+                header
+            );
+            assert!(
+                permission_prompt_visible(&output, 16).is_some(),
+                "tool-consent dialog with header {:?} must be detected",
+                header
+            );
+        }
+    }
+
+    #[test]
+    fn permission_prompt_accepts_a_deny_worded_decline_row() {
+        // Defensive: some dialogs word the decline row "Deny, and tell Claude
+        // what to do differently". A wording change must not silence the
+        // monitor the way the dropped Escape hint did.
+        let output = "Bash command\n\
+                        rm -rf /tmp/a\n\
+                      Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. Deny, and tell Claude what to do differently";
+        assert!(permission_prompt_visible(output, 16).is_some());
+    }
+
+    #[test]
+    fn permission_prompt_header_alone_is_not_a_dialog() {
+        // A tool preview with no question and no option rows — marker (4b)
+        // must never be sufficient on its own.
+        let output = "Bash command\n  rm -rf /tmp/a\n  Remove scratch files";
+        assert!(permission_prompt_visible(output, 16).is_none());
+    }
+
+    #[test]
+    fn permission_prompt_vetoes_a_reworded_folder_trust_dialog() {
+        // Hypothetical rewording that WOULD clear markers (1)-(3) and carries
+        // an Escape footer. Declining folder-trust makes Claude Code EXIT, so
+        // the text veto keeps it out regardless of shape.
+        let output = "Do you want to trust the files in this folder?\n\
+                      /home/user/repos/some-repo\n\
+                      \u{276f} 1. Yes, proceed\n\
+                        2. No, exit\n\
+                      Enter to confirm \u{00b7} Esc to cancel";
+        assert!(
+            permission_prompt_visible(output, 16).is_none(),
+            "the folder-trust dialog must never be auto-denied, however worded"
+        );
+    }
+
+    #[test]
+    fn permission_prompt_vetoes_a_numbered_bypass_permissions_dialog() {
+        // Same veto for the launch consent screen, here given numbered Yes/No
+        // rows it does not currently have.
+        let output = "WARNING: Claude Code running in Bypass Permissions mode\n\
+                      Do you want to proceed?\n\
+                      \u{276f} 1. Yes, I accept\n\
+                        2. No, exit (esc)";
         assert!(permission_prompt_visible(output, 16).is_none());
     }
 
