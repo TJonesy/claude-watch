@@ -534,12 +534,12 @@ fn default_interrupt_enabled() -> bool {
 
 /// Default ack-stale recovery prompt. Single-line (the tmux inject pipeline
 /// assumes single-line). Liveness is the age of the last ack of ANY event, so
-/// the prompt's only instruction is to run the per-batch ack reflex — one
-/// bare command, no key lookup, no file to touch. Marked `[CLAUDE-WATCH]` so
+/// the prompt's only instruction is to ack every pending key individually
+/// (the batch reflex was disabled 2026-09-11), no file to touch. Marked `[CLAUDE-WATCH]` so
 /// the loop recognises it as a daemon interrupt, and asks for a watcher
 /// sanity-check so a genuinely-wedged event pipeline still gets surfaced.
 fn default_ack_stale_prompt() -> String {
-    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack-batch --override-reason \"<why>\"` NOW (--override-reason is required and audited; it acks every pending entry and stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM the operator with the details.".to_string()
+    "[CLAUDE-WATCH] No claude-event has been acked for longer than the stale window — from here the loop looks wedged. Run `event-ack ack \"<key>\" --action \"<what you did>\"` for EVERY pending key NOW (ack-batch is permanently disabled; each per-key ack stamps the liveness timestamp). Then check why events weren't reaching you (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM the operator with the details.".to_string()
 }
 
 /// Default post-clear resume prompt. Single-line (the tmux inject pipeline
@@ -1318,7 +1318,7 @@ fn default_malformed_override_marker() -> String {
 }
 
 fn default_malformed_nudge() -> String {
-    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). A one-off: re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is up (watcher-ctl status) and re-run `event-ack ack-batch` if it was an event-ack turn. But if malformed calls KEEP recurring, the render state is poisoned and retrying will just reproduce them — run /clear to reset it instead of re-emitting the same call.".to_string()
+    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). A one-off: re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is up (watcher-ctl status) and re-run your per-key `event-ack ack \"<key>\" --action \"...\"` if it was an event-ack turn. But if malformed calls KEEP recurring, the render state is poisoned and retrying will just reproduce them — run /clear to reset it instead of re-emitting the same call.".to_string()
 }
 
 fn default_malformed_hard_block_nudge() -> String {
@@ -2081,7 +2081,7 @@ const RETIRED_CONFIG_KEYS: &[(&str, &str, &str)] = &[(
     "heartbeat_file",
     "the host heartbeat file was retired 2026-08-22 — liveness is now the age \
      of the last event ack (`[ack] stale_minutes`), stamped by `event-ack \
-     ack-batch`. Delete the key; nothing touches that file any more",
+     ack`. Delete the key; nothing touches that file any more",
 )];
 
 /// Warn (once per load) about retired keys still present in the merged config.
@@ -2848,8 +2848,12 @@ cooldown = 300
         // ritual has not crept back in.
         let p = default_ack_stale_prompt();
         assert!(
-            p.contains("event-ack ack-batch"),
-            "ack-stale prompt must name the per-batch ack command; got: {p:?}"
+            p.contains("event-ack ack "),
+            "ack-stale prompt must name the per-key ack command; got: {p:?}"
+        );
+        assert!(
+            !p.contains("event-ack ack-batch"),
+            "ack-stale prompt must NOT tell the loop to RUN the disabled ack-batch command; got: {p:?}"
         );
         assert!(
             !p.contains("touch") && !p.to_lowercase().contains("heartbeat file"),
