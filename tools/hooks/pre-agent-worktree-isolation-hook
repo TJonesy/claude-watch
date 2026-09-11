@@ -24,6 +24,9 @@ Each non-blank, non-comment (``#``) line is a pipe-separated record:
     ``git worktree add`` source). Read by worktree-create-hook; this hook
     ignores it.
 
+Setting ``WORKTREE_ISOLATION_REPOS`` (os.pathsep-separated paths) REPLACES
+both defaults -- for tests and local debugging.
+
 If no config file is present (or contains zero parsed entries) the hook is a
 no-op and allows all Agent spawns. This makes the hook safe to install on
 hosts that don't have any shared-repo collision risk.
@@ -32,6 +35,22 @@ Sample config (place at /etc/claude-code/worktree-isolation-repos.txt)::
 
     # repo_key | prompt_regex | upstream_path
     claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\b(?:hndrewaall|gbre-org)/claude-watch\b|\bgithub\.com/(?:hndrewaall|gbre-org)/claude-watch\b)|/home/USER/repos/claude-watch
+
+Explicit repo-selection marker
+------------------------------
+A prompt can name its repo directly instead of relying on the regex::
+
+    Worktree repo: claude-watch
+
+The marker is a whole line (leading/trailing whitespace ignored, label
+case-insensitive) whose value must be an EXACT ``repo_key`` from the opt-in
+list -- never a free-form path. A prompt carrying it counts as a match here
+(so the spawn still needs ``isolation: "worktree"``), and the companion
+``worktree-create-hook`` uses it to pick the upstream repo. A marker naming a
+key that is NOT opted in is ignored by this hook and falls back to the
+regexes; the create hook refuses it loudly.
+
+KEEP IN SYNC with worktree-create-hook.
 
 Decision protocol (matches the other PreToolUse hooks in this directory):
 - Exit 0 with empty JSON ``{}`` -> allow silently.
@@ -108,6 +127,10 @@ CONFIG_FILES = [
     Path(os.path.expanduser("~/.config/claude-watch/worktree-isolation-repos.txt")),
 ]
 
+# Test/debug override: os.pathsep-separated config paths REPLACING the
+# defaults above. KEEP IN SYNC with worktree-create-hook.
+CONFIG_ENV_VAR = "WORKTREE_ISOLATION_REPOS"
+
 BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 BYPASS_LOG_PATH = BYPASS_LOG_DIR / "worktree-isolation-bypass.log"
 
@@ -123,6 +146,13 @@ CACHE_TTL_SECONDS = 60
 # marker so a bare mention does not trigger the bypass.
 MARKER = "WORKTREE_ISOLATION_NOT_REQUIRED:"
 MARKER_REASON_MAX = 200
+
+# Explicit repo-selection marker -- a whole line naming an opted-in repo_key.
+# KEEP IN SYNC with worktree-create-hook.
+REPO_MARKER_RE = re.compile(
+    r"^[ \t]*Worktree[ \t]+repo:[ \t]*(\S+)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _allow() -> dict:
@@ -154,6 +184,14 @@ def _banner(repo_key: str, specific_reason: str, opted_in_keys: list[str]) -> st
         "!!\n"
         "!! Fix: re-spawn the Agent tool call with isolation: \"worktree\"\n"
         "!!\n"
+        "!! KEEP the prompt's reference to the repo when you re-spawn. The\n"
+        "!! worktree allocator reads the SAME prompt to find the upstream repo;\n"
+        "!! a rewrite that adds isolation but drops the repo path leaves it with\n"
+        "!! nothing to match. Safest is to name the repo explicitly by adding\n"
+        "!! this line to the prompt:\n"
+        "!!\n"
+        f"!!   Worktree repo: {repo_key}\n"
+        "!!\n"
         f"!! What was wrong: {specific_reason}\n"
         "!!\n"
         f"!! Opted-in repos: {', '.join(opted_in_keys) or '(none)'}\n"
@@ -171,8 +209,21 @@ def _banner(repo_key: str, specific_reason: str, opted_in_keys: list[str]) -> st
     )
 
 
+def _config_files() -> list[Path]:
+    """Config paths to read: the ``WORKTREE_ISOLATION_REPOS`` override, else
+    the system + user defaults."""
+    raw = os.environ.get(CONFIG_ENV_VAR, "").strip()
+    if raw:
+        return [
+            Path(os.path.expanduser(part))
+            for part in raw.split(os.pathsep)
+            if part.strip()
+        ]
+    return CONFIG_FILES
+
+
 def _load_opted_in_repos(
-    config_files: list[Path] = CONFIG_FILES,
+    config_files: list[Path] | None = None,
 ) -> list[tuple[str, re.Pattern[str]]]:
     """Read opted-in repos from the config files.
 
@@ -187,6 +238,8 @@ def _load_opted_in_repos(
     config files exist or all entries are malformed -- in that case the hook
     is effectively a no-op.
     """
+    if config_files is None:
+        config_files = _config_files()
     out: list[tuple[str, re.Pattern[str]]] = []
     for path in config_files:
         try:
@@ -268,11 +321,33 @@ def _extract_marker_reason(prompt: str) -> str | None:
     return reason.strip()[:MARKER_REASON_MAX]
 
 
+def _extract_repo_marker(prompt: str) -> str | None:
+    """Return the repo_key named by a ``Worktree repo: <key>`` line, if any."""
+    if not prompt:
+        return None
+    m = REPO_MARKER_RE.search(prompt)
+    if m is None:
+        return None
+    return m.group(1).strip() or None
+
+
 def _find_opted_in_repo(
     prompt: str, opted_in: list[tuple[str, re.Pattern[str]]]
 ) -> str | None:
+    """Which opted-in repo does this prompt touch?
+
+    An explicit ``Worktree repo: <repo_key>`` line wins over the regexes, but
+    only for an EXACT key from the opt-in list. An unknown key falls back to
+    the regexes here (the create hook is the one that refuses it loudly) --
+    this hook must never *deny* on the strength of a marker it cannot resolve.
+    """
     if not prompt:
         return None
+    marker_key = _extract_repo_marker(prompt)
+    if marker_key is not None:
+        for repo_key, _pattern in opted_in:
+            if repo_key == marker_key:
+                return repo_key
     for repo_key, pattern in opted_in:
         if pattern.search(prompt):
             return repo_key
@@ -653,6 +728,62 @@ def _run_tests() -> int:  # noqa: C901
         "M6c. extract reason returns empty string when marker has no tail",
         _extract_marker_reason("WORKTREE_ISOLATION_NOT_REQUIRED:") == "",
     )
+
+    print("=== Explicit `Worktree repo:` marker tests ===")
+
+    # The failure this marker exists for: a prompt that names the repo only
+    # via the marker (the path reference was dropped in a re-spawn rewrite).
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Fix the hook bug on a feature branch.\nWorktree repo: claude-watch\n",
+        },
+    }, _TEST_OPTED_IN)
+    _check("R1. marker-only prompt + no isolation denies", _is_deny(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Fix the hook bug on a feature branch.\nWorktree repo: claude-watch\n",
+            "isolation": "worktree",
+        },
+    }, _TEST_OPTED_IN)
+    _check("R2. marker-only prompt + isolation allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Do a thing.\nWorktree repo: not-an-opted-in-repo\n"},
+    }, _TEST_OPTED_IN)
+    _check("R3. marker naming non-opted-in key does not deny", _is_allow(out), f"out={out}")
+
+    _check(
+        "R4a. marker parsed from its own line",
+        _extract_repo_marker("intro\nWorktree repo: claude-watch\nrest") == "claude-watch",
+    )
+    _check(
+        "R4b. marker label is case-insensitive",
+        _extract_repo_marker("worktree REPO:   media-tools  ") == "media-tools",
+    )
+    _check(
+        "R4c. mid-line mention is not a marker",
+        _extract_repo_marker("see Worktree repo: claude-watch for context") is None,
+    )
+    _check(
+        "R4d. absent marker returns None",
+        _extract_repo_marker("plain prompt") is None,
+    )
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Diagnostics only.\n"
+                "Worktree repo: claude-watch\n"
+                "WORKTREE_ISOLATION_NOT_REQUIRED: meta investigation\n"
+            ),
+        },
+    }, _TEST_OPTED_IN)
+    _check("R5. opt-out marker still wins over repo marker", _is_allow(out), f"out={out}")
 
     print("=== Config-file loader tests ===")
 
