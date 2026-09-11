@@ -29,13 +29,34 @@ Each non-blank, non-comment (``#``) line is a pipe-separated record:
   - ``upstream_path`` -- absolute path to the upstream working tree (the
     ``git worktree add`` target).
 
+Setting ``WORKTREE_ISOLATION_REPOS`` (os.pathsep-separated paths) REPLACES
+both defaults -- for tests and local debugging.
+
 KEEP IN SYNC with pre-agent-worktree-isolation-hook (same file format,
-same loader semantics).
+same loader semantics, same ``Worktree repo:`` override marker).
 
 Sample config (place at /etc/claude-code/worktree-isolation-repos.txt)::
 
     # repo_key | prompt_regex | upstream_path
     claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\b(?:hndrewaall|gbre-org)/claude-watch\b|\bgithub\.com/(?:hndrewaall|gbre-org)/claude-watch\b)|/home/USER/repos/claude-watch
+
+Explicit repo-selection marker
+------------------------------
+A prompt can name its repo directly instead of relying on the regex::
+
+    Worktree repo: claude-watch
+
+The marker is a whole line (leading/trailing whitespace ignored, label
+case-insensitive) whose value must be an EXACT ``repo_key`` from the opt-in
+list -- never a free-form path. It takes precedence over the regexes, and a
+marker naming a key that is not opted in is REFUSED rather than ignored.
+``pre-agent-worktree-isolation-hook`` honours the same marker, so a prompt
+carrying it is treated as "touches that repo" by the isolation gate too.
+
+This exists because the regexes match *incidental prose* (the repo's path or
+slug). A spawner that rewrites a prompt can silently drop the only phrase
+that matched; the marker is the stable, intentional way to say which repo a
+worktree belongs to.
 
 Contract (Claude Code harness, verified 2026-05-19)
 ---------------------------------------------------
@@ -49,9 +70,22 @@ Contract (Claude Code harness, verified 2026-05-19)
   harness's default behaviour (i.e. "not opted in, you handle it").
 - stdout for ``WorktreeRemove``: ignored by the harness; we just clean up
   and exit 0.
-- Exit 0 always. Non-zero on ``WorktreeCreate`` would abort the spawn, which
-  is too aggressive for a hook bug -- default-OPEN (empty stdout = pass-through)
-  preserves the existing "not in a git repo" error rather than masking it.
+
+Exit codes / failure posture
+----------------------------
+``WorktreeRemove`` always exits 0. ``WorktreeCreate`` exits 0 on success and
+on a *viable* pass-through, and exits 2 -- with an actionable stderr
+diagnostic -- when it cannot allocate and pass-through cannot work either.
+
+Pass-through is viable only when the harness can allocate the worktree
+itself, i.e. the session ``cwd`` is inside a git working tree. When it is
+not (the case this hook exists for), empty stdout makes the harness report
+the opaque "hook succeeded but returned no worktree path", which names
+neither the cause nor the fix. Exiting non-zero surfaces our stderr instead:
+the opted-in repo keys and the two ways to make the prompt select one.
+
+The hook is still a silent no-op when no config file is present / parses,
+so it is safe to install on a host with no opted-in repos.
 
 Audit log: best-effort newline-delimited JSON to
 ``~/.config/claude/worktree-create.log`` (0600).
@@ -77,6 +111,11 @@ CONFIG_FILES = [
     Path(os.path.expanduser("~/.config/claude-watch/worktree-isolation-repos.txt")),
 ]
 
+# Test/debug override: os.pathsep-separated config paths REPLACING the
+# defaults above. Keeps the subprocess tests hermetic on hosts (CI) that have
+# no config installed. KEEP IN SYNC with pre-agent-worktree-isolation-hook.
+CONFIG_ENV_VAR = "WORKTREE_ISOLATION_REPOS"
+
 LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 LOG_PATH = LOG_DIR / "worktree-create.log"
 
@@ -90,6 +129,31 @@ WORKTREE_BASE_TMPL = "/tmp/{repo_key}-worktrees"
 CACHE_DIR = Path(os.path.expanduser("~/.cache/claude"))
 CACHE_TTL_SECONDS = 30
 CACHE_FILENAME_TMPL = "last-agent-prompt-{session_id}.txt"
+
+# Explicit repo-selection marker -- a whole line naming an opted-in repo_key.
+# KEEP IN SYNC with pre-agent-worktree-isolation-hook.
+REPO_MARKER_RE = re.compile(
+    r"^[ \t]*Worktree[ \t]+repo:[ \t]*(\S+)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Exit code used when WorktreeCreate cannot allocate and pass-through would
+# only produce the harness's opaque "returned no worktree path" error.
+EXIT_REFUSED = 2
+
+
+class WorktreeCreateRefused(Exception):
+    """Raised when WorktreeCreate must fail loudly instead of passing through.
+
+    ``str(exc)`` is the operator-facing diagnostic written to stderr; the
+    harness surfaces hook stderr on a non-zero exit, which is the only channel
+    that reaches whoever wrote the prompt.
+    """
+
+    def __init__(self, message: str, *, reason: str, extra: dict | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.extra = extra or {}
 
 
 def _log(record: dict) -> None:
@@ -111,8 +175,21 @@ def _log(record: dict) -> None:
         pass
 
 
+def _config_files() -> list[Path]:
+    """Config paths to read: the ``WORKTREE_ISOLATION_REPOS`` override, else
+    the system + user defaults."""
+    raw = os.environ.get(CONFIG_ENV_VAR, "").strip()
+    if raw:
+        return [
+            Path(os.path.expanduser(part))
+            for part in raw.split(os.pathsep)
+            if part.strip()
+        ]
+    return CONFIG_FILES
+
+
 def _load_opted_in_repos(
-    config_files: list[Path] = CONFIG_FILES,
+    config_files: list[Path] | None = None,
 ) -> list[tuple[str, re.Pattern[str], Path]]:
     """Read opted-in repos from the config files.
 
@@ -123,6 +200,8 @@ def _load_opted_in_repos(
     Lines with a missing or malformed upstream_path are skipped (since this
     hook actually needs the path to allocate the worktree).
     """
+    if config_files is None:
+        config_files = _config_files()
     out: list[tuple[str, re.Pattern[str], Path]] = []
     for path in config_files:
         try:
@@ -169,6 +248,92 @@ def _find_opted_in(
         if pattern.search(prompt):
             return (repo_key, upstream)
     return None
+
+
+def _extract_repo_marker(prompt: str) -> str | None:
+    """Return the repo_key named by a ``Worktree repo: <key>`` line, if any."""
+    if not prompt:
+        return None
+    m = REPO_MARKER_RE.search(prompt)
+    if m is None:
+        return None
+    return m.group(1).strip() or None
+
+
+def _find_opted_in_by_key(
+    repo_key: str,
+    opted_in: list[tuple[str, re.Pattern[str], Path]],
+) -> tuple[str, Path] | None:
+    """Exact repo_key lookup. Never a free-form path -- opt-in list only."""
+    for key, _pattern, upstream in opted_in:
+        if key == repo_key:
+            return (key, upstream)
+    return None
+
+
+def _cwd_is_git_repo(cwd: str, runner=subprocess.run) -> bool:
+    """True when the harness could allocate the worktree itself from ``cwd``.
+
+    That is the ONLY situation in which empty stdout (pass-through) is a
+    useful answer: otherwise the harness turns it into the opaque
+    "hook succeeded but returned no worktree path".
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return False
+    try:
+        proc = runner(
+            ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and (proc.stdout or "").strip() == "true"
+
+
+def _payload_cwd(payload: dict) -> str:
+    if isinstance(payload, dict):
+        for key in ("cwd", "workingDirectory", "working_directory"):
+            val = payload.get(key)
+            if isinstance(val, str) and val:
+                return val
+    try:
+        return os.getcwd()
+    except OSError:
+        return ""
+
+
+def _refusal_message(headline: str, opted_in_keys: list[str], detail: str = "") -> str:
+    """Operator-facing stderr diagnostic. Must name the keys AND the fix."""
+    keys = ", ".join(opted_in_keys) or "(none configured)"
+    example = opted_in_keys[0] if opted_in_keys else "<repo_key>"
+    lines = [
+        "worktree-create-hook: REFUSED -- cannot allocate an agent worktree.",
+        "",
+        headline,
+    ]
+    if detail:
+        lines += ["", detail]
+    lines += [
+        "",
+        f"Opted-in repo keys: {keys}",
+        "",
+        "Fix the Agent spawn in one of two ways:",
+        "  1. Name the repo explicitly -- add this line to the Agent prompt",
+        "     (the value must be an exact repo_key from the list above):",
+        "",
+        f"       Worktree repo: {example}",
+        "",
+        "  2. Or reference the repo's upstream path / slug in the prompt text",
+        "     so the opt-in regex matches (e.g. \"~/repos/" + example + "\").",
+        "",
+        "Config: /etc/claude-code/worktree-isolation-repos.txt",
+        "        ~/.config/claude-watch/worktree-isolation-repos.txt",
+        "Hook: worktree-create-hook   Audit log: ~/.config/claude/worktree-create.log",
+    ]
+    return "\n".join(lines)
 
 
 def _find_opted_in_by_path(
@@ -383,44 +548,98 @@ def handle_create(
     runner=subprocess.run,
     opted_in: list[tuple[str, re.Pattern[str], Path]] | None = None,
 ) -> str:
-    """Decide + (maybe) allocate a worktree. Returns the stdout payload."""
+    """Decide + (maybe) allocate a worktree. Returns the stdout payload.
+
+    Raises ``WorktreeCreateRefused`` when allocation is impossible AND
+    pass-through cannot work (the session cwd is not a git repo), so the
+    caller can exit non-zero with a diagnostic instead of handing the harness
+    empty stdout.
+    """
     if opted_in is None:
         opted_in = _load_opted_in_repos()
+    opted_in_keys = [k for k, _p, _u in opted_in]
     prompt, prompt_source = _extract_prompt_with_source(payload)
-    match = _find_opted_in(prompt, opted_in)
+
+    def _passthrough_or_refuse(headline: str, detail: str, reason: str, **extra) -> str:
+        """Pass through only if the harness can actually take over."""
+        record = {
+            "event": "create",
+            "reason": reason,
+            "prompt_source": prompt_source,
+            "debug_prompt_len": len(prompt),
+            "payload_keys": sorted(k for k in payload if isinstance(k, str)),
+            "opted_in_keys": opted_in_keys,
+            **extra,
+        }
+        # Unconfigured host: the hook is documented as a no-op. Never refuse.
+        if not opted_in:
+            _log({**record, "decision": "passthrough", "passthrough_why": "no opted-in repos configured"})
+            return ""
+        cwd = _payload_cwd(payload)
+        if _cwd_is_git_repo(cwd, runner):
+            _log({**record, "decision": "passthrough", "passthrough_why": f"cwd is a git repo: {cwd}"})
+            return ""
+        _log({**record, "decision": "refused", "cwd": cwd})
+        raise WorktreeCreateRefused(
+            _refusal_message(headline, opted_in_keys, detail),
+            reason=reason,
+            extra=record,
+        )
+
+    # An explicit `Worktree repo: <repo_key>` line beats the regexes. It is
+    # restricted to the opt-in list -- an unknown key is an error, not a
+    # silent fallback, or the marker would be a way to typo yourself back
+    # into the opaque failure this whole path exists to prevent.
+    marker_key = _extract_repo_marker(prompt)
+    if marker_key is not None:
+        match = _find_opted_in_by_key(marker_key, opted_in)
+        if match is None:
+            return _passthrough_or_refuse(
+                f"The prompt's marker line names repo {marker_key!r}, which is "
+                "not in the opt-in list.",
+                "Either fix the marker to an exact opted-in repo_key, or add "
+                "the repo to the config below (repo_key|prompt_regex|upstream_path).",
+                "marker names non-opted-in repo",
+                marker_key=marker_key,
+            )
+    else:
+        match = _find_opted_in(prompt, opted_in)
+
     if match is None:
         # Record WHERE the prompt came from and which keys the payload
-        # actually carried. Without this a passthrough here is
+        # actually carried. Without this a refusal/passthrough here is
         # indistinguishable from "the prompt genuinely did not name an
         # opted-in repo", and the pair (gate says yes / allocator says no) is
         # undiagnosable after the fact.
-        _log({
-            "event": "create",
-            "decision": "passthrough",
-            "reason": "no opted-in repo in prompt",
-            "debug_prompt_len": len(prompt),
-            "prompt_source": prompt_source,
-            "payload_keys": sorted(k for k in payload if isinstance(k, str)),
-            "opted_in_keys": [k for k, _p, _u in opted_in],
-        })
-        return ""
+        return _passthrough_or_refuse(
+            "The Agent spawn requested worktree isolation, but the prompt names "
+            "no opted-in repo -- so there is no upstream repository to branch from.",
+            f"(prompt source: {prompt_source}, {len(prompt)} chars)",
+            "no opted-in repo in prompt",
+        )
 
     repo_key, upstream = match
     if not upstream.exists():
-        _log({
-            "event": "create",
-            "decision": "passthrough",
-            "reason": f"upstream path does not exist: {upstream}",
-            "repo_key": repo_key,
-        })
-        return ""
+        return _passthrough_or_refuse(
+            f"Opted-in repo {repo_key!r} matched, but its configured "
+            f"upstream path does not exist: {upstream}",
+            "Fix the upstream_path field for this repo in the config below.",
+            "upstream path does not exist",
+            repo_key=repo_key,
+            upstream=str(upstream),
+        )
 
     base = Path(WORKTREE_BASE_TMPL.format(repo_key=repo_key))
     try:
         base.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        _log({"event": "create", "decision": "passthrough", "reason": f"mkdir failed: {exc}"})
-        return ""
+        return _passthrough_or_refuse(
+            f"Opted-in repo {repo_key!r} matched, but the worktree base "
+            f"directory could not be created: {base}",
+            f"mkdir failed: {exc}",
+            "mkdir failed",
+            repo_key=repo_key,
+        )
 
     wt_id = uuid.uuid4().hex[:12]
     wt_path = base / f"agent-{wt_id}"
@@ -448,8 +667,13 @@ def handle_create(
             if probe.returncode != 0:
                 base_ref = "HEAD"
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _log({"event": "create", "decision": "passthrough", "reason": f"rev-parse failed: {exc}"})
-        return ""
+        return _passthrough_or_refuse(
+            f"Opted-in repo {repo_key!r} matched, but resolving a base ref in "
+            f"{upstream} failed.",
+            f"git rev-parse failed: {exc}",
+            "rev-parse failed",
+            repo_key=repo_key,
+        )
 
     cmd = [
         "git", "-C", str(upstream), "worktree", "add",
@@ -458,19 +682,24 @@ def handle_create(
     try:
         proc = runner(cmd, capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _log({"event": "create", "decision": "passthrough", "reason": f"worktree add raised: {exc}"})
-        return ""
+        return _passthrough_or_refuse(
+            f"Opted-in repo {repo_key!r} matched, but `git worktree add` could "
+            "not be run.",
+            f"git worktree add raised: {exc}",
+            "worktree add raised",
+            repo_key=repo_key,
+        )
 
     if proc.returncode != 0:
-        _log({
-            "event": "create",
-            "decision": "passthrough",
-            "reason": "git worktree add returned non-zero",
-            "repo_key": repo_key,
-            "stderr": (proc.stderr or "")[:500],
-            "stdout": (proc.stdout or "")[:500],
-        })
-        return ""
+        return _passthrough_or_refuse(
+            f"Opted-in repo {repo_key!r} matched, but `git worktree add` failed "
+            f"in {upstream}.",
+            "git stderr: " + (proc.stderr or "").strip()[:500],
+            "git worktree add returned non-zero",
+            repo_key=repo_key,
+            stderr=(proc.stderr or "")[:500],
+            stdout=(proc.stdout or "")[:500],
+        )
 
     _log({
         "event": "create",
@@ -537,7 +766,17 @@ def main() -> int:
             handle_remove(payload)
             return 0
         if mode == "create":
-            out = handle_create(payload)
+            try:
+                out = handle_create(payload)
+            except WorktreeCreateRefused as refusal:
+                # Fail LOUDLY. Empty stdout here becomes the harness's opaque
+                # "hook succeeded but returned no worktree path", which names
+                # neither the cause nor the fix; stderr + non-zero does both.
+                try:
+                    sys.stderr.write(str(refusal) + "\n")
+                except OSError:
+                    pass
+                return EXIT_REFUSED
             if out:
                 sys.stdout.write(out + "\n")
             return 0
@@ -620,11 +859,44 @@ def _run_tests() -> int:  # noqa: C901
     m = _find_opted_in_by_path("/home/u/repos/foo/bar", fixture)
     _check("10. find_by_path rejects foreign", m is None, f"m={m}")
 
+    print("=== No-match failure posture ===")
+
+    # THE BUG: a spawn that asked for isolation but whose prompt matches no
+    # opted-in repo used to exit 0 with empty stdout, which the harness
+    # reports as "hook succeeded but returned no worktree path" -- naming
+    # neither the cause nor the fix. It must fail loudly instead.
+    two_key_fixture = [
+        ("claude-watch", _TEST_CW_PATTERN, Path("/nonexistent/cw")),
+        ("media-tools", re.compile(r"\brepos/media-tools\b", re.IGNORECASE), Path("/nonexistent/mt")),
+    ]
+    nongit_cwd = {"tool_name": "Agent", "cwd": "/nonexistent-not-a-git-repo"}
+
+    try:
+        out = handle_create(
+            {**nongit_cwd, "tool_input": {"prompt": "Do some work somewhere."}},
+            opted_in=two_key_fixture,
+        )
+        _check("11. no-match + non-git cwd refuses loudly", False, f"returned {out!r}")
+    except WorktreeCreateRefused as exc:
+        msg = str(exc)
+        _check("11. no-match + non-git cwd refuses loudly", True)
+        _check(
+            "11a. refusal names every opted-in repo key",
+            "claude-watch" in msg and "media-tools" in msg,
+            f"msg={msg!r}",
+        )
+        _check(
+            "11b. refusal tells the caller how to fix the prompt",
+            "Worktree repo:" in msg and "regex" in msg,
+            f"msg={msg!r}",
+        )
+
+    # Unconfigured host: the hook is documented as a no-op. Never refuse.
     out = handle_create(
-        {"tool_name": "Agent", "tool_input": {"prompt": "Just media-tools."}},
-        opted_in=fixture,
+        {**nongit_cwd, "tool_input": {"prompt": "Do some work somewhere."}},
+        opted_in=[],
     )
-    _check("11. handle_create non-opted-in -> empty passthrough", out == "", f"out={out!r}")
+    _check("11c. no opted-in repos configured -> silent passthrough", out == "", f"out={out!r}")
 
     print("=== Config-file loader tests ===")
 
@@ -751,6 +1023,67 @@ def _run_tests() -> int:  # noqa: C901
             except Exception as exc:  # noqa: BLE001
                 _check("16. handle_remove ignores foreign path", False, f"raised: {exc}")
 
+            # Pass-through is still correct when the harness can allocate the
+            # worktree itself, i.e. the session cwd IS inside a git repo.
+            try:
+                out = handle_create(
+                    {
+                        "tool_name": "Agent",
+                        "cwd": str(tmp_repo),
+                        "tool_input": {"prompt": "No opted-in repo named here."},
+                    },
+                    opted_in=test_opted_in,
+                )
+                _check("16a. no-match but cwd IS a git repo -> passthrough", out == "", f"out={out!r}")
+            except WorktreeCreateRefused as exc:
+                _check("16a. no-match but cwd IS a git repo -> passthrough", False, f"refused: {exc}")
+
+            # The marker selects the repo even though nothing in the prompt
+            # matches the opt-in regex -- the exact case a prompt rewrite that
+            # drops the repo path used to break.
+            marker_out = ""
+            try:
+                marker_out = handle_create(
+                    {
+                        "tool_name": "Agent",
+                        "cwd": "/nonexistent-not-a-git-repo",
+                        "tool_input": {
+                            "prompt": "Fix a bug, no path mentioned.\nWorktree repo: claude-watch-test\n",
+                        },
+                    },
+                    opted_in=test_opted_in,
+                )
+                ok = bool(marker_out) and Path(marker_out).is_dir()
+                _check("16b. marker selects the opted-in repo", ok, f"out={marker_out!r}")
+            except WorktreeCreateRefused as exc:
+                _check("16b. marker selects the opted-in repo", False, f"refused: {exc}")
+            finally:
+                if marker_out:
+                    handle_remove(
+                        {"hook_event_name": "WorktreeRemove", "worktree_path": marker_out},
+                        opted_in=test_opted_in,
+                    )
+
+            # A marker naming a key that is not opted in is an error, not a
+            # silent fallback -- and never a free-form path.
+            for bad, label in (
+                ("some-other-repo", "16c. marker naming a non-opted-in key refuses"),
+                ("/home/u/repos/claude-watch", "16d. marker naming a free-form path refuses"),
+            ):
+                try:
+                    out = handle_create(
+                        {
+                            "tool_name": "Agent",
+                            "cwd": "/nonexistent-not-a-git-repo",
+                            "tool_input": {"prompt": f"Do work.\nWorktree repo: {bad}\n"},
+                        },
+                        opted_in=test_opted_in,
+                    )
+                    _check(label, False, f"returned {out!r}")
+                except WorktreeCreateRefused as exc:
+                    msg = str(exc)
+                    _check(label, bad in msg and "claude-watch-test" in msg, f"msg={msg!r}")
+
         finally:
             try:
                 leftover = Path(WORKTREE_BASE_TMPL.format(repo_key="claude-watch-test"))
@@ -762,20 +1095,56 @@ def _run_tests() -> int:  # noqa: C901
     print("=== Subprocess smoke tests ===")
     script = Path(__file__).resolve()
 
-    proc = subprocess.run(
-        [str(script)],
-        input=json.dumps({
-            "hook_event_name": "WorktreeCreate",
-            "tool_name": "Agent",
-            "tool_input": {"prompt": "Just media-tools work."},
-        }),
-        capture_output=True, text=True, timeout=10, check=False,
-    )
-    _check(
-        "17. subprocess non-cw create -> empty stdout passthrough",
-        proc.returncode == 0 and proc.stdout.strip() == "",
-        f"rc={proc.returncode} stdout={proc.stdout!r}",
-    )
+    # Hermetic config: never depend on what happens to be installed on the
+    # host running the tests (CI has no config file at all).
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = Path(tmpdir) / "repos.txt"
+        cfg.write_text(
+            "claude-watch|\\brepos/claude-watch\\b|/nonexistent/cw\n"
+            "media-tools|\\brepos/media-tools\\b|/nonexistent/mt\n"
+        )
+        env = {**os.environ, "WORKTREE_ISOLATION_REPOS": str(cfg)}
+
+        proc = subprocess.run(
+            [str(script)],
+            input=json.dumps({
+                "hook_event_name": "WorktreeCreate",
+                "tool_name": "Agent",
+                "cwd": "/nonexistent-not-a-git-repo",
+                "tool_input": {"prompt": "Work on something unnamed."},
+            }),
+            capture_output=True, text=True, timeout=10, check=False, env=env,
+        )
+        _check(
+            "17. subprocess no-match create -> non-zero exit, empty stdout",
+            proc.returncode != 0 and proc.stdout.strip() == "",
+            f"rc={proc.returncode} stdout={proc.stdout!r}",
+        )
+        _check(
+            "17a. subprocess refusal stderr names the keys + the fix",
+            "claude-watch" in proc.stderr
+            and "media-tools" in proc.stderr
+            and "Worktree repo:" in proc.stderr,
+            f"stderr={proc.stderr!r}",
+        )
+
+        # Config override with no readable entries -> unconfigured -> no-op.
+        proc = subprocess.run(
+            [str(script)],
+            input=json.dumps({
+                "hook_event_name": "WorktreeCreate",
+                "tool_name": "Agent",
+                "cwd": "/nonexistent-not-a-git-repo",
+                "tool_input": {"prompt": "Work on something unnamed."},
+            }),
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "WORKTREE_ISOLATION_REPOS": str(Path(tmpdir) / "absent.txt")},
+        )
+        _check(
+            "17b. subprocess unconfigured host -> exit 0 passthrough",
+            proc.returncode == 0 and proc.stdout.strip() == "",
+            f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}",
+        )
 
     proc = subprocess.run(
         [str(script)],
