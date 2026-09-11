@@ -13,8 +13,9 @@
 # drain-time marker, removed 2026-08-22) made the cron health-check fire
 # "WATCHER DOWN: 1 event(s) unconsumed >6min" twice in one day off a directory
 # that was never an event. Liveness is now the age of the main loop's last ack
-# (`event-ack ack-batch` stamps $CLAUDE_EVENT_STATE_DIR/last-ack-timestamp),
-# which is state the ACKER owns, outside the queue entirely.
+# (per-key `event-ack ack` stamps $CLAUDE_EVENT_STATE_DIR/last-ack-timestamp;
+# `ack-batch` is permanently disabled as of 2026-09-11), which is state the
+# ACKER owns, outside the queue entirely.
 #
 # Behavior:
 #   - Block on inotifywait for create/moved_to (or, if events are already
@@ -344,11 +345,12 @@ Full event JSON appended to \$CLAUDE_EVENT_LOG_DIR/consumed.jsonl
 \$CLAUDE_EVENT_LOG_MAX_LINES lines, default 10000).
 
 ACK FOOTER (monitor mode) — after each delivered batch the watcher prints
-one \`EVENT-ACK REQUIRED: ... event-ack ack-batch\` line. The main loop acks
-EVERY batch it handles; that ack stamps the liveness timestamp claude-watch
-reads, so the footer is both the gate-clear instruction and the thing that
-keeps the daemon from declaring the loop wedged. It is printed per BATCH, not
-per event: one command clears the whole drain.
+one \`EVENT-ACK REQUIRED: ... event-ack ack "<key>" --action "..."\` line per
+pending key. The main loop must ack EVERY pending event individually; each
+per-key ack stamps the liveness timestamp claude-watch reads, so the footer
+is both the gate-clear instruction and the thing that keeps the daemon from
+declaring the loop wedged. \`ack-batch\` is permanently disabled (2026-09-11)
+— there is no single command that clears a whole drain any more.
 
 MODE FILE (the runtime toggle) — default \$CLAUDE_EVENT_LOG_DIR/mode,
 override \$CLAUDE_EVENT_WATCH_MODE_FILE. One word, \`exit\` or \`monitor\`;
@@ -1073,8 +1075,8 @@ def monitor_lead(source, tag, msg, d):
         # falling through to the raw-message fallback.
         #
         # covers_message=False: the message names the required action
-        # (`event-ack ack-batch`), which the lead does not, and this is the one
-        # event whose ENTIRE purpose is getting that action performed.
+        # (per-key `event-ack ack`), which the lead does not, and this is the
+        # one event whose ENTIRE purpose is getting that action performed.
         return ("keepalive — nothing acked recently", False)
     if tag in ("memory-reminder", "memory-remind"):
         return ("memory reminder", False)
@@ -1310,10 +1312,14 @@ if cli:
 PYEOF
 }
 
-# The one command the main loop runs after handling a batch. It acks every
-# pending entry AND stamps the liveness timestamp claude-watch's ack-stale
-# detector reads. Overridable for a deployment that wraps it.
-ACK_BATCH_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack-batch --override-reason \"<why>\"}"
+# The per-key command the main loop runs on EACH pending event after handling
+# a batch. Every per-key ack stamps the liveness timestamp claude-watch's
+# ack-stale detector reads. Overridable for a deployment that wraps it.
+# `event-ack ack-batch` is permanently disabled (Andrew directive, 2026-09-11,
+# #7784/7786/7787) — it became a reflexive bypass instead of a deliberate
+# escape hatch, so there is no longer a single command that clears a whole
+# drain.
+ACK_KEY_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack \"<key>\" --action \"<what you did>\"}"
 
 # Print the per-batch ack instruction (monitor mode only).
 #
@@ -1322,11 +1328,11 @@ ACK_BATCH_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack-batch --override-re
 # loop is told — including what to do afterwards. The SIGNAL watchers have
 # always named their `signal-ack` command this way; events had no equivalent,
 # which is why acking every event was a rule the loop had to REMEMBER rather
-# than one it was told. One line per BATCH, not per event: a single
-# `ack-batch` clears the whole drain.
+# than one it was told. One line per BATCH, listing every pending key: each
+# one needs its own `event-ack ack` call.
 print_ack_footer() {
     [[ "$MODE_RESOLVED" == "monitor" ]] || return 0
-    echo "EVENT-ACK REQUIRED: after handling the batch above, run \`$ACK_BATCH_COMMAND\` (--override-reason required, audited — acks every pending entry and stamps liveness)"
+    echo "EVENT-ACK REQUIRED: after handling the batch above, ack EVERY pending key individually — \`$ACK_KEY_COMMAND\` (ack-batch is permanently disabled; each per-key ack stamps liveness)"
 }
 
 # Count the number of pending event files currently in the queue. Used by the
@@ -1528,7 +1534,7 @@ if [[ "$MODE_RESOLVED" == "monitor" ]]; then
     # the ONLY human-visible trace of what was read. A bare "Acknowledged" /
     # "Idle" is indistinguishable from a rubber stamp.
     echo "[monitor-mode] REPLY RULE: when you act on an EVENT[...] line, your visible reply MUST quote its lead (the text after the prefix, ~80 chars) plus what you did — never a bare 'Acknowledged' / 'Idle' — so a human reading the terminal can see what was handled"
-    echo "[monitor-mode] ACK RULE: every batch ends with an EVENT-ACK REQUIRED line — run \`$ACK_BATCH_COMMAND\` once per batch. That ack is the daemon's ONLY liveness signal; skip it and claude-watch eventually declares the loop wedged"
+    echo "[monitor-mode] ACK RULE: every batch ends with an EVENT-ACK REQUIRED line — ack EVERY pending key individually with \`$ACK_KEY_COMMAND\` (ack-batch is permanently disabled). Each per-key ack is the daemon's ONLY liveness signal; skip it and claude-watch eventually declares the loop wedged"
     LAST_OUTPUT_AT="$(date +%s)"
 fi
 
