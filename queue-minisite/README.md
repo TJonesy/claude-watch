@@ -146,6 +146,34 @@ Otherwise mount the producer's output dir elsewhere and point the env var at
 the file inside it (the `CLAUDE_HOST_AGENT_STATS_DIR` pattern in
 `examples/compose/docker-compose.yml`).
 
+## Model tag (which model ran the item)
+
+Every list entry — running, pending, blocked, wedged, quarantined, done,
+abandoned, and the unrecognised-status fallback — carries a short chip in
+its item head naming the model that ran the work (`opus`, `sonnet`, …),
+with the raw transcript id (`claude-opus-5`) on hover. Like the agent
+activity cell it lives in the HEAD, so compact density keeps it (one notch
+smaller, never hidden) — that is the whole point: the compact row showed
+queue id, priority, token count, age and creator, and no model anywhere.
+
+The model is not carried in `queue.json` nor in the active-agents state, so
+it is read from the transcript — the ARCHIVED one for finished items, the
+owner's LIVE one for running items — from `message.model` on the first
+non-synthetic assistant record, exactly as the detail modal's `model` row
+already does (one resolver, so the row and the modal can never disagree).
+A `model` string stamped on the queue record itself wins over both, which
+lets tooling record the model explicitly for an item whose transcript has
+since been rotated away.
+
+`/api/queue` carries it per row as `model` (raw id) + `model_label` (family
+shorthand, or the raw id verbatim when the family is unrecognised — no
+invented labels). Both are `""` when no model is attributable: workload and
+hostjob items ran no model at all, pending items have not run yet, and an
+agent item whose transcript is gone has no truthful answer. All three
+render as ABSENT — no chip, no "unknown" placeholder. Resolution is
+memoised on each transcript's (mtime, size), so the archived transcripts
+behind the done section are scanned once rather than on every 5s poll.
+
 ## Layout
 
 | Path | Purpose |

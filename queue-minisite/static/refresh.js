@@ -87,6 +87,26 @@
   }
 
   // ---------------------------------------------------------------------
+  // Model tag — WHICH MODEL ran this item, as a short chip ("opus" /
+  // "sonnet" / ...) with the raw transcript id on hover. Rendered in every
+  // card's HEAD, the one part of a row compact density never elides, so the
+  // tag survives compact the way the priority + agent-stats cells do.
+  //
+  // The server (app.py _shape) resolves it from the agent transcript and
+  // pre-formats `model_label` (family shorthand, or the raw id when the
+  // family is unrecognised — we never invent a label). It is "" whenever no
+  // model is attributable — workload / hostjob items ran no model, pending
+  // items have not run, and an item whose transcript is gone has no truthful
+  // answer — and we then render NOTHING. Absent is absent: no "unknown"
+  // placeholder. MUST mirror the model_tag() macro in templates/index.html.
+  // ---------------------------------------------------------------------
+  function modelTag(it) {
+    const label = it.model_label || '';
+    if (!label) return '';
+    return `<span class="model-tag" title="model: ${attr(it.model || label)}">${esc(label)}</span>`;
+  }
+
+  // ---------------------------------------------------------------------
   // Subagent-tree collapse persistence.
   //
   // The nested subagent tree (one .subagent-tree <details> per running card,
@@ -453,6 +473,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += modelTag(it);
     // Agent activity cell (botchat #2967) — MUST mirror the RUNNING block in
     // templates/index.html: tool-call + context-token counters for the live
     // agent bound to this queue id, in the HEAD so compact density keeps it.
@@ -563,6 +584,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += modelTag(it);
 
     const blockedIso = it.blocked_at_iso || '';
     let ageBlock = `<span ${blockedIso ? `data-local-time-iso="${attr(blockedIso)}" data-local-time-title-only` : ''} title="${attr(blockedIso)}">blocked ${relAge(it.age, it.age_epoch)}</span>`;
@@ -663,6 +685,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += modelTag(it);
 
     const iso = it.wedged_at_iso || '';
     let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">wedged ${relAge(it.age, it.age_epoch)}</span>`;
@@ -708,6 +731,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += modelTag(it);
 
     const iso = it.quarantined_at_iso || '';
     let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">quarantined ${relAge(it.age, it.age_epoch)}</span>`;
@@ -754,6 +778,7 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += modelTag(it);
 
     const iso = it.created_at_iso || '';
     let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">created ${relAge(it.age, it.age_epoch)}</span>`;
@@ -804,6 +829,7 @@
     if (it.locked) head += '<span class="badge state-locked" title="parked by an operator scope lock — NOT ready to spawn; the dispatcher refuses it until the scope is unlocked">locked</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += modelTag(it);
     if (it.depends_on && it.depends_on.length) {
       for (const dep of it.depends_on) {
         // Each dep is a clickable anchor (jumps to the target row)
@@ -918,7 +944,8 @@
       ? ` title="hostjob exited non-zero (exit ${attr(it.hostjob_exit_code || '')}) — failed, not operator-cancelled"`
       : '';
     let head = `<span class="badge ${badgeCls}"${badgeTitle}>${esc(badgeTxt)}</span>` +
-      `<span class="id">${esc(it.id)}</span>`;
+      `<span class="id">${esc(it.id)}</span>` +
+      modelTag(it);
     if (isErroredHostjob) {
       head += `<span class="badge hostjob-badge" title="hostjob-bound: ${attr(it.hostjob_label || '')}">hostjob</span>`;
     }
