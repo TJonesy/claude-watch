@@ -1341,8 +1341,8 @@ async fn run_daemon() {
         // keepalive: a POKE FOR QUIET PERIODS, not a schedule. The tracker
         // ticks every `[cadence] keepalive_interval_secs`, but the event is
         // emitted ONLY when the last ack is at least that old. ANY ack (the
-        // main loop runs `event-ack ack-batch` on every event batch it
-        // handles) proves the loop is alive, so a loop that is busy handling
+        // main loop acks every pending key with `event-ack ack` as it
+        // handles a batch) proves the loop is alive, so a loop that is busy handling
         // real events never sees a keepalive at all — which is the entire
         // point of the 2026-08-22 redesign: ONE liveness signal, poked only
         // when it has gone quiet. The daemon still never stamps the ack
@@ -1396,7 +1396,7 @@ async fn run_daemon() {
                         tag: cadence::KEEPALIVE_TAG,
                         source: cadence::CADENCE_SOURCE,
                         message: "keepalive: no event acked recently — \
-                                  run `event-ack ack-batch --override-reason \"<why>\"` to prove liveness",
+                                  ack every pending key with `event-ack ack \"<key>\" --action \"<what you did>\"` to prove liveness",
                         priority: "low",
                         data: event_bus::keepalive_data(quiet_secs, last_ack_age),
                     });

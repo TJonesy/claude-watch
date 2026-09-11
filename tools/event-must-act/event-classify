@@ -395,8 +395,9 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     # actionable rather than ambient. Placed before the claude-watch/* ambient
     # catch-all below.
     ("claude-watch", "keepalive", None, ACTIONABLE,
-        "Keepalive: nothing acked recently. Run `event-ack ack-batch` (one "
-        "bare command) to clear this and stamp liveness."),
+        "Keepalive: nothing acked recently. Ack EVERY pending key with "
+        "`event-ack ack \"<key>\" --action \"<what you did>\"` to clear this "
+        "and stamp liveness (ack-batch is disabled)."),
 
     # heartbeat-tick: the pre-2026-08-22 name for keepalive. Kept for one
     # release so an event emitted by an older daemon — or one still sitting on
@@ -404,8 +405,9 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     # falling through to the claude-watch/* ambient catch-all and silently
     # losing its required action.
     ("claude-watch", "heartbeat-tick", None, ACTIONABLE,
-        "Keepalive (legacy `heartbeat-tick` tag): run `event-ack ack-batch` "
-        "to clear this and stamp liveness."),
+        "Keepalive (legacy `heartbeat-tick` tag): ack every pending key with "
+        "`event-ack ack \"<key>\" --action \"<what you did>\"` to clear this "
+        "and stamp liveness (ack-batch is disabled)."),
 
     # memory-reminder -> ambient context-hygiene reminder emitted by the
     # daemon every 30min (carries the memory checklist in the event message).

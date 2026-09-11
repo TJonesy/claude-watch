@@ -281,17 +281,18 @@ pub fn build_cadence_json(ev: &CadenceEvent<'_>) -> serde_json::Value {
     })
 }
 
-/// The ONE command the main loop runs after handling an event batch. It acks
-/// every pending actionable entry and stamps the liveness timestamp the
+/// The per-key ack command the main loop runs for EACH pending event after
+/// handling a batch — the batch reflex `ack-batch` was disabled 2026-09-11
+/// (#773). Each per-key ack stamps the liveness timestamp the
 /// daemon reads, so it is both the gate-clear and the proof-of-life. Kept as
 /// a const because three producers quote it: the keepalive event body, the
 /// ack-stale recovery prompt, and `claude-event-watch`'s per-batch footer.
-pub const ACK_BATCH_COMMAND: &str = "event-ack ack-batch --override-reason \"<why>\"";
+pub const ACK_COMMAND: &str = "event-ack ack \"<key>\" --action \"<what you did>\"";
 
 /// Build the `data` body for a `keepalive` cadence event.
 ///
 /// Carries the ONE command the main loop must run to clear it —
-/// [`ACK_BATCH_COMMAND`] — plus the quiet window that triggered the emission
+/// [`ACK_COMMAND`] — plus the quiet window that triggered the emission
 /// and how old the last ack was. `claude-event-watch` surfaces every scalar
 /// in `data` on the EVENT[...] line, so the loop is TOLD the ritual rather
 /// than having to remember it.
@@ -301,7 +302,7 @@ pub const ACK_BATCH_COMMAND: &str = "event-ack ack-batch --override-reason \"<wh
 /// than faked with a 0 that would read as "just acked".
 pub fn keepalive_data(interval_secs: u64, last_ack_age_secs: Option<u64>) -> serde_json::Value {
     let mut data = serde_json::json!({
-        "ack_command": ACK_BATCH_COMMAND,
+        "ack_command": ACK_COMMAND,
         "quiet_secs": interval_secs,
     });
     if let Some(age) = last_ack_age_secs {
@@ -1072,13 +1073,13 @@ mod tests {
         // The body must TELL the loop the ritual, not assume it remembers.
         // claude-event-watch renders every scalar in `data` on the EVENT line,
         // so this is what makes the instruction visible.
-        assert_eq!(parsed["data"]["ack_command"], "event-ack ack-batch --override-reason \"<why>\"");
+        assert_eq!(parsed["data"]["ack_command"], "event-ack ack \"<key>\" --action \"<what you did>\"");
     }
 
     #[test]
     fn keepalive_data_carries_the_ack_command_and_quiet_window() {
         let data = keepalive_data(300, Some(900));
-        assert_eq!(data["ack_command"], ACK_BATCH_COMMAND);
+        assert_eq!(data["ack_command"], ACK_COMMAND);
         assert_eq!(data["quiet_secs"], 300);
         assert_eq!(data["last_ack_age_secs"], 900);
 
@@ -1099,6 +1100,6 @@ mod tests {
             data.get("last_ack_age_secs").is_none(),
             "unknown ack age must be omitted, never faked as 0; got: {data}"
         );
-        assert_eq!(data["ack_command"], ACK_BATCH_COMMAND);
+        assert_eq!(data["ack_command"], ACK_COMMAND);
     }
 }
