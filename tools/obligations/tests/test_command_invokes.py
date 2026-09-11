@@ -231,3 +231,103 @@ def test_hostbash_regex_rest_still_body_wide():
     # ...while the invoke: form does NOT fire on that same arg-only mention.
     assert m(HB_CMD, "mcp__host-bash__run_command",
              _run_command("echo sudo now")) is False
+
+
+# --------------------------------------------------------------------------
+# Robustness fix: inline shell ``-c`` string args + process substitution.
+# Before the fix, ``command_invokes`` treated a ``bash -c 'sudo x'`` operand as
+# a single data word (only ``bash`` was seen) and mis-tokenized ``<(sudo x)`` as
+# a redirection (losing the inner command) -- so a real host ``sudo`` slipped
+# through the invoke:sudo,doas gate. invocation_names now recurses into ``-c``
+# operands and process-substitution bodies.
+# --------------------------------------------------------------------------
+
+# must-BLOCK: sudo invoked inside an inline shell -c string.
+
+def test_block_bash_dash_c_sudo():
+    assert m(BASH, "Bash", "bash -c 'sudo x'") is True
+
+
+def test_block_sh_dash_c_sudo():
+    assert m(BASH, "Bash", 'sh -c "sudo y"') is True
+
+
+def test_block_bash_bundled_lc_sudo():
+    assert m(BASH, "Bash", "bash -lc 'echo hi; sudo z'") is True
+
+
+def test_block_env_bash_c_sudo():
+    assert m(BASH, "Bash", "env bash -c 'sudo w'") is True
+
+
+def test_block_nested_bash_c_sudo():
+    assert m(BASH, "Bash", "bash -c 'bash -c \"sudo deep\"'") is True
+
+
+# must-PASS: bash -c that does NOT run sudo (sudo absent or only as data).
+
+def test_pass_bash_c_no_sudo():
+    assert m(BASH, "Bash", "bash -c 'echo hi'") is False
+
+
+def test_pass_bash_c_writes_sudo_text():
+    assert m(BASH, "Bash", "bash -c 'echo sudo >> notes'") is False
+
+
+def test_pass_bash_script_file_not_read():
+    # A script FILE arg is not the command string, and its contents are not
+    # available -- do not guess. (Not a ``-c`` operand.)
+    assert m(BASH, "Bash", "bash deploy.sh") is False
+
+
+# must-BLOCK: sudo inside a process substitution.
+
+def test_block_procsub_input_sudo():
+    assert m(BASH, "Bash", "cat <(sudo x)") is True
+
+
+def test_block_procsub_output_sudo():
+    assert m(BASH, "Bash", "tee >(sudo y) < f") is True
+
+
+def test_block_bash_c_wrapping_procsub_sudo():
+    assert m(BASH, "Bash", "bash -c 'cat <(sudo x)'") is True
+
+
+# must-PASS: process substitution with no sudo.
+
+def test_pass_procsub_no_sudo():
+    assert m(BASH, "Bash", "diff <(sort a) <(sort b)") is False
+
+
+# host-bash parity for the new forms (run_command + run_script).
+
+def test_hostbash_run_command_block_bash_c_sudo():
+    assert m(HB_CMD, "mcp__host-bash__run_command",
+             _run_command("bash -c 'sudo tee /etc/hosts'")) is True
+
+
+def test_hostbash_run_command_block_procsub_sudo():
+    assert m(HB_CMD, "mcp__host-bash__run_command",
+             _run_command("cat <(sudo id)")) is True
+
+
+def test_hostbash_run_script_block_bash_c_sudo():
+    assert m(HB_SCRIPT, "mcp__host-bash__run_script",
+             _run_script("bash -c 'sudo systemctl restart nginx'")) is True
+
+
+def test_hostbash_run_script_block_procsub_sudo():
+    assert m(HB_SCRIPT, "mcp__host-bash__run_script",
+             _run_script("cat <(sudo id)\n")) is True
+
+
+def test_hostbash_run_script_pass_heredoc_procsub_mention():
+    # A doc/heredoc body mentioning bash -c / <(...) is DATA, not an invocation.
+    script = (
+        "cat >> notes.md <<'EOF'\n"
+        "use bash -c 'sudo x' or cat <(sudo y) as examples of what is blocked\n"
+        "EOF\n"
+    )
+    assert m(HB_SCRIPT, "mcp__host-bash__run_script",
+             _run_script(script)) is False
