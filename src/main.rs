@@ -724,6 +724,18 @@ enum WatcherAction {
         #[arg(long)]
         all: bool,
     },
+    /// Stop ONE watcher: kill its processes (and their children) and clear
+    /// its liveness records (`<name>.pid`, a pending monitor arm intent, and
+    /// a `<name>.lock` whose recorded pid is dead).
+    ///
+    /// The per-watcher counterpart to `restart`, which stops EVERY enabled
+    /// watcher. Idempotent: stopping something that is not running still
+    /// cleans up whatever records are lying around, and exits 0. Config is
+    /// untouched — use `disable` to stop it coming back.
+    Stop {
+        /// Watcher name
+        name: String,
+    },
     /// Enable a watcher (config flip only — main loop must spawn it).
     ///
     /// Per the cardinal rule, watchers can ONLY be started by Claude Code's
@@ -1586,6 +1598,7 @@ async fn run_watcher(action: WatcherAction) {
             watcher::cmd_status(&cfg, extra_ref, json, unhealthy_only, all).await;
             0
         }
+        WatcherAction::Stop { name } => watcher::cmd_stop(&cfg, extra_ref, &name).await,
         WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, extra_ref, &name, true).await,
         WatcherAction::Disable { name } => {
             watcher::cmd_toggle(&cfg, extra_ref, &name, false).await
