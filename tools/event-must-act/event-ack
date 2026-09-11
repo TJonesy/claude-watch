@@ -42,24 +42,18 @@ Subcommands:
                                   from pending-actions, resets the
                                   N-counter to 0.
 
-  event-ack ack-batch --override-reason "<why>" [--action "<text>"]
-                                  THE PER-BATCH REFLEX. Acks every pending
-                                  entry at once and stamps the liveness
-                                  timestamp. ``--override-reason`` is
-                                  MANDATORY and audited (appended to
-                                  ``<state-dir>/ack-batch-audit.log``):
-                                  a bare batch-ack was being used to
-                                  reflexively bypass the per-event
-                                  actionable-gate instead of reading each
-                                  event, so this command now REFUSES
-                                  without a deliberate, human-written
-                                  reason (mirrors ``obligations override``'s
-                                  mandatory-reason escape hatch). It is
-                                  still ONE command — just no longer a bare
-                                  one. Idempotent — safe on an empty queue,
-                                  where it still stamps liveness (an idle
-                                  loop acking a keepalive is exactly that
-                                  case).
+  event-ack ack-batch             PERMANENTLY DISABLED (Andrew directive,
+                                  2026-09-11, #7784/7786/7787): this became
+                                  a reflexive per-event bypass instead of a
+                                  deliberate escape hatch, so it is now a
+                                  hard, unconditional refusal -- exits
+                                  nonzero, touches NO state (no pending
+                                  removal, no counter reset, no liveness
+                                  stamp) regardless of any flags passed.
+                                  Kept registered (not removed) purely so
+                                  it stays discoverable in --help instead
+                                  of erroring as an unknown subcommand.
+                                  Redirects the caller to per-key `ack`.
 
   event-ack list                  Show pending + counter state.
 
@@ -79,15 +73,18 @@ Subcommands:
 Liveness
 --------
 
-``last-ack-timestamp`` (epoch float) is stamped by EVERY ack — ``ack`` and
-``ack-batch`` alike. Its age is the daemon's ONE liveness signal
-(``[ack] stale_minutes`` in claude-watch's config): ANY ack proves the main
-loop is alive, so a loop busy handling real events never needs a synthetic
-poke. When nothing has been acked for ``[cadence] keepalive_interval_secs``
-the daemon emits a ``keepalive`` event whose only purpose is to give an IDLE
-loop something to ack. The pre-2026-08-22 design instead had the loop
-``touch`` a separate host heartbeat FILE; two signals for one fact, and the
-file could stay fresh while events went unread.
+``last-ack-timestamp`` (epoch float) is stamped by every successful per-key
+``ack``. Its age is the daemon's ONE liveness signal (``[ack] stale_minutes``
+in claude-watch's config): ANY per-key ack proves the main loop is alive, so
+a loop busy handling real events never needs a synthetic poke. When nothing
+has been acked for ``[cadence] keepalive_interval_secs`` the daemon emits a
+``keepalive`` event whose only purpose is to give an IDLE loop something to
+ack -- ``event-ack ack "<keepalive-key>" --action "..."`` stamps liveness the
+same as any other per-key ack. ``ack-batch`` is PERMANENTLY DISABLED and
+stamps NOTHING (see the Subcommands list above) -- it is not a liveness path
+any more. The pre-2026-08-22 design instead had the loop ``touch`` a separate
+host heartbeat FILE; two signals for one fact, and the file could stay fresh
+while events went unread.
 
 Signal-distinct guarantee
 -------------------------
@@ -142,7 +139,6 @@ PENDING_FILE = "pending-actions.json"
 COUNTER_FILE = "tool-call-counter.json"
 AMBIENT_FILE = "ambient-context.json"
 LAST_ACK_FILE = "last-ack-timestamp"
-ACK_BATCH_AUDIT_LOG = "ack-batch-audit.log"
 
 DEFAULT_N = int(os.environ.get("EVENT_MUST_ACT_N", "3"))
 
@@ -151,8 +147,10 @@ DEFAULT_N = int(os.environ.get("EVENT_MUST_ACT_N", "3"))
 # land in pending-actions.json and stamp the gate) but whose ONLY demand is that
 # the loop ack to prove it is alive -- there is no substantive action to take.
 # keepalive is the daemon's idle-poke; heartbeat-tick is its pre-2026-08-22 name
-# (see event-classify). These are the ONLY pending entries `ack-batch` may clear;
-# a genuine actionable event must be per-key acked with a --action note.
+# (see event-classify). A liveness entry's per-key `ack` does not require a
+# substantive --action note (see the `ack` dispatch below); ack-batch is
+# PERMANENTLY DISABLED (see below) so it no longer clears anything -- every
+# entry, liveness or actionable, is now acked individually via `ack`.
 LIVENESS_SOURCE_EVENTS = frozenset({
     "claude-watch/keepalive",
     "claude-watch/heartbeat-tick",
@@ -330,92 +328,6 @@ def ack_pending(state_dir: Path, key: str, action: str) -> dict:
             "remaining": remaining}
 
 
-def _audit_ack_batch(state_dir: Path, override_reason: str, result: dict) -> None:
-    """Append an audit record for an ack-batch override.
-
-    Mirrors the ``obligations override`` audit pattern
-    (``~/.config/claude/obligations-bypass.log``): a batch-ack bypasses the
-    normal per-event read-and-ack path, so every use gets a durable,
-    timestamped, WHO-and-WHY record even though the gate itself can't stop
-    a determined bare-reflex habit. Best-effort -- swallows I/O errors so a
-    logging failure never undoes an ack that already committed.
-    """
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        path = state_dir / ACK_BATCH_AUDIT_LOG
-        record = {
-            "ts": _now(),
-            "pid": os.getpid(),
-            "override_reason": override_reason,
-            "acked": result.get("acked", 0),
-            "keys": result.get("keys", []),
-            "action": result.get("action", ""),
-        }
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-    except (OSError, ValueError):
-        pass
-
-
-def ack_batch(state_dir: Path, action: str = "batch ack",
-              override_reason: str = "") -> dict:
-    """Clear ONLY pure-liveness pending entries (keepalive/heartbeat-tick)
-    and stamp liveness; LEAVE genuine actionable events pending.
-
-    Historically this acked EVERY pending entry -- but that let the per-batch
-    reflex silently clear real actionable events. Now it removes only the
-    pure-liveness entries (``_is_liveness_entry``); actionable events survive
-    and must be per-key acked via ``event-ack ack "<key>" --action "..."``.
-    The returned dict carries ``remaining_actionable`` so the CLI can tell the
-    user exactly which keys still need a per-event ack.
-
-    This is the command the main loop runs after handling an event batch.
-    ``override_reason`` is expected to already be validated (non-empty,
-    stripped) by the CLI layer -- see ``main()``'s ``ack-batch`` dispatch,
-    which mirrors ``obligations override``'s mandatory-reason gate. This
-    function stays permissive at the API level (default ``""``) so lower-
-    level callers/tests can exercise the batch-ack mechanics directly; when
-    a reason IS supplied it is appended to ``<state-dir>/ack-batch-audit.log``
-    so every deliberate override leaves a durable trail.
-
-    An EMPTY queue is not an error and still stamps the timestamp. That case
-    is load-bearing, not a degenerate one: an idle loop acking a ``keepalive``
-    (which routes ambient, so it may never land in pending-actions) has
-    nothing to remove but is exactly the loop proving it is alive.
-    """
-    cleared_keys: list[str] = []
-    remaining_actionable: list[str] = []
-    with _locked(state_dir, PENDING_FILE) as p:
-        pending = p["data"].get("pending", [])
-        kept = []
-        for it in pending:
-            key = it.get("key")
-            if _is_liveness_entry(it):
-                if key:
-                    cleared_keys.append(str(key))
-            else:
-                kept.append(it)
-                if key:
-                    remaining_actionable.append(str(key))
-        p["data"]["pending"] = kept
-        p["write"] = True
-
-    # Stamp liveness + reset the N-counter unconditionally (as before): the
-    # loop invoking ack-batch IS proving it is alive, and each surviving
-    # actionable event still gets a fresh N-call grace before the gate re-fires.
-    _set_counter(state_dir, 0)
-    _update_last_ack_timestamp(state_dir)
-
-    result = {"acked": len(cleared_keys), "keys": cleared_keys,
-              "remaining_actionable": remaining_actionable, "action": action,
-              "override_reason": override_reason}
-    if override_reason:
-        _audit_ack_batch(state_dir, override_reason, result)
-    return result
 
 
 def list_state(state_dir: Path) -> dict:
@@ -619,18 +531,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "ack-batch",
-        help="Clear ONLY pure-liveness (keepalive) pending entries + stamp "
-             "liveness; actionable events stay pending for per-key ack. "
-             "Requires --override-reason, audited.")
-    sp.add_argument("--action", default="batch ack",
-                    help="Optional note recorded with the batch ack.")
+        help="DISABLED (Andrew directive, 2026-09-11): always refuses, "
+             "exits nonzero, touches NO state. Kept registered only so "
+             "it stays discoverable here instead of erroring as unknown. "
+             "Ack each pending event individually: `event-ack ack "
+             "\"<key>\" --action \"...\"`.")
+    sp.add_argument("--action", default="",
+                    help="Accepted for backward compatibility; IGNORED.")
     sp.add_argument(
-        "--override-reason", required=True,
-        help="REQUIRED, audited (<state-dir>/ack-batch-audit.log). "
-             "Human-readable reason for bulk-acking instead of reading + "
-             "acking each pending event individually via `event-ack ack "
-             "\"<key>\" --action \"...\"`. This is a deliberate, logged "
-             "escape hatch -- not a routine reflex.")
+        "--override-reason", default="",
+        help="Accepted for backward compatibility; IGNORED. ack-batch no "
+             "longer accepts any override -- it is disabled unconditionally.")
 
     sub.add_parser("list", help="Show pending + counter state.")
     sub.add_parser("clear", help="Clear all pending entries.")
@@ -775,34 +686,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "ack-batch":
-        reason = (args.override_reason or "").strip()
-        if not reason:
-            print(
-                "ERROR: --override-reason is required and must be "
-                "non-empty. `ack-batch` bypasses the normal per-event "
-                "read-and-ack path, so every use must carry a deliberate, "
-                "audited reason. If you haven't actually looked at each "
-                "pending event, ack them individually instead: "
-                "`event-ack ack \"<key>\" --action \"...\"`.",
-                file=sys.stderr)
-            return 2
-        res = ack_batch(state_dir, args.action, override_reason=reason)
-        remaining = res.get("remaining_actionable", [])
-        if res["acked"]:
-            print(f"ack-batch cleared {res['acked']} pure-liveness event(s); "
-                  f"liveness stamped. (override-reason: {reason})")
-        else:
-            print(f"No pure-liveness events to clear; liveness stamped. "
-                  f"(override-reason: {reason})")
-        if remaining:
-            print(
-                f"REFUSED to batch-clear {len(remaining)} ACTIONABLE event(s) "
-                "-- these still need a per-event ack describing what you did:",
-                file=sys.stderr)
-            for k in remaining:
+        # PERMANENTLY DISABLED (Andrew directive, 2026-09-11,
+        # #7784/7786/7787): this subcommand became a reflexive per-event
+        # bypass instead of a deliberate escape hatch. It now does
+        # NOTHING -- no pending removal, no counter reset, no liveness
+        # stamp -- regardless of what flags are passed (a real
+        # --override-reason changes nothing: there is no override any
+        # more). Ack every pending event individually instead.
+        snap = list_state(state_dir)
+        pending_keys = [e.get("key", "?") for e in snap.get("pending", [])]
+        print(
+            "ERROR: `event-ack ack-batch` is PERMANENTLY DISABLED. It "
+            "performed NO action: no pending entry was removed, the "
+            "N-counter was not reset, and the liveness timestamp was NOT "
+            "stamped. Ack every pending event individually instead:\n"
+            "  event-ack list\n"
+            "  event-ack ack \"<key>\" --action \"<what you did>\"",
+            file=sys.stderr)
+        if pending_keys:
+            print(f"{len(pending_keys)} pending key(s) still need a "
+                  "per-event ack:", file=sys.stderr)
+            for k in pending_keys:
                 print(f"  event-ack ack \"{k}\" --action \"<what you did>\"",
                       file=sys.stderr)
-        return 0
+        return 3
 
     if args.cmd == "list":
         snap = list_state(state_dir)
@@ -1062,43 +969,70 @@ def _self_test() -> int:
         if any(e["key"] == "sub-test-key" for e in snap["pending"]):
             fail(f"sub-test-key still pending after argparse ack: {snap}")
 
-        # 18. ack-batch clears ONLY pure-liveness (keepalive/heartbeat-tick)
-        #     entries and LEAVES genuine actionable events pending. It still
-        #     stamps liveness, resets the counter, and audits the reason.
+        # 18. ack-batch is PERMANENTLY DISABLED (Andrew directive,
+        #     2026-09-11, #7784/7786/7787): a bare invocation with pending
+        #     liveness + actionable entries must hard-refuse (nonzero exit)
+        #     and touch NOTHING -- no pending removed, no counter reset, no
+        #     liveness stamp. The old "clear only liveness entries" carve-out
+        #     is gone: nothing is cleared any more, full stop.
         clear_pending(sd)
         ingest(sd, "claude-watch", "keepalive", "idle poke")         # liveness
         ingest(sd, "claude-watch", "heartbeat-tick", "legacy poke")  # liveness
         ingest(sd, "torrent", "torrent-completed", "Movie done")     # actionable
         add_pending(sd, "slack-unread:from bob")                     # actionable
         bump_counter(sd)
-        res = ack_batch(sd, override_reason="idle loop liveness ack")
-        if res["acked"] != 2:
-            fail(f"ack-batch should clear only the 2 liveness entries: {res}")
-        snap = list_state(sd)
-        remaining_keys = {e["key"] for e in snap["pending"]}
-        if len(snap["pending"]) != 2:
-            fail(f"ack-batch must leave the 2 actionable entries pending: {snap}")
-        if (not any(k.startswith("torrent-completed:") for k in remaining_keys)
-                or "slack-unread:from bob" not in remaining_keys):
-            fail(f"ack-batch cleared an actionable entry: {remaining_keys}")
-        if snap["counter"] != 0:
-            fail(f"ack-batch must reset the counter: {snap}")
-        if set(res.get("remaining_actionable", [])) != remaining_keys:
-            fail(f"ack-batch must report remaining_actionable keys: {res}")
-        audit_log = sd / ACK_BATCH_AUDIT_LOG
-        if not audit_log.exists():
-            fail("ack_batch with override_reason must write an audit log")
-        else:
-            rec = json.loads(audit_log.read_text().strip().splitlines()[-1])
-            if rec.get("override_reason") != "idle loop liveness ack":
-                fail(f"audit log entry missing/mismatched override_reason: {rec}")
-            if rec.get("acked") != 2:
-                fail(f"audit log entry should record acked=2: {rec}")
-
-        # 19. ack-batch stamps liveness — the daemon's ONLY wedge signal.
         stamp = sd / LAST_ACK_FILE
+        if stamp.exists():
+            stamp.unlink()
+        before = list_state(sd)
+        rc = main(["--state-dir", str(sd), "ack-batch"])
+        if rc == 0:
+            fail("bare `event-ack ack-batch` must hard-refuse (nonzero exit)")
+        after = list_state(sd)
+        if after != before:
+            fail(f"ack-batch must not mutate pending/counter state: "
+                 f"before={before} after={after}")
+        if stamp.exists():
+            fail("disabled ack-batch must NOT write last-ack-timestamp")
+
+        # 19. Flags (--action, --override-reason) are accepted for backward
+        #     compatibility but change NOTHING: still refuses, still no
+        #     state mutation, regardless of what's passed.
+        rc = main(["--state-dir", str(sd), "ack-batch", "--action", "x",
+                   "--override-reason", "reviewed everything"])
+        if rc == 0:
+            fail("ack-batch with flags must still hard-refuse")
+        after2 = list_state(sd)
+        if after2 != before:
+            fail(f"ack-batch with flags must not mutate state: {after2}")
+        if stamp.exists():
+            fail("ack-batch with flags must NOT write last-ack-timestamp")
+
+        # 20. ack-batch on an EMPTY queue also refuses -- there is no more
+        #     "idle loop proving it's alive via batch-ack" path. Liveness
+        #     now comes ONLY from per-key ack (see #21).
+        clear_pending(sd)
+        rc = main(["--state-dir", str(sd), "ack-batch"])
+        if rc == 0:
+            fail("ack-batch on an empty queue must still hard-refuse")
+        if stamp.exists():
+            fail("ack-batch on an empty queue must NOT stamp liveness")
+
+        # 21. Liveness now comes ONLY from per-key `ack` -- including for a
+        #     pure-liveness (keepalive) entry, which has no substantive
+        #     --action note but still stamps last-ack-timestamp.
+        clear_pending(sd)
+        ingest(sd, "claude-watch", "keepalive", "solo poke")
+        snap = list_state(sd)
+        keepalive_key = next(e["key"] for e in snap["pending"])
+        rc = main(["--state-dir", str(sd), "ack", keepalive_key,
+                   "--action", "keepalive"])
+        if rc != 0:
+            fail(f"per-key ack of a keepalive entry returned rc={rc}")
+        if list_state(sd)["pending"]:
+            fail("per-key ack of the only pending entry must clear it")
         if not stamp.exists():
-            fail("ack-batch must write last-ack-timestamp")
+            fail("per-key ack must write last-ack-timestamp")
         else:
             try:
                 stamped = float(stamp.read_text().strip())
@@ -1110,83 +1044,7 @@ def _self_test() -> int:
             if not (0 < now - stamped < 60):
                 fail(f"last-ack stamp {stamped} should be ~now ({now})")
 
-        # 20. ack-batch on an EMPTY queue is not an error and STILL stamps
-        #     liveness. Load-bearing: an idle loop proving it is alive.
-        clear_pending(sd)
-        stamp.unlink()
-        res = ack_batch(sd)
-        if res["acked"] != 0:
-            fail(f"empty ack-batch should report 0 acked, got: {res}")
-        if not stamp.exists():
-            fail("ack-batch on an empty queue must still stamp liveness")
-
-        # 20b. The keepalive/liveness path is PRESERVED exactly: a queue
-        #      holding ONLY a keepalive entry is fully cleared by ack-batch
-        #      (acked=1, nothing left pending) and liveness is stamped.
-        clear_pending(sd)
-        ingest(sd, "claude-watch", "keepalive", "solo poke")
-        stamp.unlink()
-        res = ack_batch(sd, override_reason="idle keepalive")
-        if res["acked"] != 1 or res.get("remaining_actionable"):
-            fail(f"keepalive-only ack-batch should clear it entirely: {res}")
-        if list_state(sd)["pending"]:
-            fail("keepalive-only ack-batch left something pending")
-        if not stamp.exists():
-            fail("keepalive-only ack-batch must stamp liveness")
-
-        # 21. ack-batch through main() now REQUIRES --override-reason: a
-        #     bare invocation (flag missing entirely -- argparse itself
-        #     refuses via SystemExit) and a present-but-blank reason (the
-        #     manual strip-check in main()) must BOTH be refused, and
-        #     neither may touch pending state. This is the fix for the
-        #     reflexive-bypass abuse this subcommand enables unguarded.
-        add_pending(sd, "bare-cmd-key")
-        try:
-            rc = main(["--state-dir", str(sd), "ack-batch"])
-        except SystemExit as e:
-            rc = e.code if isinstance(e.code, int) else 2
-        if rc == 0:
-            fail("bare `event-ack ack-batch` (no --override-reason) "
-                 "should be refused")
-        snap = list_state(sd)
-        if not any(e["key"] == "bare-cmd-key" for e in snap["pending"]):
-            fail("refused ack-batch (missing flag) must not have acked "
-                 "pending entries")
-
-        rc = main(["--state-dir", str(sd), "ack-batch",
-                   "--override-reason", "   "])
-        if rc == 0:
-            fail("whitespace-only --override-reason should be refused")
-        snap = list_state(sd)
-        if not any(e["key"] == "bare-cmd-key" for e in snap["pending"]):
-            fail("refused ack-batch (blank reason) must not have acked "
-                 "pending entries")
-
-        # 21b. A real, non-empty --override-reason IS accepted via main():
-        #      it clears pure-liveness entries + audits the reason, but LEAVES
-        #      the actionable "bare-cmd-key" pending (the whole point of the guard).
-        clear_pending(sd)
-        add_pending(sd, "bare-cmd-key")                 # actionable, must survive
-        ingest(sd, "claude-watch", "keepalive", "poke") # liveness, must clear
-        rc = main(["--state-dir", str(sd), "ack-batch", "--override-reason",
-                   "reviewed pending, acked liveness"])
-        if rc != 0:
-            fail(f"ack-batch with a real --override-reason returned rc={rc}")
-        snap = list_state(sd)
-        pend_keys = {e["key"] for e in snap["pending"]}
-        if "bare-cmd-key" not in pend_keys:
-            fail(f"ack-batch cleared an actionable entry it must keep: {snap}")
-        if any(k.startswith("keepalive:") for k in pend_keys):
-            fail(f"ack-batch failed to clear the liveness entry: {snap}")
-        audit_log = sd / ACK_BATCH_AUDIT_LOG
-        if not audit_log.exists():
-            fail("ack-batch via main() with --override-reason must audit-log")
-        else:
-            rec = json.loads(audit_log.read_text().strip().splitlines()[-1])
-            if rec.get("override_reason") != "reviewed pending, acked liveness":
-                fail(f"audit log entry missing/mismatched override_reason: {rec}")
-
-        # 22. Legacy dispatch must not swallow the new subcommand name.
+        # 22. Legacy dispatch must not swallow the (disabled) subcommand name.
         if _legacy_dispatch(["ack-batch"]) is not None:
             fail("_legacy_dispatch intercepted the 'ack-batch' subcommand")
 
@@ -1228,10 +1086,10 @@ def _self_test() -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: all self-test cases pass (incl. ack-batch clears ONLY "
-          "pure-liveness entries + refuses actionable, keepalive path "
-          "preserved, per-key actionable ack requires --action, "
-          "gate/counter resets, mandatory --override-reason + audit log).")
+    print("OK: all self-test cases pass (incl. ack-batch PERMANENTLY "
+          "DISABLED -- hard-refuses and touches no state under any flags "
+          "or queue contents -- per-key ack is now the only liveness path, "
+          "per-key actionable ack requires --action, gate/counter resets).")
     return 0
 
 

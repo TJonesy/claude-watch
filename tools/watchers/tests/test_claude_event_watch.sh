@@ -1184,9 +1184,11 @@ echo "  monitor-format: exit-mode one-shot lines are byte-identical (guard) OK"
 # --- Per-batch ack footer + "no state in the queue dir" ------------------
 # The main loop is TOLD what to run, the way the SIGNAL watchers have always
 # named `signal-ack`: every delivered batch in monitor mode ends with one
-# EVENT-ACK REQUIRED line naming `event-ack ack-batch`. Per BATCH, not per
-# event — one command clears the whole drain, and that ack is what stamps the
-# liveness timestamp claude-watch's ack-stale detector reads.
+# EVENT-ACK REQUIRED line naming per-key `event-ack ack`. `ack-batch` is
+# permanently disabled (2026-09-11) — one footer line still covers the whole
+# BATCH (not printed per event), but it now tells the loop to ack each
+# pending key individually; each per-key ack is what stamps the liveness
+# timestamp claude-watch's ack-stale detector reads.
 AFQ="$TMP/afq"; AFLOG="$TMP/aflog"; mkdir -p "$AFQ" "$AFLOG"
 AF_OUT="$TMP/af.out"
 echo '{"source":"manual","tag":"one","message":"first of batch","data":{}}' \
@@ -1211,8 +1213,12 @@ done
 kill -TERM "$AF_PID" 2>/dev/null || true
 reap_within "$AF_PID" 10 || true
 
-if ! grep -q '^EVENT-ACK REQUIRED.*event-ack ack-batch' "$AF_OUT"; then
-    echo "FAIL: ack footer does not name \`event-ack ack-batch\`" >&2
+if ! grep -q '^EVENT-ACK REQUIRED.*event-ack ack ' "$AF_OUT"; then
+    echo "FAIL: ack footer does not name per-key \`event-ack ack\`" >&2
+    cat "$AF_OUT" >&2; exit 1
+fi
+if grep -q '^EVENT-ACK REQUIRED.*event-ack ack-batch' "$AF_OUT"; then
+    echo "FAIL: ack footer still names disabled \`event-ack ack-batch\`" >&2
     cat "$AF_OUT" >&2; exit 1
 fi
 # ONE footer for a TWO-event batch. A per-event footer would make the reflex
@@ -1224,7 +1230,7 @@ if [[ "$af_footers" != "1" ]]; then
     echo "FAIL: expected exactly 1 ack footer for a 2-event batch, got $af_footers" >&2
     cat "$AF_OUT" >&2; exit 1
 fi
-echo "  ack footer: one EVENT-ACK REQUIRED line per BATCH, naming event-ack ack-batch OK"
+echo "  ack footer: one EVENT-ACK REQUIRED line per BATCH, naming per-key event-ack ack OK"
 
 # The footer is monitor-only: in exit mode the main loop reads the captured
 # .output file and the ack reflex is driven by its own runbook, and the

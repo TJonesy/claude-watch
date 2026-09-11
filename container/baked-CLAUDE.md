@@ -1275,10 +1275,11 @@ PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
 
 > **`keepalive` = the daemon asking whether you are alive.** Emitted only
 > when nothing has been acked for the quiet window (5 min), so if you ack
-> your batches you never see one. Clear it like any batch:
-> **`event-ack ack-batch --override-reason "<why>"`**. The stamp must come from YOU, never the daemon:
-> that is the wedge detector. Miss it past `[ack] stale_minutes` (20) and
-> claude-watch nudges + alerts.
+> every pending event individually you never see one. Clear it like any
+> pending event: **`event-ack ack "<key>" --action "<why>"`** (`ack-batch`
+> is permanently disabled, 2026-09-11 — see below). The stamp must come from
+> YOU, never the daemon: that is the wedge detector. Miss it past
+> `[ack] stale_minutes` (20) and claude-watch nudges + alerts.
 
   - Routed into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
@@ -1310,14 +1311,16 @@ table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
 2. **Restart the watcher immediately** if it exited (before processing).
 3. Ingest is automatic (the watcher does it as it drains).
 4. **Handle the batch**: queue an agent / act directly / dismiss, per event.
-5. **Ack the batch, every batch: `event-ack ack-batch --override-reason
-   "<why>"`** (REQUIRED, audited): clears all pending, resets the
-   N-counter, stamps `last-ack-timestamp` (its age is claude-watch's ONLY
-   liveness signal). Monitor mode prints an `EVENT-ACK REQUIRED:` line per
-   batch. Per-key `event-ack ack "<key>"` only to leave part of a batch
-   pending.
+5. **Ack every pending event, individually: `event-ack ack "<key>" --action
+   "<what you did>"`**. `event-ack ack-batch` is **permanently disabled**
+   (Andrew directive, 2026-09-11, #7784/7786/7787) — it became a reflexive
+   bypass instead of a deliberate read-and-ack, so it now hard-fails and
+   touches no state. Each per-key ack resets the N-counter and stamps
+   `last-ack-timestamp` (its age is claude-watch's ONLY liveness signal).
+   Monitor mode prints one `EVENT-ACK REQUIRED:` line per batch listing
+   every key that still needs its own `event-ack ack` call.
 6. **Ambient events** need no action: they surface in the next prompt's
-   context via the UserPromptSubmit hook. Ack the batch anyway.
+   context via the UserPromptSubmit hook. Ack each one anyway (per-key).
 
 ### CLI reference
 
@@ -1326,9 +1329,9 @@ table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
 event-ack ingest --source <src> --tag <tag> --message "<msg>"
 
 # Pending-actions surface (actionable tier).
-event-ack ack-batch --override-reason "<why>"  # per-batch reflex
+event-ack ack-batch                        # PERMANENTLY DISABLED — hard-fails, no state touched
 event-ack add "<key>" [--source "<src>"]   # Manual add (rare)
-event-ack ack "<key>" --action "<text>"    # Ack ONE key (partial batch only)
+event-ack ack "<key>" --action "<text>"    # Ack ONE key — the only ack path; stamps liveness
 event-ack list                             # Show pending + counter
 event-ack clear                            # Clear all (escape hatch)
 
