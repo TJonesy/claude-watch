@@ -343,6 +343,22 @@ def tokenize(cmd: str) -> List[tuple]:
         # A leading fd-number like ``2>file`` / ``1>&2`` is part of the
         # redirection, not a word: if the in-progress word is all digits
         # we pull it off as the fd instead of flushing it as an argument.
+        # Process substitution: ``<( ... )`` / ``>( ... )``. Bash runs the
+        # command(s) inside as a REAL command context (I/O wired to a FIFO),
+        # so a ``sudo`` there is a real invocation. Consume the whole balanced
+        # construct into the current word -- exactly as ``$( )`` is consumed --
+        # so ``_procsub_bodies`` can recurse into it. Without this the ``<`` is
+        # mis-read as a redirection whose target is ``(sudo``, silently losing
+        # the inner invocation (a privilege-gate hole).
+        if c in ('<', '>') and i + 1 < n and cmd[i + 1] == '(':
+            end = _match_paren(cmd, i + 1)
+            if end == -1:
+                raise ShellParseError('unbalanced process substitution')
+            cur.append(cmd[i:end + 1])
+            word_started = True
+            i = end + 1
+            continue
+
         if c in _REDIR_CHARS:
             fd = None
             pending = "".join(cur)
@@ -718,7 +734,7 @@ def command_name_present(cmd: str, targets) -> bool:
     return any(name_matches(n, s) for n in names for s in specs)
 
 
-def invocation_names(cmd: str) -> set:
+def invocation_names(cmd: str, _depth: int = 0) -> set:
     """Set of BASENAMES of every command-POSITION word across all top-level
     segments AND every ``$(...)`` / backtick command substitution.
 
@@ -746,13 +762,19 @@ def invocation_names(cmd: str) -> set:
     absorbed into a single data word during tokenization). Raises
     ``ShellParseError`` on parse failure so the caller FAILS CLOSED.
     """
+    if _depth > _MAX_INVOCATION_DEPTH:
+        raise ShellParseError('command nesting too deep')
     parsed = parse(cmd)
     out: set = set()
     for seg in parsed.segments:
         out |= _invocation_words(seg.words)
         for word in seg.words:
             for inner in _substitution_bodies(word):
-                out |= invocation_names(inner)
+                out |= invocation_names(inner, _depth + 1)
+            for inner in _procsub_bodies(word):
+                out |= invocation_names(inner, _depth + 1)
+        for inner in _dash_c_bodies(seg.words):
+            out |= invocation_names(inner, _depth + 1)
     return out
 
 
@@ -994,6 +1016,59 @@ def _substitution_bodies(word: str) -> List[str]:
             continue
         i += 1
     return bodies
+
+
+_MAX_INVOCATION_DEPTH = 40
+
+
+def _procsub_bodies(word: str) -> List[str]:
+    """Bodies of ``<( ... )`` / ``>( ... )`` process substitutions in a
+    single (already quote-stripped) word. A process substitution runs a real
+    command whose I/O is wired to a FIFO, so a privilege gate must look inside
+    it. (``$( )`` / backticks are handled by ``_substitution_bodies``.)
+    """
+    bodies: List[str] = []
+    i = 0
+    n = len(word)
+    while i < n:
+        if word[i] in ('<', '>') and i + 1 < n and word[i + 1] == '(':
+            end = _match_paren(word, i + 1)
+            if end == -1:
+                break
+            bodies.append(word[i + 2:end])
+            i = end + 1
+            continue
+        i += 1
+    return bodies
+
+
+_SHELL_HEADS = ("sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "busybox")
+
+
+def _dash_c_bodies(words: List[str]) -> List[str]:
+    """Script-string operand(s) of a ``sh -c`` / ``bash -c`` invocation in
+    this segment. ``bash -c 'sudo rm'`` RUNS ``sudo``, but the string is a
+    single data word so ``_invocation_words`` only sees ``bash``; return the
+    ``-c`` operand so the caller can recurse into it. Leading wrappers
+    (``sudo`` / ``env`` / ...) are stripped first (``env bash -c ...``). A
+    ``-c`` may be bundled (``sh -lc``, ``bash -xc``) or ``--command``. Returns
+    [] when the head is not a shell or there is no ``-c`` operand (a script
+    FILE arg is not in the command string).
+    """
+    stripped = _strip_command_prefix(words)
+    if not stripped:
+        return []
+    if os.path.basename(stripped[0]) not in _SHELL_HEADS:
+        return []
+    for j in range(1, len(stripped)):
+        w = stripped[j]
+        if not w.startswith('-'):
+            break
+        is_c = (w == '--command') or (
+            not w.startswith('--') and len(w) >= 2 and w.endswith('c'))
+        if is_c:
+            return [stripped[j + 1]] if j + 1 < len(stripped) else []
+    return []
 
 
 def _head_matches(seg: Segment, target: str) -> bool:
