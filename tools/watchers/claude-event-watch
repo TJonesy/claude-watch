@@ -701,25 +701,90 @@ if [[ -n "$MODE_QUERY" ]]; then
     exit 0
 fi
 
+# How long to wait for a lock whose recorded holder is NOT a live instance
+# before giving up. Small on purpose: a live duplicate is still refused
+# IMMEDIATELY (that check runs first), so this only ever delays the already-
+# broken case. Env-overridable so tests don't pay for it.
+LOCK_WAIT_SECONDS="${CLAUDE_EVENT_WATCH_LOCK_WAIT_SECS:-3}"
+
+# Is `$1` a pid that is alive AND still this watcher? Anything else — empty,
+# non-numeric, dead, or a recycled pid now running something unrelated — is
+# NOT a live instance, and must not be reported as one.
+#
+# When /proc is unavailable (macOS) an alive pid is accepted on liveness alone:
+# refusing a possibly-live duplicate is the safe direction.
+lock_holder_is_live_instance() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 0
+    tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'claude-event-watch'
+}
+
+# Drop OUR pid from the lockfile, so a record of a dead process is never left
+# behind for the next start to trip over (it is what `watcher-ctl status` and
+# the refusal message above both read).
+#
+# Two rules, both load-bearing:
+#   * TRUNCATE, never unlink. Unlinking makes a fresh inode while the old
+#     description is still locked -> two live watchers.
+#   * Only when the file still records OUR pid. If a successor has already
+#     claimed the slot and written its own, clearing it would erase a LIVE
+#     watcher's liveness record.
+release_lock_pid_record() {
+    local current
+    current="$(cat "$LOCKFILE" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$current" == "$$" ]] || return 0
+    : >"$LOCKFILE" 2>/dev/null || true
+}
+
 if command -v flock >/dev/null 2>&1; then
-    # Read any existing holder pid FIRST, before we open the fd for write —
-    # opening with `9>` truncates the file, which would otherwise wipe the
-    # holder's pid before we get to read it in the refused branch below.
     prior_holder="$(cat "$LOCKFILE" 2>/dev/null | tr -d '[:space:]')"
-    exec 9>"$LOCKFILE" || {
+    # Open READ-WRITE (`<>`), NOT `>`. A truncating open wipes the file before
+    # we know whether we are allowed to have it — so a refused duplicate erased
+    # the LIVE holder's pid record on its way out, leaving a healthy watcher
+    # with an empty liveness record (read as DOWN by the supervision layer) and
+    # every later refusal reporting "pid unknown". `<>` creates the file when
+    # absent and leaves existing content alone; we truncate deliberately, after
+    # the lock is ours.
+    exec 9<>"$LOCKFILE" || {
         echo "claude-event-watch: cannot open lockfile $LOCKFILE" >&2
         exit 1
     }
     if ! flock -n 9; then
-        # Lock is held by a live instance — refuse. `prior_holder` was read
-        # before the truncating open above, so it still names the holder (an
-        # empty/stale read is fine; we still refuse with "unknown").
-        echo "claude-event-watch: already running (pid ${prior_holder:-unknown}) — refusing to start a duplicate" >&2
-        exit 3
+        # The lock is held — but by WHAT? Two very different cases hid behind
+        # the one refusal this branch used to print:
+        #
+        #   1. a genuinely live instance     -> refusing is correct;
+        #   2. a holder that is NOT a live instance (a child that inherited
+        #      the lock fd and outlived its parent, anything else holding the
+        #      description) -> the recorded pid is dead, `watcher-ctl status`
+        #      reports the watcher DOWN, and yet every start is refused with
+        #      "already running (pid <dead>)". The only recovery was a full
+        #      `watcher-restart`, which stops every OTHER healthy watcher too.
+        #
+        # So: verify the recorded holder before refusing. If it is not a live
+        # instance, give the lock a bounded window to clear itself (a transient
+        # holder releases when it exits) and start if it does. We deliberately
+        # do NOT unlink the lockfile as recovery: that makes a fresh inode
+        # while the old description is still locked, which permits two live
+        # watchers — a duplicate-spawn vector, not a fix.
+        if lock_holder_is_live_instance "$prior_holder"; then
+            echo "claude-event-watch: already running (pid ${prior_holder}) — refusing to start a duplicate" >&2
+            exit 3
+        fi
+        echo "claude-event-watch: lock held but the recorded pid (${prior_holder:-unknown}) is not a live instance — waiting up to ${LOCK_WAIT_SECONDS}s for the holder to release instead of refusing" >&2
+        if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
+            echo "claude-event-watch: already running (pid ${prior_holder:-unknown}) — lock still held after ${LOCK_WAIT_SECONDS}s by a holder that is not a live instance; refusing to start a duplicate. Clear it with: watcher-ctl stop claude-event-watch" >&2
+            exit 3
+        fi
+        echo "claude-event-watch: stale lock holder released; starting (self-healed, no watcher-restart needed)" >&2
     fi
-    # We hold the lock. The truncating open already emptied the file; record
-    # our pid so a refused second instance can name us. The fd stays open for
-    # the lock's lifetime (auto-released on process death — no stale cleanup).
+    # We hold the lock. Drop the previous holder's record (a separate O_TRUNC
+    # open on the same inode — it does not disturb the flock, which lives on
+    # our open file description) and record our own pid, so a refused second
+    # instance can name us. The fd stays open for the lock's lifetime
+    # (auto-released on process death — no stale cleanup).
     #
     # LIVENESS — why this pid write is load-bearing for BOTH modes.
     # The lockfile doubles as this watcher's liveness record: the supervision
@@ -741,7 +806,32 @@ if command -v flock >/dev/null 2>&1; then
     # Together they make "no output from the monitor" a statement rather than
     # an unknown: silence with a live ALIVE cadence means idle; missing ALIVE
     # lines mean wedged; a DOWN report means dead.
+    : >"$LOCKFILE" 2>/dev/null || true
     printf '%s\n' "$$" >&9
+
+    # A deliberate stop must not leave our pid recorded behind us.
+    #
+    # `watcher-restart` cleans the runtime records FIRST and signals SECOND, so
+    # an instance that was still starting wrote its record AFTER the sweep had
+    # passed and left it naming a pid that was killed moments later. The next
+    # start then read a record for a dead process. Clearing our own record from
+    # the signal handler closes that window from the writer's side.
+    #
+    # The handler re-raises the signal with the default disposition, so the
+    # 128+N exit status the supervisor translates is unchanged. Monitor mode
+    # installs its own TERM/INT/HUP handlers further down (they call
+    # `release_lock_pid_record` too) and those deliberately win.
+    on_stop_signal() {
+        local sig="$1"
+        trap - TERM INT
+        if [[ -n "${INOTIFY_PID:-}" ]]; then
+            kill "$INOTIFY_PID" 2>/dev/null || true
+        fi
+        release_lock_pid_record
+        kill -"$sig" "$$"
+    }
+    trap 'on_stop_signal TERM' TERM
+    trap 'on_stop_signal INT' INT
 else
     # flock unavailable (e.g. macOS without util-linux). Degrade gracefully:
     # the singleton guarantee is best-effort here, but the watcher still works.
@@ -1404,6 +1494,10 @@ monitor_stop_on_signal() {
     now="$(date +%s)"
     echo "[monitor-mode] EVENT-WATCH MONITOR STOPPED signal=$sig pid=$$ uptime=$(( now - STARTED_AT ))s batches=$BATCHES_DELIVERED pending=$(count_pending) — clean exit 0; re-arm with: watcher-ctl run claude-event-watch"
     write_clean_exit_marker
+    # Same reason as the exit-mode handler: do not leave our pid recorded in
+    # the lockfile for the next start (or `watcher-ctl status`) to read as a
+    # live instance. Truncates only while the record is still ours.
+    release_lock_pid_record
     exit 0
 }
 

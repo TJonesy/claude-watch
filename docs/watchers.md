@@ -242,6 +242,43 @@ alerts, restarts trivially on resume.
   `kill` for watcher cleanup — it misses the right children and clobbers
   the wrong ones.
 
+## Stopping ONE watcher (`watcher-ctl stop <name>`)
+
+`watcher-restart` stops **every** enabled watcher. When only one entry is
+stuck, use the per-watcher verb instead:
+
+```
+watcher-ctl stop <name>     # kill its processes + children, clear its records
+watcher-ctl run  <name>     # ... then start it again (main loop only)
+```
+
+`stop` kills the watcher's pollers and their descendants (a child that
+inherited the watcher's lock fd keeps the singleton lock held after its parent
+is gone), removes `<name>.pid` and any pending monitor arm intent, and empties
+a `<name>.lock` whose recorded pid is no longer alive. It never *unlinks* a
+lockfile: a fresh inode under a still-locked open file description would let
+two watchers hold "the" lock at once. It is idempotent — stopping something
+that is not running still clears stale records and exits 0 — and it does not
+touch the config (use `disable` to stop a watcher coming back).
+
+### Stale liveness records heal themselves
+
+A record naming a process that no longer exists must never block a start:
+
+- `watcher-ctl run <name>` treats **any** PID file that does not name a live,
+  identity-matching instance as stale — a dead pid, a recycled pid now running
+  something else, or a file with no usable pid at all (empty / junk) — clears
+  it, and starts. Only a genuinely live instance is refused.
+- A run whose child is stopped **by a signal** removes its own PID file, and
+  only while it still names that child, so a successor's record is never
+  deleted. `watcher-restart` cleans records *first* and signals *second*, so
+  without this a run that was still starting could re-create a record naming
+  the pid restart had just killed.
+- The bash watchers clear their own pid record from the lockfile on
+  SIGTERM/SIGINT (truncate, never unlink) and, when the lock is held but the
+  recorded holder is not a live instance, wait a bounded window for the holder
+  to release rather than refusing outright.
+
 ## Restart watchers BEFORE acting on results
 
 When a watcher returns results, restart it **immediately** as the first

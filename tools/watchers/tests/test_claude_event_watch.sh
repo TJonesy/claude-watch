@@ -72,6 +72,11 @@ reap_within() {  # <pid> <max_seconds>
 # whether the suite passes. Individual tests still override this per-invocation
 # where they need two instances to contend on a specific file.
 export CLAUDE_EVENT_WATCH_LOCK="$TMP/default.lock"
+# Keep the bounded "wait for a lock whose recorded holder is not a live
+# instance" window short for the suite. A LIVE holder is still refused
+# immediately (that check runs first), so this only trims dead time in the
+# harness-held-lock cases; the self-heal test sets its own longer window.
+export CLAUDE_EVENT_WATCH_LOCK_WAIT_SECS=1
 
 QUEUE="$TMP/queue"
 LOG_DIR="$TMP/log"
@@ -683,6 +688,125 @@ else
         exit 1
     fi
     echo "  singleton: fresh instance acquires the lock right after a SIGKILLed parent OK"
+
+    # (i4) SELF-HEAL: a lock whose RECORDED holder is not a live instance must
+    # not produce an instant refusal. The watcher waits a bounded window and
+    # starts as soon as the holder lets go — the case that used to need a
+    # fleet-wide `watcher-restart` to recover from (every other healthy watcher
+    # killed to clear one entry).
+    SQ="$TMP/sq"; SLOG="$TMP/slog"; SLOCK="$TMP/selfheal.lock"
+    mkdir -p "$SQ" "$SLOG"
+    # A pid that is definitely dead: start a process, reap it, reuse its pid.
+    sleep 0.1 & dead_pid=$!
+    wait "$dead_pid" 2>/dev/null || true
+    # Hold the lock from the test shell and record the DEAD pid in the file,
+    # i.e. exactly the shape the old code refused on ("already running (pid
+    # <dead>)" while `watcher-ctl status` said DOWN).
+    exec 7>"$SLOCK"
+    if ! flock -n 7; then
+        echo "FAIL: test harness could not acquire the self-heal lock" >&2; exit 1
+    fi
+    printf '%s\n' "$dead_pid" >&7
+    write_event "$SQ" "100_selfheal.json" "self heal"
+    # Release the lock shortly after the watcher starts waiting.
+    ( sleep 2; flock -u 7 ) &
+    RELEASER=$!
+    BG_PIDS+=("$RELEASER")
+    set +e
+    heal_out=$(CLAUDE_EVENT_QUEUE="$SQ" CLAUDE_EVENT_LOG_DIR="$SLOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$SLOCK" CLAUDE_EVENT_WATCH_LOCK_WAIT_SECS=15 \
+        "$WATCHER" --debounce 0 2>&1)
+    heal_rc=$?
+    set -e
+    wait "$RELEASER" 2>/dev/null || true
+    exec 7>&-
+    if (( heal_rc != 0 )); then
+        echo "FAIL: watcher did not self-heal past a dead-pid lock holder (rc=$heal_rc)" >&2
+        echo "$heal_out" >&2
+        exit 1
+    fi
+    if ! grep -q 'is not a live instance' <<<"$heal_out"; then
+        echo "FAIL: watcher refused/started without reporting the dead recorded pid" >&2
+        echo "$heal_out" >&2
+        exit 1
+    fi
+    if ! grep -q 'WATCHER EXITED' <<<"$heal_out"; then
+        echo "FAIL: self-healed watcher did not run to completion" >&2
+        echo "$heal_out" >&2
+        exit 1
+    fi
+    echo "  singleton: dead-pid lock holder is waited out, not refused OK"
+
+    # (i5) A LIVE instance is still refused IMMEDIATELY — the self-heal must
+    # not weaken the singleton guard into "wait, then spawn a duplicate".
+    LQ2="$TMP/lq2"; LLOG2="$TMP/llog2"; LIVELOCK="$TMP/live.lock"
+    mkdir -p "$LQ2" "$LLOG2"
+    CLAUDE_EVENT_QUEUE="$LQ2" CLAUDE_EVENT_LOG_DIR="$LLOG2" \
+        CLAUDE_EVENT_WATCH_LOCK="$LIVELOCK" "$WATCHER" --debounce 0 >"$TMP/live.out" 2>&1 &
+    LIVE=$!
+    BG_PIDS+=("$LIVE")
+    sleep 2
+    live_recorded=""
+    for _try in 1 2 3 4 5; do
+        live_recorded="$(tr -d '[:space:]' <"$LIVELOCK" 2>/dev/null || true)"
+        [[ "$live_recorded" =~ ^[0-9]+$ ]] && break
+        sleep 1
+    done
+    if [[ ! "$live_recorded" =~ ^[0-9]+$ ]]; then
+        echo "FAIL: live watcher recorded no pid in its lockfile (got '$live_recorded')" >&2
+        kill "$LIVE" 2>/dev/null || true
+        exit 1
+    fi
+    started_at=$(date +%s)
+    set +e
+    live_out=$(CLAUDE_EVENT_QUEUE="$LQ2" CLAUDE_EVENT_LOG_DIR="$LLOG2" \
+        CLAUDE_EVENT_WATCH_LOCK="$LIVELOCK" CLAUDE_EVENT_WATCH_LOCK_WAIT_SECS=30 \
+        "$WATCHER" --debounce 0 2>&1)
+    live_rc=$?
+    set -e
+    elapsed=$(( $(date +%s) - started_at ))
+    if (( live_rc != 3 )); then
+        echo "FAIL: duplicate against a LIVE instance returned rc=$live_rc, expected 3" >&2
+        echo "$live_out" >&2
+        kill "$LIVE" 2>/dev/null || true
+        exit 1
+    fi
+    if (( elapsed > 10 )); then
+        echo "FAIL: duplicate against a LIVE instance waited ${elapsed}s — it must fail fast" >&2
+        kill "$LIVE" 2>/dev/null || true
+        exit 1
+    fi
+
+    # (i6) SIGTERM clears the instance's own pid record. `watcher-restart`
+    # cleans runtime records FIRST and signals SECOND, so a watcher that keeps
+    # its record on the way out leaves one naming a dead process. The lockfile
+    # must be EMPTIED, never unlinked (a fresh inode under a still-locked
+    # description permits two live watchers).
+    # The refused duplicate must NOT have wiped the live holder's record: a
+    # truncating open of the lockfile emptied it before the flock was even
+    # attempted, so a healthy watcher was left with no liveness record (read as
+    # DOWN) every time something tried to start a second one.
+    recorded="$(tr -d '[:space:]' <"$LIVELOCK" 2>/dev/null || true)"
+    if [[ "$recorded" != "$live_recorded" ]]; then
+        echo "FAIL: a refused duplicate changed the live instance's pid record ('$live_recorded' -> '$recorded')" >&2
+        kill "$LIVE" 2>/dev/null || true
+        exit 1
+    fi
+    kill -TERM "$recorded" 2>/dev/null || true
+    reap_within "$LIVE" 10 >/dev/null 2>&1 || true
+    for _try in 1 2 3 4 5; do
+        [[ -s "$LIVELOCK" ]] || break
+        sleep 1
+    done
+    if [[ ! -e "$LIVELOCK" ]]; then
+        echo "FAIL: SIGTERM unlinked the lockfile (must only clear its content)" >&2
+        exit 1
+    fi
+    if [[ -s "$LIVELOCK" ]]; then
+        echo "FAIL: SIGTERMed watcher left its pid recorded ($(cat "$LIVELOCK"))" >&2
+        exit 1
+    fi
+    echo "  singleton: live duplicate refused fast; SIGTERM clears the pid record OK"
 fi
 
 # (i3) The lockfile default must not depend on the caller's environment.

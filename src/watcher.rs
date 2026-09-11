@@ -907,6 +907,125 @@ fn pid_matches_watcher(pid: u32, start_cmd: &str) -> bool {
     }
 }
 
+/// What a watcher's `<name>.pid` file says about the spawn slot.
+///
+/// The guard used to reason over a bare `Option<u32>`, which collapsed two
+/// very different situations into the same `None`: "there is no PID file" and
+/// "there is a PID file but it carries no usable pid". Only the first is
+/// harmless — the second is a file sitting on the slot that nothing ever
+/// cleaned, because the stale-clear was conditioned on having parsed a pid out
+/// of it. The atomic `O_EXCL` claim then failed on every subsequent run and
+/// `watcher-ctl run` refused forever with "launch already in progress", with a
+/// full `watcher-restart` (which kills every healthy watcher) the only way out.
+/// Naming the states separately is what lets the caller clean BOTH stale
+/// shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidFileVerdict {
+    /// No PID file — the slot is free.
+    Absent,
+    /// The file names a pid that is alive AND identifies as this watcher: a
+    /// genuine live instance holds the slot.
+    Live(u32),
+    /// The file names a pid that is dead, or that a recycled PID handed to an
+    /// unrelated process (identity check failed). Stale — clean and start.
+    StaleDead(u32),
+    /// The file exists but carries no usable pid: empty (a torn write, or a
+    /// claim whose writer died between `create` and `write`), whitespace, or
+    /// non-numeric junk. Stale — clean and start.
+    StaleUnusable,
+}
+
+impl PidFileVerdict {
+    /// A live instance holds the slot (the only verdict that blocks a start).
+    pub fn is_live(self) -> bool {
+        matches!(self, PidFileVerdict::Live(_))
+    }
+
+    /// The file is present but proves nothing — it must be removed before the
+    /// `O_EXCL` claim, or the claim (and therefore every future `run`) fails.
+    pub fn is_stale(self) -> bool {
+        matches!(
+            self,
+            PidFileVerdict::StaleDead(_) | PidFileVerdict::StaleUnusable
+        )
+    }
+
+    /// The recorded pid, when the file carried one.
+    pub fn pid(self) -> Option<u32> {
+        match self {
+            PidFileVerdict::Live(p) | PidFileVerdict::StaleDead(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Short human reason for the `cleared stale PID file` line.
+    pub fn stale_reason(self) -> &'static str {
+        match self {
+            PidFileVerdict::StaleDead(_) => "recorded pid is not a live instance of this watcher",
+            PidFileVerdict::StaleUnusable => "file carries no usable pid",
+            _ => "",
+        }
+    }
+}
+
+/// Pure classification of a PID file's content.
+///
+/// `content` is the file's raw text (`None` when the file does not exist or
+/// could not be read). `is_live_instance` answers "is this pid alive AND
+/// actually this watcher?" — kept as a closure so the decision is unit-testable
+/// without touching `/proc`, and so PID reuse (a live pid running something
+/// else) is rejected by the same path as a dead pid.
+pub fn classify_pid_file(content: Option<&str>, is_live_instance: impl Fn(u32) -> bool) -> PidFileVerdict {
+    let content = match content {
+        Some(c) => c,
+        None => return PidFileVerdict::Absent,
+    };
+    match content.trim().parse::<u32>() {
+        Ok(pid) if is_live_instance(pid) => PidFileVerdict::Live(pid),
+        Ok(pid) => PidFileVerdict::StaleDead(pid),
+        Err(_) => PidFileVerdict::StaleUnusable,
+    }
+}
+
+/// Write `pid` into `pid_file` ATOMICALLY: fill a temp file in the same
+/// directory, then `rename(2)` it over the target.
+///
+/// A plain `write` truncates first and fills after, so a reader (or a crash)
+/// in between sees an EMPTY pid file — which, before [`classify_pid_file`]
+/// named that state, was the shape that wedged the spawn slot permanently.
+/// `rename` within a directory is atomic, so every reader sees either the old
+/// content or the complete new pid, never a half-written one.
+fn write_pid_file_atomic(pid_file: &str, pid: u32) -> std::io::Result<()> {
+    let tmp = format!("{}.tmp.{}", pid_file, std::process::id());
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        if let Err(e) = f.write_all(pid.to_string().as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, pid_file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remove `pid_file`, but ONLY if it still records `pid`.
+///
+/// The "only if it is still ours" check is the whole point: by the time a run
+/// tears down, a SUCCESSOR may already have claimed the slot and written its
+/// own pid. Deleting that would hand the slot back to a duplicate-spawn. A
+/// file naming some other pid is therefore left exactly where it is.
+///
+/// Returns `true` when the file was ours and is now gone.
+fn remove_pid_file_if_matches(pid_file: &str, pid: u32) -> bool {
+    if read_pid_file(pid_file) != Some(pid) {
+        return false;
+    }
+    std::fs::remove_file(pid_file).is_ok()
+}
+
 /// Pure decision: given what the guard observed, should `watcher_run` no-op
 /// (a live instance already holds the slot) instead of starting a second one?
 ///
@@ -1092,7 +1211,6 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
     let _ = std::fs::create_dir_all(&pid_dir);
 
     let pid_file = format!("{}/{}.pid", pid_dir, name);
-    let pid_file_exists = std::path::Path::new(&pid_file).exists();
 
     // --- Spawn-slot lock (BUG B fix) ---------------------------------------
     // Acquire an exclusive `flock` over `<name>.lock` for the WHOLE duration
@@ -1141,11 +1259,26 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
     //   2. Live poller count: `pgrep` on the watcher's pattern — the same
     //      signal `watcher-status` uses. Catches an instance started
     //      out-of-band whose PID isn't (or no longer is) in the file.
-    let recorded_pid = read_pid_file(&pid_file);
-    let recorded_pid_alive = match recorded_pid {
-        Some(pid) => pid_is_alive(pid) && pid_matches_watcher(pid, start_cmd),
-        None => false,
+    //
+    // The PID file is read ONCE, here, and classified: only `Live` blocks a
+    // start. Every other present-but-not-live shape — a dead pid, a recycled
+    // pid running something else, an EMPTY or junk file — is stale and gets
+    // cleaned below. We already hold the spawn lock, so no concurrent
+    // `watcher_run` can be mid-claim while we decide.
+    let pid_file_content = match std::fs::read_to_string(&pid_file) {
+        Ok(c) => Some(c),
+        // Present but unreadable counts as present: fall through to the stale
+        // path (which tries to remove it) rather than silently treating the
+        // slot as free and then failing the O_EXCL claim with no explanation.
+        Err(_) if std::path::Path::new(&pid_file).exists() => Some(String::new()),
+        Err(_) => None,
     };
+    let verdict = classify_pid_file(pid_file_content.as_deref(), |pid| {
+        pid_is_alive(pid) && pid_matches_watcher(pid, start_cmd)
+    });
+    let pid_file_exists = verdict != PidFileVerdict::Absent;
+    let recorded_pid = verdict.pid();
+    let recorded_pid_alive = verdict.is_live();
     // Comm-filtered: a raw `pgrep -f` here counted any process that merely
     // mentioned the pattern and refused a legitimate start.
     let live_poller_count = poller_pids(&entry.pattern, entry.start_cmd.as_deref())
@@ -1168,10 +1301,26 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
         return Ok(0);
     }
 
-    // No live instance. If a PID file lingers it is stale (dead/recycled PID)
-    // — remove it so the atomic O_EXCL claim below can succeed.
-    if recorded_pid.is_some() {
-        let _ = std::fs::remove_file(&pid_file);
+    // No live instance. If a PID file lingers it is stale — a dead pid, a
+    // recycled one, or a file with no usable pid at all — so remove it and say
+    // so. This is the SELF-HEAL: without it the slot stays claimed by a record
+    // of a process that no longer exists, the O_EXCL claim below fails, and the
+    // only recovery is `watcher-restart`, which needlessly kills every OTHER
+    // (healthy) watcher too.
+    if verdict.is_stale() {
+        match std::fs::remove_file(&pid_file) {
+            Ok(()) => println!(
+                "{}: cleared stale PID file {} ({}) — starting",
+                name,
+                pid_file,
+                verdict.stale_reason()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "warning: could not remove stale PID file {} for '{}': {}",
+                pid_file, name, e
+            ),
+        }
     }
 
     // Print history on restart (PID file existed from a previous run).
@@ -1230,20 +1379,89 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
             format!("failed to start '{}': {}", start_cmd, e)
         })?;
 
-    // Record the real child PID (overwrite the placeholder claim).
+    // Record the real child PID (overwrite the placeholder claim), ATOMICALLY:
+    // a truncate-then-fill write is observable as an EMPTY pid file, which is
+    // precisely the shape that used to wedge the slot for good.
     let pid = child.id().unwrap_or(0);
-    let _ = std::fs::write(&pid_file, pid.to_string());
+    if let Err(e) = write_pid_file_atomic(&pid_file, pid) {
+        eprintln!("warning: could not record PID file for '{}': {}", name, e);
+    }
 
-    // Wait for child to exit
-    let status = child
-        .wait()
+    // Wait for the child, translating a SIGTERM/SIGINT delivered to US into a
+    // graceful stop of the child (so a stop of this supervisor is not an
+    // orphaned poller plus a pid file nobody owns).
+    let (status, stopped_by_signal) = wait_for_child_with_signal_forwarding(&mut child, pid)
         .await
         .map_err(|e| format!("failed to wait for '{}': {}", name, e))?;
+
+    // Deliberate stop (`watcher-restart`, `watcher-ctl stop`, an operator ^C)
+    // — clean up our own record instead of leaving a pid file naming a process
+    // that was just killed.
+    //
+    // This is the OTHER half of the stale-pidfile race: `watcher-restart`
+    // cleans pid files FIRST and signals second, so a run that was still
+    // starting re-created the file (with the pid of the child restart had just
+    // killed) AFTER the sweep had passed, and the next `run` found a pid file
+    // for a dead process. Removing it here — and only while it still names OUR
+    // child, never a successor's — closes that window from the writer's side;
+    // the stale-clear above closes it from the reader's.
+    if stopped_by_signal || ExitStatusExt::signal(&status).is_some() {
+        remove_pid_file_if_matches(&pid_file, pid);
+    }
 
     Ok(exit_code_from_status(
         status.code(),
         ExitStatusExt::signal(&status),
     ))
+}
+
+/// Wait for `child` to exit, forwarding a SIGTERM/SIGINT that arrives for THIS
+/// process on to the child first.
+///
+/// Returns `(status, stopped_by_signal)`, where `stopped_by_signal` is true iff
+/// we forwarded at least one signal — i.e. the exit was a deliberate stop of
+/// this supervisor, even if the child then chose to exit 0 out of its own
+/// handler (the monitor-mode watchers do exactly that).
+///
+/// A second signal escalates to SIGKILL, so an unresponsive child cannot pin
+/// the supervisor. If signal handlers cannot be installed at all we degrade to
+/// a plain wait — never worse than the previous behaviour.
+async fn wait_for_child_with_signal_forwarding(
+    child: &mut tokio::process::Child,
+    pid: u32,
+) -> std::io::Result<(std::process::ExitStatus, bool)> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let (mut term, mut intr) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(t), Ok(i)) => (t, i),
+        _ => return child.wait().await.map(|s| (s, false)),
+    };
+
+    let mut forwarded = 0u32;
+    loop {
+        let escalate = tokio::select! {
+            res = child.wait() => return res.map(|s| (s, forwarded > 0)),
+            Some(_) = term.recv() => true,
+            Some(_) = intr.recv() => true,
+        };
+        if escalate {
+            forwarded += 1;
+            if forwarded == 1 {
+                // Polite stop first: the watchers have TERM handlers that
+                // clear their own liveness records on the way out.
+                if pid != 0 {
+                    use nix::sys::signal::{kill, Signal};
+                    use nix::unistd::Pid;
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                }
+            } else {
+                let _ = child.start_kill();
+            }
+        }
+    }
 }
 
 /// `watcher-ctl run <name>` for a `mode=monitor` watcher.
@@ -1596,6 +1814,134 @@ pub(crate) fn descendants_of(roots: &[u32], ppid_map: &[(u32, u32)]) -> Vec<u32>
 /// singleton lock with no live watcher behind it. Descendants are enumerated
 /// BEFORE anything is signalled: once the parent dies its children are
 /// reparented to init and are no longer reachable from the watcher's PID.
+/// SIGTERM one watcher's live pollers and their descendants.
+///
+/// Returns `(pollers_killed, descendants_killed)`. Descendants are enumerated
+/// BEFORE anything is signalled: once the parent dies its children are
+/// reparented to init and are no longer reachable from the watcher's PID. This
+/// matters beyond tidiness — a child that inherited the watcher's flock fd
+/// keeps the singleton lock held after its parent is gone, which is what made
+/// "stop, then immediately start" refuse against a lock nobody owned.
+async fn kill_entry_processes(entry: &WatcherEntry) -> (u32, u32) {
+    // Comm-filtered so a process that merely quotes the pattern in an
+    // argument is not signalled.
+    let pids = poller_pids(&entry.pattern, entry.start_cmd.as_deref()).await;
+    if pids.is_empty() {
+        return (0, 0);
+    }
+    let children = descendants_of(&pids, &read_ppid_map());
+    for pid in pids.iter().chain(children.iter()) {
+        let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
+    }
+    (pids.len() as u32, children.len() as u32)
+}
+
+/// Clear the liveness records of ONE watcher across every candidate pid dir.
+///
+/// * `<name>.pid` and `<name>.monitor-intent` are removed outright — the
+///   watcher is being stopped, so a pending arm intent is void and the pid
+///   record describes a process we just killed.
+/// * `<name>.lock` (the bash flock guard's file) is TRUNCATED, never unlinked,
+///   and only when the pid it records is no longer alive. Unlinking a lockfile
+///   creates a fresh inode while the old open file description is still
+///   locked, which permits two live watchers — a duplicate-spawn vector, not a
+///   recovery. Clearing the content drops the stale pid without touching the
+///   lock itself.
+///
+/// Returns the paths that were actually cleared, for the caller's report.
+fn clear_watcher_records(name: &str) -> Vec<String> {
+    clear_watcher_records_in(&crate::status::watcher_pid_dirs(), name)
+}
+
+/// [`clear_watcher_records`] over an explicit directory list (the seam the
+/// tests use, so they never have to mutate process-global env).
+fn clear_watcher_records_in(dirs: &[String], name: &str) -> Vec<String> {
+    let mut cleared = Vec::new();
+    for dir in dirs {
+        for suffix in ["pid", "monitor-intent"] {
+            let path = format!("{}/{}.{}", dir, name, suffix);
+            if std::fs::remove_file(&path).is_ok() {
+                cleared.push(path);
+            }
+        }
+        let lock_path = format!("{}/{}.lock", dir, name);
+        if let Ok(content) = std::fs::read_to_string(&lock_path) {
+            if content.trim().is_empty() {
+                continue;
+            }
+            let holder_alive = content
+                .trim()
+                .parse::<u32>()
+                .is_ok_and(|pid| pid_is_alive(pid) && pid_matches_watcher_entry(pid, name));
+            if !holder_alive && std::fs::write(&lock_path, "").is_ok() {
+                cleared.push(lock_path);
+            }
+        }
+    }
+    cleared
+}
+
+/// Identity check for a lockfile holder when all we know is the watcher NAME
+/// (the `.lock` file convention is per-name, and `clear_watcher_records` runs
+/// after the entry's processes are gone). Lenient on purpose — it only ever
+/// has to answer "could this pid still be that watcher?", and a `true` answer
+/// simply leaves the record alone.
+fn pid_matches_watcher_entry(pid: u32, name: &str) -> bool {
+    match pid_cmdline(pid) {
+        Some(cmdline) => cmdline.contains(name),
+        None => false,
+    }
+}
+
+/// Stop ONE watcher by name: signal its pollers (and their descendants), then
+/// clear its liveness records.
+///
+/// This is the missing per-watcher recovery verb. Without it the only way to
+/// clear a watcher whose records outlived it was `watcher-restart`, which stops
+/// EVERY enabled watcher — a fleet-wide kill to fix one entry. `stop` is
+/// deliberately idempotent: stopping a watcher that is not running is a
+/// success that still cleans up whatever records are lying around.
+///
+/// Unlike `disable` this is transient and does NOT touch the config, so it
+/// applies to protected watchers too (`watcher-restart` already stops those).
+/// The main loop is still the only thing that may START a watcher.
+pub async fn watcher_stop(
+    config_path: &str,
+    extra_config_path: Option<&str>,
+    name: &str,
+) -> Result<String, String> {
+    let entries = load_entries(config_path, extra_config_path);
+    let entry = entries
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| format!("watcher '{}' not found in config", name))?;
+
+    let (killed, children) = kill_entry_processes(entry).await;
+    let cleared = clear_watcher_records(name);
+
+    let mut messages = Vec::new();
+    match (killed, children) {
+        (0, _) => messages.push(format!("{}: no live process to stop", name)),
+        (k, 0) => messages.push(format!("{}: killed {} process(es)", name, k)),
+        (k, c) => messages.push(format!(
+            "{}: killed {} process(es) + {} child process(es)",
+            name, k, c
+        )),
+    }
+    if cleared.is_empty() {
+        messages.push(format!("{}: no liveness records to clear", name));
+    } else {
+        for path in &cleared {
+            messages.push(format!("{}: cleared {}", name, path));
+        }
+    }
+    messages.push(format!(
+        "{}: stopped. Restart it from the main loop with `watcher-ctl run {}`.",
+        name, name
+    ));
+    Ok(messages.join("\n"))
+}
+
 pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>) -> String {
     let entries = load_entries(config_path, extra_config_path);
     let mut total = 0u32;
@@ -1605,30 +1951,17 @@ pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>)
         if !entry.enabled {
             continue;
         }
-        // Comm-filtered so a process that merely quotes the pattern in an
-        // argument is not signalled.
-        let pids = poller_pids(&entry.pattern, entry.start_cmd.as_deref()).await;
-        if !pids.is_empty() {
-            // Snapshot the tree first — see the note on this function.
-            let children = descendants_of(&pids, &read_ppid_map());
-            let count = pids.len() as u32;
-            for pid in &pids {
-                let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
-            }
-            for pid in &children {
-                let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
-            }
-            if children.is_empty() {
+        let (count, children) = kill_entry_processes(entry).await;
+        if count > 0 {
+            if children == 0 {
                 messages.push(format!("Killed {} {} process(es)", count, entry.name));
             } else {
                 messages.push(format!(
                     "Killed {} {} process(es) + {} child process(es)",
-                    count,
-                    entry.name,
-                    children.len()
+                    count, entry.name, children
                 ));
             }
-            total += count + children.len() as u32;
+            total += count + children;
         }
     }
 
@@ -1736,6 +2069,20 @@ pub fn any_unhealthy(statuses: &[WatcherStatus]) -> bool {
 pub async fn cmd_run(config_path: &str, extra_config_path: Option<&str>, name: &str) -> i32 {
     match watcher_run(config_path, extra_config_path, name).await {
         Ok(code) => code,
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            1
+        }
+    }
+}
+
+/// `claude-watch watcher stop <name>`
+pub async fn cmd_stop(config_path: &str, extra_config_path: Option<&str>, name: &str) -> i32 {
+    match watcher_stop(config_path, extra_config_path, name).await {
+        Ok(msg) => {
+            println!("{}", msg);
+            0
+        }
         Err(msg) => {
             eprintln!("Error: {}", msg);
             1
@@ -3527,6 +3874,363 @@ mod tests {
         );
     }
 
+    // --- stale PID file: classification + self-heal -------------------------
+    //
+    // The guard used to reason over `Option<u32>`, which merged "no PID file"
+    // with "a PID file that carries no usable pid". Only a PARSEABLE-but-dead
+    // pid was ever cleaned, so an EMPTY or junk file sat on the slot forever:
+    // the O_EXCL claim failed, `watcher-ctl run` refused with "launch already
+    // in progress", `watcher-ctl status` reported the watcher DOWN, and the
+    // only recovery was `watcher-restart` — which stops every other (healthy)
+    // watcher too.
+
+    #[test]
+    fn test_classify_pid_file_absent_when_no_file() {
+        assert_eq!(
+            classify_pid_file(None, |_| panic!("must not probe liveness")),
+            PidFileVerdict::Absent
+        );
+    }
+
+    #[test]
+    fn test_classify_pid_file_live_only_when_pid_is_this_watcher() {
+        assert_eq!(
+            classify_pid_file(Some("4242\n"), |pid| pid == 4242),
+            PidFileVerdict::Live(4242)
+        );
+        // PID REUSE: the pid is alive but the identity check says it is some
+        // other program. That must NOT suppress a legitimate start.
+        assert_eq!(
+            classify_pid_file(Some("4242\n"), |_| false),
+            PidFileVerdict::StaleDead(4242)
+        );
+    }
+
+    #[test]
+    fn test_classify_pid_file_unusable_content_is_stale_not_absent() {
+        for content in ["", "   ", "\n", "not-a-pid", "1234 5678"] {
+            let v = classify_pid_file(Some(content), |_| true);
+            assert_eq!(
+                v,
+                PidFileVerdict::StaleUnusable,
+                "content {:?} must classify as stale-unusable",
+                content
+            );
+            assert!(v.is_stale(), "content {:?} must be cleanable", content);
+            assert!(!v.is_live());
+            assert_eq!(v.pid(), None);
+        }
+    }
+
+    #[test]
+    fn test_pid_file_verdict_predicates() {
+        assert!(PidFileVerdict::Live(7).is_live());
+        assert!(!PidFileVerdict::Live(7).is_stale());
+        assert!(PidFileVerdict::StaleDead(7).is_stale());
+        assert!(!PidFileVerdict::Absent.is_stale());
+        assert_eq!(PidFileVerdict::StaleDead(7).pid(), Some(7));
+    }
+
+    #[test]
+    fn test_write_pid_file_atomic_replaces_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("w.pid");
+        let p = pid_file.to_str().unwrap();
+        write_pid_file_atomic(p, 111).unwrap();
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "111");
+        write_pid_file_atomic(p, 222).unwrap();
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "222");
+        // No temp file left behind (it would look like another watcher's
+        // record to anything scanning the dir).
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "w.pid")
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftovers: {:?}", leftovers);
+    }
+
+    #[test]
+    fn test_remove_pid_file_if_matches_never_deletes_a_successors_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("w.pid");
+        let p = pid_file.to_str().unwrap();
+
+        // Ours → removed.
+        std::fs::write(&pid_file, "555").unwrap();
+        assert!(remove_pid_file_if_matches(p, 555));
+        assert!(!pid_file.exists());
+
+        // A SUCCESSOR already claimed the slot → left completely alone.
+        std::fs::write(&pid_file, "999").unwrap();
+        assert!(!remove_pid_file_if_matches(p, 555));
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "999");
+
+        // Absent → no-op, no panic.
+        std::fs::remove_file(&pid_file).unwrap();
+        assert!(!remove_pid_file_if_matches(p, 555));
+    }
+
+    #[test]
+    fn test_clear_watcher_records_removes_pid_and_intent_and_empties_dead_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_string_lossy().into_owned()];
+        let name = "cw-clear-test";
+        std::fs::write(dir.path().join(format!("{}.pid", name)), "4242").unwrap();
+        std::fs::write(dir.path().join(format!("{}.monitor-intent", name)), "epoch=1").unwrap();
+        // A lock naming a pid that cannot be alive.
+        std::fs::write(
+            dir.path().join(format!("{}.lock", name)),
+            (u32::MAX - 1).to_string(),
+        )
+        .unwrap();
+
+        let cleared = clear_watcher_records_in(&dirs, name);
+        assert_eq!(cleared.len(), 3, "cleared {:?}", cleared);
+        assert!(!dir.path().join(format!("{}.pid", name)).exists());
+        assert!(!dir.path().join(format!("{}.monitor-intent", name)).exists());
+        // The lockfile is TRUNCATED, never unlinked: unlinking creates a fresh
+        // inode while the old (still locked) description lives on, which would
+        // let two watchers hold "the" lock at once.
+        let lock = dir.path().join(format!("{}.lock", name));
+        assert!(lock.exists(), "lockfile must not be unlinked");
+        assert!(std::fs::read_to_string(&lock).unwrap().trim().is_empty());
+    }
+
+    /// A lock naming a LIVE process that still identifies as the watcher must
+    /// be left untouched — clearing it would erase a running watcher's only
+    /// liveness record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_clear_watcher_records_keeps_a_live_lock_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_string_lossy().into_owned()];
+        // Use a token from OUR OWN cmdline as the watcher name, so this
+        // process passes the identity check for it.
+        let cmdline = pid_cmdline(std::process::id()).expect("own cmdline");
+        let name = cmdline
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.rsplit('/').next())
+            .expect("own argv0")
+            .to_string();
+        let lock = dir.path().join(format!("{}.lock", name));
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+
+        let cleared = clear_watcher_records_in(&dirs, &name);
+        assert!(cleared.is_empty(), "cleared {:?}", cleared);
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().trim(),
+            std::process::id().to_string()
+        );
+    }
+
+    /// `watcher_run` with a PID file that exists but carries NO usable pid
+    /// (empty — a torn write, or a claim whose writer died mid-write) must
+    /// self-heal: clear it and start. Before the fix this refused forever.
+    #[tokio::test]
+    async fn test_watcher_run_empty_pid_file_self_heals_and_starts() {
+        for junk in ["", "not-a-pid"] {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_dir = dir.path().join("pids");
+            std::fs::create_dir_all(&pid_dir).unwrap();
+            let cfg = dir.path().join("watchers.conf");
+            let sentinel = format!("cw-runtest-junkpid-{}", unique_token("w"));
+            let script = make_poller_script(dir.path(), &sentinel, "0.3");
+            std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+
+            let pid_file = pid_dir.join("runtest.pid");
+            std::fs::write(&pid_file, junk).unwrap();
+
+            let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+            let code = watcher_run(&config_path(), config_path_extra().as_deref(), "runtest")
+                .await
+                .expect("run should succeed");
+            assert_eq!(code, 0);
+            let recorded = std::fs::read_to_string(&pid_file).unwrap();
+            assert!(
+                recorded.trim().parse::<u32>().is_ok(),
+                "a real start must have replaced the unusable PID file {:?}, got {:?}",
+                junk,
+                recorded
+            );
+        }
+    }
+
+    /// PID REUSE: the PID file names a pid that IS alive but belongs to an
+    /// unrelated process. The guard must not mistake it for the watcher.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_watcher_run_recycled_pid_is_not_mistaken_for_the_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-runtest-recycled-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "0.3");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+
+        // Our own pid: definitely alive, definitely not this watcher.
+        let pid_file = pid_dir.join("runtest.pid");
+        let alien = std::process::id();
+        std::fs::write(&pid_file, alien.to_string()).unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let code = watcher_run(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("run should succeed");
+        assert_eq!(code, 0);
+        assert_ne!(
+            std::fs::read_to_string(&pid_file).unwrap().trim(),
+            alien.to_string(),
+            "a live-but-unrelated pid must not hold the slot"
+        );
+    }
+
+    // --- signalled stop: no stale record left behind ------------------------
+    //
+    // `watcher-restart` cleans PID files FIRST and signals SECOND, so a run
+    // that was still starting re-created its record AFTER the sweep passed and
+    // left it naming a pid that had just been killed. The next `run` then had
+    // to detect-and-clean it. A run now removes its OWN record when the child
+    // is stopped by a signal, closing the window from the writer's side.
+
+    /// Wait (bounded) for the pid file to name a live child, and return it.
+    async fn await_recorded_child(pid_file: &std::path::Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(c) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = c.trim().parse::<u32>() {
+                    if pid != std::process::id() && pid_is_alive(pid) {
+                        return pid;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("watcher_run never recorded a live child pid");
+    }
+
+    fn sigterm(pid: u32) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_run_clears_its_record_when_the_child_is_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-runtest-termed-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+        let pid_file = pid_dir.join("runtest.pid");
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let (cfg_path, extra) = (config_path(), config_path_extra());
+        let run = tokio::spawn(async move {
+            watcher_run(&cfg_path, extra.as_deref(), "runtest").await
+        });
+
+        let child = await_recorded_child(&pid_file).await;
+        sigterm(child);
+        let code = run.await.unwrap().expect("run should return Ok");
+        assert_eq!(code, 143, "SIGTERMed child should surface as 128+15");
+        assert!(
+            !pid_file.exists(),
+            "a signalled stop must not leave a PID file naming the dead child"
+        );
+    }
+
+    /// The restart race end-to-end: a sweep removes the PID file while the run
+    /// is live, then the child is killed. Whatever the interleaving, no record
+    /// of the dead child may survive — and a successor's record is never
+    /// touched.
+    #[tokio::test]
+    async fn test_watcher_run_leaves_no_record_after_a_restart_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-runtest-sweep-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+        let pid_file = pid_dir.join("runtest.pid");
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let (cfg_path, extra) = (config_path(), config_path_extra());
+        let run = tokio::spawn(async move {
+            watcher_run(&cfg_path, extra.as_deref(), "runtest").await
+        });
+
+        let child = await_recorded_child(&pid_file).await;
+        // `watcher-restart` order: sweep the records, THEN signal.
+        std::fs::remove_file(&pid_file).unwrap();
+        sigterm(child);
+        let _ = run.await.unwrap().expect("run should return Ok");
+        assert!(
+            !pid_file.exists(),
+            "the swept record must not be resurrected by the stopping run"
+        );
+
+        // And a successor's record planted in the same window survives.
+        std::fs::write(&pid_file, "424242").unwrap();
+        assert!(!remove_pid_file_if_matches(pid_file.to_str().unwrap(), child));
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "424242");
+    }
+
+    /// `watcher-ctl stop <name>`: kills just that watcher and clears just its
+    /// records — the per-watcher recovery that used to require a fleet-wide
+    /// `watcher-restart`.
+    #[tokio::test]
+    async fn test_watcher_stop_kills_one_watcher_and_clears_its_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-runtest-stop-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+        let pid_file = pid_dir.join("runtest.pid");
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let (cfg_path, extra) = (config_path(), config_path_extra());
+        let run = tokio::spawn(async move {
+            watcher_run(&cfg_path, extra.as_deref(), "runtest").await
+        });
+        let child = await_recorded_child(&pid_file).await;
+
+        let msg = watcher_stop(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("stop should succeed");
+        assert!(msg.contains("killed"), "{}", msg);
+        let _ = run.await.unwrap();
+        assert!(!pid_is_alive(child), "stop must kill the poller: {}", msg);
+        assert!(!pid_file.exists(), "stop must clear the PID file: {}", msg);
+
+        // Idempotent: stopping again is a clean no-op, not an error.
+        let again = watcher_stop(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("second stop should succeed");
+        assert!(again.contains("no live process to stop"), "{}", again);
+    }
+
+    #[tokio::test]
+    async fn test_watcher_stop_unknown_watcher_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        std::fs::write(&cfg, "runtest|sentinel|1|true|/bin/true\n").unwrap();
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let err = watcher_stop(&config_path(), config_path_extra().as_deref(), "nosuch")
+            .await
+            .expect_err("unknown watcher must error");
+        assert!(err.contains("not found"), "{}", err);
+    }
+
     /// `watcher_run` for a `mode=monitor` watcher must NOT exec the start_cmd:
     /// it records the arm intent (command included) and returns 0. The
     /// override layer is what flips the mode here — the base line is a plain
@@ -3834,13 +4538,18 @@ mod tests {
                 .spawn()
                 .expect("spawn poller")
         };
+        // Take the env guard BEFORE spawning: `RunEnv::new` blocks on the
+        // serialization mutex, and the pollers' AGE is what this test asserts
+        // on. Spawning first meant a long-held lock aged them past the
+        // transient floor before the first status call, turning the "not yet
+        // DUPLICATE" assertion red for reasons unrelated to the filter.
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
         let mut a = spawn();
         let mut b = spawn();
         let pid_a = a.id().unwrap();
         let pid_b = b.id().unwrap();
         std::fs::write(pid_dir.join("dupr.lock"), pid_a.to_string()).unwrap();
-
-        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
 
         // Fresh pollers are under the transient floor: the status must NOT
         // flag them yet (this is exactly the window a probe child lives in).

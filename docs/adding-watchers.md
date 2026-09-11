@@ -97,6 +97,19 @@ their own to `/var/run/claude/<name>.pid` as a belt-and-suspenders for
 its heartbeat tracking — that's fine, but not required for new
 watchers.)
 
+If a watcher DOES record its own pid (its own `<name>.pid`, or the pid it
+writes into its flock guard's `<name>.lock`), two rules apply, because the
+record is what the supervision layer reads as liveness:
+
+- **Write it atomically** (temp file + `rename`, or a single small write at
+  offset 0 of a file you have already truncated). A truncate-then-fill write is
+  observable as an EMPTY record, which reads as "present but unusable".
+- **Clear it on SIGTERM/SIGINT**, and only while it still names your own pid —
+  a successor may already have claimed the slot. Truncate a lockfile; never
+  unlink one (a fresh inode under a still-locked open file description permits
+  two live watchers). The supervisor does the same for the records it owns, so
+  a deliberate stop never leaves a record naming a dead process.
+
 ### 5. One watcher per domain
 
 Within a given event domain (e.g. surface inotify events from one
