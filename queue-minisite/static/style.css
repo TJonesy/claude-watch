@@ -616,6 +616,22 @@ html.header-collapsed .topbar .density-control { display: none; }
   color: var(--fg-mute);
 }
 
+/* Model tag: WHICH MODEL ran the item ("opus" / "sonnet" / ...), in the item
+   head of EVERY card. Same quiet monospace-chip furniture as .id / .prio so
+   it reads as row metadata rather than a status badge, and — being in the
+   head — it survives compact density (see the override below). Rendered only
+   when a model is actually attributable; there is no placeholder form. */
+.model-tag {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--fg-mute);
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+
 /* ------- badges ------- */
 
 .badge {
@@ -2300,6 +2316,9 @@ html.density-compact .badge {
 }
 html.density-compact .id { font-size: 0.76rem; padding: 1px 5px; }
 html.density-compact .prio { font-size: 0.7rem; }
+/* Compact: one notch smaller, NEVER hidden — the model is exactly the kind of
+   at-a-glance fact compact mode exists to line up. */
+html.density-compact .model-tag { font-size: 0.66rem; padding: 0 4px; }
 html.density-compact .action-btn { font-size: 0.68rem; padding: 1px 6px; }
 
 /* Cluster the pending-item action buttons (force start + abandon) TOGETHER

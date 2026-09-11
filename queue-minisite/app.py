@@ -1800,6 +1800,11 @@ def _shape(
     # filesystem path.
     raw_archive = item.get("log_archive_path")
     has_archive = False
+    # The archived AGENT transcript (``.jsonl`` only — a workload's stdout
+    # carries no model), for the model lookup at the bottom of this
+    # function. Same path-traversal guard the /meta endpoint applies before
+    # reading an archive: the filename is a bare basename or nothing.
+    model_archive_path: Path | None = None
     if isinstance(raw_archive, str) and (
         raw_archive.endswith(".jsonl") or raw_archive.endswith(".workload.txt")
     ):
@@ -1808,6 +1813,13 @@ def _shape(
             has_archive = os.path.isfile(archive_path)
         except OSError:
             has_archive = False
+        if (
+            has_archive
+            and raw_archive.endswith(".jsonl")
+            and "/" not in raw_archive
+            and ".." not in raw_archive
+        ):
+            model_archive_path = Path(archive_path)
 
     # Manual scope-lock state. A pending item whose scope overlaps an
     # operator-declared locked scope (``session-task queue lock <scope>``) is
@@ -1957,6 +1969,30 @@ def _shape(
     # so the front-end / live-log endpoint can dispatch on it, mirroring
     # the workload path above.
     shaped["hostjob_label"] = _extract_hostjob_label(shaped["scope"])
+    # WHICH MODEL ran this item — resolved from the transcript (archived for
+    # finished items, live for running ones) by the same ``_resolve_item_model``
+    # the /meta endpoint uses, so the list row and the detail modal can never
+    # disagree. Surfaced on EVERY row (not just running ones) because the
+    # operator's question — "what ran this?" — is asked of done and abandoned
+    # work at least as often (Andrew's compact-mode screenshot: the row showed
+    # id / priority / tokens / age / creator and no model anywhere).
+    #
+    #   ``model``       the raw id as recorded ("claude-opus-5"), for the
+    #                   hover title.
+    #   ``model_label`` the short chip text: the family shorthand ("opus",
+    #                   "sonnet", ...) when the id is recognised, else the raw
+    #                   id verbatim — we never invent a label we can't back up.
+    #
+    # BOTH are "" when no model is attributable: workload / hostjob items ran
+    # no model at all, pending items have not run yet, and an agent item whose
+    # transcript has been rotated away has no truthful answer. Absent is
+    # rendered as ABSENT by both renderers (no chip) — never "unknown".
+    _item_model = _resolve_item_model(item, shaped, model_archive_path)
+    shaped["model"] = _item_model or ""
+    shaped["model_label"] = (
+        (_model_family(_item_model) or _item_model) if _item_model else ""
+    )
+
     # Errored-hostjob recovery. An `abandoned` item that the hostjob reaper
     # flipped on a NON-ZERO worker exit is a FAILURE, not an operator
     # cancel — surface that distinctly so it (a) reads as errored in the UI
@@ -5532,6 +5568,40 @@ def _model_family(model_id: str | None) -> str | None:
     return None
 
 
+# Resolved-model cache. The model now decorates EVERY list row, so a render
+# pass can ask for it once per item (30 done rows + the running/abandoned
+# ones) every refresh tick — without a cache that is a file scan per row per
+# tick. Keyed on (path, mtime_ns, size) so an ARCHIVED transcript (immutable
+# once written) is scanned exactly once, while a LIVE transcript — whose
+# mtime moves on every write — is simply re-scanned; that scan stops at the
+# first assistant record, and running rows are few.
+#
+# Only POSITIVE results are cached: a None means "no assistant turn in this
+# transcript YET", which a live agent resolves seconds later.
+_MODEL_CACHE: dict[str, str] = {}
+_MODEL_CACHE_MAX = 4096
+
+
+def _cached_transcript_model(path: Path) -> str | None:
+    """``_extract_transcript_model`` memoised on the file's (mtime, size)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    hit = _MODEL_CACHE.get(key)
+    if hit:
+        return hit
+    model = _extract_transcript_model(path)
+    if model:
+        # Crude but bounded: drop the whole table rather than track an LRU
+        # for a few hundred bytes of display metadata.
+        if len(_MODEL_CACHE) >= _MODEL_CACHE_MAX:
+            _MODEL_CACHE.clear()
+        _MODEL_CACHE[key] = model
+    return model
+
+
 def _extract_transcript_model(path: Path) -> str | None:
     """Return the model id recorded on the first assistant record of a JSONL.
 
@@ -5598,7 +5668,7 @@ def _resolve_item_model(
         return stamped.strip()
 
     if archive_path is not None:
-        model = _extract_transcript_model(archive_path)
+        model = _cached_transcript_model(archive_path)
         if model:
             return model
 
@@ -5607,7 +5677,7 @@ def _resolve_item_model(
     if isinstance(owner_agent_id, str) and owner_agent_id:
         live_path = _find_agent_jsonl(owner_agent_id)
         if live_path is not None:
-            return _extract_transcript_model(live_path)
+            return _cached_transcript_model(live_path)
     return None
 
 

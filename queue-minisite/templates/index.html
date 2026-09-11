@@ -112,6 +112,25 @@
       <span class="exit-note">{{ note }}</span>
     </li>
   {%- endmacro -%}
+  {#- ---------- MODEL TAG MACRO ----------
+      WHICH MODEL ran an item, as a short chip ("opus" / "sonnet" / ...) with
+      the raw transcript id on hover. Used by EVERY card's head — the head is
+      the one part of a row compact density never elides, so the tag survives
+      compact exactly the way the priority and agent-stats cells do (the
+      operator's compact-mode screenshot showed id / priority / tokens / age /
+      creator and no model anywhere).
+
+      app.py _shape() resolves it from the agent transcript (archived for
+      finished items, live for running ones). `model_label` is "" whenever no
+      model is attributable — workload / hostjob items (no model ran), pending
+      items (not run yet), and agent items whose transcript is gone — and the
+      macro then renders NOTHING. Absent is absent: no "unknown" placeholder.
+
+      MUST stay in step with modelTag() in static/refresh.js — the 5s morphdom
+      merge replaces this markup with the JS version. -#}
+  {%- macro model_tag(it) -%}
+    {%- if it.model_label %}<span class="model-tag" title="model: {{ it.model or it.model_label }}">{{ it.model_label }}</span>{% endif -%}
+  {%- endmacro -%}
   <header class="topbar">
     <div class="title">
       {#- HEADER COLLAPSE (botchat #1762): a caret button that folds the header
@@ -341,6 +360,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {{ model_tag(it) }}
             {#- AGENT ACTIVITY CELL (botchat #2967): live tool-call + context
                 token counters for the agent bound to this queue id, from the
                 agent-stats snapshot. Lives in the item HEAD (not .age / .scope)
@@ -455,6 +475,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.wedged_reason %}<p class="description abandon-reason"><strong>wedge:</strong> {{ it.wedged_reason }}</p>{% endif %}
@@ -516,6 +537,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.quarantine_reason %}<p class="description abandon-reason"><strong>quarantine:</strong> {{ it.quarantine_reason }}</p>{% endif %}
@@ -586,6 +608,7 @@
             {% if it.locked %}<span class="badge state-locked" title="parked by an operator scope lock — NOT ready to spawn; the dispatcher refuses it until the scope is unlocked">locked</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {{ model_tag(it) }}
             {# depends-on badge — depends_on landed 2026-05-02.
                Each dep is a clickable anchor (jumps to the target row)
                with an "x" affordance to remove the edge via DELETE. #}
@@ -707,6 +730,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason }}</p>{% endif %}
@@ -765,6 +789,7 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
           <div class="age">
@@ -815,6 +840,7 @@
           <header class="item-head">
             <span class="badge state-done">done</span>
             <span class="id">{{ it.id }}</span>
+            {{ model_tag(it) }}
             {% if it.has_archive %}
               <span class="badge log-badge" title="archived agent transcript available">log</span>
             {% endif %}
@@ -862,6 +888,7 @@
               <span class="badge state-abandoned">abandoned</span>
             {% endif %}
             <span class="id">{{ it.id }}</span>
+            {{ model_tag(it) }}
             {% if it.is_errored_hostjob %}
               <span class="badge hostjob-badge" title="hostjob-bound: {{ it.hostjob_label }}">hostjob</span>
             {% endif %}
