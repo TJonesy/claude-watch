@@ -246,11 +246,11 @@ pub async fn run_script(policy: &Policy, interpreter: &str, script: &str) -> Too
             "run_script: interpreter {interpreter:?} is not in the allow-list"
         ));
     }
-    if script.len() > policy.max_command_length {
+    if script.len() > policy.max_script_length {
         return ToolOutput::err(format!(
-            "run_script: script exceeds MAX_COMMAND_LENGTH ({} > {})",
+            "run_script: script exceeds MAX_SCRIPT_LENGTH ({} > {})",
             script.len(),
-            policy.max_command_length
+            policy.max_script_length
         ));
     }
     let mut cmd = Command::new(interpreter);
@@ -294,7 +294,8 @@ mod tests {
             allowed_flags: Default::default(),
             allowed_dir: "/".to_string(),
             command_timeout: 10,
-            max_command_length: 8192,
+            max_command_length: 131_072,
+            max_script_length: 4 * 1024 * 1024,
             allow_shell_operators: true,
             profile: "test".to_string(),
             profile_warning: None,
@@ -342,5 +343,29 @@ mod tests {
         let out = run_script(&p, "perl", "print 1").await;
         assert!(out.is_error);
         assert!(out.text.contains("not in the allow-list"));
+    }
+
+    #[tokio::test]
+    async fn run_script_length_cap_is_independent_of_run_command() {
+        // A script well past max_command_length must still run: run_script's
+        // body goes over stdin, not argv, so max_command_length's OS-argv
+        // justification does not apply to it. This is the regression test
+        // for the original bug (run_script capped identically to
+        // run_command, defeating run_script's entire purpose).
+        let mut p = trusted_policy();
+        p.max_command_length = 8_192;
+        p.max_script_length = 4 * 1024 * 1024;
+        let script = format!("echo {}", "x".repeat(20_000));
+        let out = run_script(&p, "bash", &script).await;
+        assert!(!out.is_error, "got error: {}", out.text);
+    }
+
+    #[tokio::test]
+    async fn run_script_rejects_over_max_script_length() {
+        let mut p = trusted_policy();
+        p.max_script_length = 100;
+        let out = run_script(&p, "bash", &"x".repeat(101)).await;
+        assert!(out.is_error);
+        assert!(out.text.contains("MAX_SCRIPT_LENGTH"));
     }
 }

@@ -97,9 +97,14 @@
         chain commands with pipes / `&&` / redirects. Default `false`.
         Leave the default unless you specifically need it.
 
-      - MAX_COMMAND_LENGTH: max length (chars) of a single command
-        string the server will accept. Default 8192. Raise / lower here
-        or in the operator config file.
+      - MAX_COMMAND_LENGTH: max length (chars) of a single run_command
+        string the server will accept (argv-bound). Default 131072.
+        Raise / lower here or in the operator config file.
+
+      - MAX_SCRIPT_LENGTH: max length (chars) of a run_script body. Fed
+        to the interpreter on stdin, so there is no OS argv ceiling —
+        kept as a SEPARATE knob from MAX_COMMAND_LENGTH on purpose.
+        Default 4194304 (4 MiB).
 
       - SSL_CERT_FILE / REQUESTS_CA_BUNDLE: corporate CA bundle for
         operators behind a TLS MITM proxy. The server itself makes no
@@ -155,11 +160,21 @@
         <string>false</string>
 
         <!--
-          MAX_COMMAND_LENGTH: max single-command length (chars) the
-          server accepts. Default 8192. Omit to inherit the default.
+          MAX_COMMAND_LENGTH: max single run_command length (chars) the
+          server accepts (argv-bound). Default 131072. Omit to inherit
+          the default.
         -->
         <key>MAX_COMMAND_LENGTH</key>
-        <string>8192</string>
+        <string>131072</string>
+
+        <!--
+          MAX_SCRIPT_LENGTH: max run_script body length (chars). Fed to
+          the interpreter on stdin (no OS argv ceiling) -- kept separate
+          from MAX_COMMAND_LENGTH on purpose. Default 4194304 (4 MiB).
+          Omit to inherit the default.
+        -->
+        <key>MAX_SCRIPT_LENGTH</key>
+        <string>4194304</string>
 
         <key>SSL_CERT_FILE</key>
         <string></string>
