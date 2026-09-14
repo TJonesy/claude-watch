@@ -1334,6 +1334,51 @@ async fn run_daemon() {
             );
         }
 
+        // Daemon-side Pushover for obligations overrides (Andrew #8375).
+        //
+        // An audited override created IN-CONTAINER cannot notify Andrew itself:
+        // the override CLI's `pingme` is host-only and absent in the container,
+        // so its in-process notify is a silent no-op there. The override DOES
+        // emit an `obligations-bypass` claude-event into the bind-mounted queue
+        // this host daemon can read, so the daemon fires the Pushover here --
+        // "the backend/daemon should always do it". Runs every loop pass (a
+        // cheap dir scan) so it beats `claude-event-watch`'s
+        // debounce-then-delete on the same queue; the per-override-id ledger
+        // keeps it one-shot.
+        {
+            let queue = event_bus::queue_dir();
+            let ledger = std::path::PathBuf::from(current_config.ack.resolve_state_dir())
+                .join("obligations-bypass-pushover.json");
+            for ov in event_bus::drain_obligations_bypass(&queue, &ledger) {
+                let dur = match ov.duration_secs {
+                    Some(d) if d >= 3600 => format!("{:.1}h", d as f64 / 3600.0),
+                    Some(d) if d >= 60 => format!("{:.1}m", d as f64 / 60.0),
+                    Some(d) => format!("{}s", d),
+                    None => "?".to_string(),
+                };
+                let by = if ov.created_by.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [by {}]", ov.created_by)
+                };
+                let msg = format!(
+                    "claude-watch: obligations override created ({}, {}): {}{}",
+                    ov.override_id, dur, ov.reason, by
+                );
+                // Never silent-low: a bypass is something Andrew wants to see.
+                let prio = match ov.priority.as_str() {
+                    "" | "low" => "high",
+                    p => p,
+                };
+                alert::send_pingme_with_priority(&msg, prio).await;
+                info!(
+                    override_id = %ov.override_id,
+                    priority = prio,
+                    "obligations override -- daemon pushover fired"
+                );
+            }
+        }
+
         let now = std::time::Instant::now();
 
         // Cadence signals (keepalive / memory-reminder).
