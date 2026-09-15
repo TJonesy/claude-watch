@@ -169,7 +169,7 @@
 
         <!--
           MAX_SCRIPT_LENGTH: max run_script body length (chars). Fed to
-          the interpreter on stdin (no OS argv ceiling) -- kept separate
+          the interpreter on stdin (no OS argv ceiling); kept separate
           from MAX_COMMAND_LENGTH on purpose. Default 4194304 (4 MiB).
           Omit to inherit the default.
         -->
