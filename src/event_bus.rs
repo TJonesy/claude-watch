@@ -568,6 +568,152 @@ fn hostname_string() -> String {
     String::new()
 }
 
+/// One `obligations-bypass` override event drained from the claude-event
+/// queue, for daemon-side push notification.
+///
+/// Background (Andrew #8375): an audited obligations override created
+/// IN-CONTAINER cannot Pushover Andrew itself -- the override CLI
+/// (`_pingme_override`) shells to the host-only `pingme` binary, which is
+/// absent in the container, so it is a silent no-op there. The override DOES
+/// emit a loud `obligations-bypass` claude-event, and that event file lands in
+/// the bind-mounted queue dir the HOST daemon can read. The daemon runs
+/// host-side where Pushover works, so it is the reliable place to fire the
+/// notification -- "the backend/daemon should always do it".
+#[derive(Debug, Clone)]
+pub struct OverrideBypassEvent {
+    pub override_id: String,
+    pub reason: String,
+    pub duration_secs: Option<i64>,
+    pub created_by: String,
+    /// The event's own `priority` field (`low|normal|high|urgent`).
+    pub priority: String,
+}
+
+/// Pull one scalar out of an event's `data` object as a String, whether it
+/// was written as a JSON string or a JSON number/bool (the Python
+/// `claude-event` helper stores `--data k=v` values as strings, but be
+/// defensive about a future typed emitter).
+fn data_str(data: &serde_json::Value, key: &str) -> Option<String> {
+    match data.get(key) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Scan the claude-event queue `dir` for `obligations-bypass` events this
+/// daemon has not yet notified on, returning the newly-seen ones and recording
+/// each override id in `ledger_path` so it fires exactly once.
+///
+/// Does NOT delete the event files: `claude-event-watch` owns draining the
+/// queue so the main loop still surfaces the bypass for its own triage. The
+/// daemon therefore re-reads a given file every loop until the watcher deletes
+/// it, and the ledger (keyed by override id) is what makes the notification
+/// one-shot. The ledger self-prunes entries older than `LEDGER_TTL_SECS`.
+///
+/// Default-open: any I/O or parse failure on an individual file is skipped, and
+/// a missing/corrupt ledger is treated as empty. Best-effort throughout -- a
+/// broken scan must never wedge the daemon loop.
+pub fn drain_obligations_bypass(
+    dir: &std::path::Path,
+    ledger_path: &std::path::Path,
+) -> Vec<OverrideBypassEvent> {
+    const LEDGER_TTL_SECS: u64 = 24 * 60 * 60;
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // Queue dir absent (nothing has emitted yet) => nothing to do.
+        Err(_) => return Vec::new(),
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Ledger shape: { "<override_id>": <processed_at_epoch_secs>, ... }.
+    let mut ledger: std::collections::BTreeMap<String, u64> =
+        std::fs::read_to_string(ledger_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    let mut fresh: Vec<OverrideBypassEvent> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Filename convention (Python helper + Rust emitter):
+        // `<unix_ns>_<safe_tag>.json`. Fast filter on the tag suffix; skip the
+        // atomic-write `.tmp` dotfiles.
+        if name.starts_with('.') || !name.ends_with("_obligations-bypass.json") {
+            continue;
+        }
+        let body = match std::fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let ev: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Defensive: confirm the tag actually matches (a stray file named like
+        // the convention but carrying a different tag is ignored).
+        if ev.get("tag").and_then(|t| t.as_str()) != Some("obligations-bypass") {
+            continue;
+        }
+        let data = ev
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        // Dedup key: the override id, falling back to the filename so a
+        // malformed event (no override_id) still fires at most once.
+        let override_id =
+            data_str(&data, "override_id").unwrap_or_else(|| name.to_string());
+        if ledger.contains_key(&override_id) {
+            continue;
+        }
+        let reason = data_str(&data, "reason").unwrap_or_default();
+        let duration_secs =
+            data_str(&data, "duration_secs").and_then(|s| s.parse::<i64>().ok());
+        let created_by = data_str(&data, "created_by").unwrap_or_default();
+        let priority = ev
+            .get("priority")
+            .and_then(|p| p.as_str())
+            .unwrap_or("high")
+            .to_string();
+
+        ledger.insert(override_id.clone(), now);
+        fresh.push(OverrideBypassEvent {
+            override_id,
+            reason,
+            duration_secs,
+            created_by,
+            priority,
+        });
+    }
+
+    // Prune stale ledger entries so it can't grow without bound.
+    ledger.retain(|_, ts| now.saturating_sub(*ts) < LEDGER_TTL_SECS);
+
+    // Persist only when we recorded something new. A failed write just risks a
+    // duplicate notification next loop, never a wedge.
+    if !fresh.is_empty() {
+        if let Some(parent) = ledger_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(s) = serde_json::to_string_pretty(&ledger) {
+            let _ = std::fs::write(ledger_path, s);
+        }
+    }
+
+    fresh
+}
+
 /// Test-only support for tests (in ANY module of this crate) that need
 /// to redirect event emission away from the user's live queue.
 #[cfg(test)]
@@ -1101,5 +1247,72 @@ mod tests {
             "unknown ack age must be omitted, never faked as 0; got: {data}"
         );
         assert_eq!(data["ack_command"], ACK_COMMAND);
+    }
+}
+
+
+#[cfg(test)]
+mod obligations_bypass_tests {
+    use super::*;
+
+    fn write_event(dir: &std::path::Path, ns: &str, tag: &str, json: serde_json::Value) {
+        let p = dir.join(format!("{}_{}.json", ns, tag));
+        std::fs::write(p, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn drains_new_bypass_events_and_dedups_via_ledger() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("events");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = tmp.path().join("ledger.json");
+
+        write_event(
+            &dir,
+            "1000",
+            "obligations-bypass",
+            serde_json::json!({
+                "tag": "obligations-bypass",
+                "priority": "high",
+                "message": "obligations override created (ov-1, duration=300s): urgent hotfix",
+                "data": {
+                    "override_id": "ov-1",
+                    "reason": "urgent hotfix",
+                    "duration_secs": "300",
+                    "created_by": "cli"
+                }
+            }),
+        );
+        // A non-bypass event in the same dir must be ignored.
+        write_event(
+            &dir,
+            "1001",
+            "keepalive",
+            serde_json::json!({"tag": "keepalive", "data": {}}),
+        );
+
+        let first = drain_obligations_bypass(&dir, &ledger);
+        assert_eq!(first.len(), 1, "one bypass event expected");
+        let ov = &first[0];
+        assert_eq!(ov.override_id, "ov-1");
+        assert_eq!(ov.reason, "urgent hotfix");
+        assert_eq!(ov.duration_secs, Some(300));
+        assert_eq!(ov.created_by, "cli");
+        assert_eq!(ov.priority, "high");
+
+        // File still on disk (we do NOT delete -- claude-event-watch owns that),
+        // but the ledger makes a second scan a no-op.
+        let second = drain_obligations_bypass(&dir, &ledger);
+        assert!(second.is_empty(), "already-notified override must not re-fire");
+    }
+
+    #[test]
+    fn missing_queue_dir_is_empty_not_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = drain_obligations_bypass(
+            &tmp.path().join("nonexistent"),
+            &tmp.path().join("ledger.json"),
+        );
+        assert!(out.is_empty());
     }
 }
