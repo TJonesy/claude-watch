@@ -12,6 +12,11 @@
 //! the file wins over an inherited env var), then built-in defaults fill any
 //! key neither source provided. An explicit `ALLOWED_COMMANDS` in the file
 //! still wins over the `CW_PROFILE`-derived default, exactly as before.
+//!
+//! `MAX_COMMAND_LENGTH` and `MAX_SCRIPT_LENGTH` are two SEPARATE knobs
+//! (`run_command` vs `run_script` respectively) — see the doc comments on
+//! [`Policy::max_command_length`] and [`Policy::max_script_length`] for why
+//! they must not be the same cap.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -27,7 +32,15 @@ const TRUSTED_EXTRAS: &str = "sw_vers,lsb_release,crontab,launchctl,systemctl,sc
 const DEFAULT_ALLOWED_DIR: &str = "/";
 const DEFAULT_ALLOWED_FLAGS: &str = "all";
 const DEFAULT_COMMAND_TIMEOUT: u64 = 30;
-const DEFAULT_MAX_COMMAND_LENGTH: usize = 8192;
+/// `run_command`'s string is handed to `bash -c` (or exec'd directly with no
+/// shell); the OS argv/env ceiling is generous (~128KiB+ per arg on both
+/// macOS and Linux), so this floor is a sanity cap, not a real constraint.
+const DEFAULT_MAX_COMMAND_LENGTH: usize = 131_072; // 128 KiB
+/// `run_script`'s body is fed to the interpreter on STDIN
+/// ([`crate::exec::run_with_timeout`]) — there is no OS argv ceiling to
+/// respect, so this default is generous headroom, not a meaningful limit.
+/// It exists only as a sanity backstop against an accidental multi-GB paste.
+const DEFAULT_MAX_SCRIPT_LENGTH: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Resolved, immutable policy shared across request handlers.
 #[derive(Debug, Clone)]
@@ -44,7 +57,23 @@ pub struct Policy {
     /// not `/`. Default `/` disables the fence.
     pub allowed_dir: String,
     pub command_timeout: u64,
+    /// Max length (bytes) of a `run_command` command STRING. This string is
+    /// either handed to `bash -c` or tokenized and exec'd directly — either
+    /// way it ultimately becomes process argv, which the OS bounds (but at a
+    /// much higher ceiling than the historical 8192 default). Kept separate
+    /// from [`Self::max_script_length`]: run_command's argv path is not the
+    /// same delivery mechanism as run_script's stdin path, so one knob
+    /// shouldn't govern both.
     pub max_command_length: usize,
+    /// Max length (bytes) of a `run_script` script BODY. The body is fed to
+    /// the interpreter on stdin (see `run_with_timeout` in exec.rs), never
+    /// tokenized and never part of argv, so it has no OS-imposed ceiling
+    /// analogous to `max_command_length`'s. Defaults far higher than
+    /// `max_command_length` for that reason — capping it at the same value
+    /// as run_command defeated run_script's entire purpose (forcing chunked
+    /// multi-call workarounds for scripts an interpreter would happily read
+    /// from stdin in one shot).
+    pub max_script_length: usize,
     pub allow_shell_operators: bool,
     /// The resolved `CW_PROFILE` name, for reporting.
     pub profile: String,
@@ -159,6 +188,9 @@ impl ServerConfig {
         let max_command_length = get("MAX_COMMAND_LENGTH")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_COMMAND_LENGTH);
+        let max_script_length = get("MAX_SCRIPT_LENGTH")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_SCRIPT_LENGTH);
         let allow_shell_operators = get("ALLOW_SHELL_OPERATORS")
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
             .unwrap_or(false);
@@ -183,6 +215,7 @@ impl ServerConfig {
                 allowed_dir,
                 command_timeout,
                 max_command_length,
+                max_script_length,
                 allow_shell_operators,
                 profile: if profile.is_empty() {
                     "corp-dev (default)".to_string()
@@ -226,7 +259,8 @@ impl Policy {
              allowed_flags:         {}\n\
              allowed_dir (cwd):     {}{}\n\
              command_timeout:       {}s\n\
-             max_command_length:    {}\n\
+             max_command_length:    {} (run_command)\n\
+             max_script_length:     {} (run_script)\n\
              allow_shell_operators: {}\n\
              \n\
              run_command runs the string via `bash -c` when allow_shell_operators=true;\n\
@@ -244,6 +278,7 @@ impl Policy {
             },
             self.command_timeout,
             self.max_command_length,
+            self.max_script_length,
             self.allow_shell_operators,
         )
     }
