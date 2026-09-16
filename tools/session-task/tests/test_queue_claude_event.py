@@ -338,11 +338,11 @@ def test_abandon_without_evidence_emits_queue_quarantined_event():
         assert parsed["data"]["prior_status"] == "running"
         assert parsed["data"]["reason"] == "no output file, presumed dead"
         assert parsed["data"]["quarantined_at"]
-        # #8732: queue-quarantined is a routine lifecycle transition, not a
-        # standalone actionable signal (the actionable dead-job signal rides
-        # on the separate hostjob-done event) -- same producer-stamped-tier
-        # pattern as queue-blocked below.
-        assert parsed["data"]["tier"] == "ambient"
+        # #8745: queue-quarantined IS the actionable signal -- a job died
+        # without clean evidence and its scope lock is held pending operator
+        # attention. #782 (756c927) wrongly stamped this ambient; corrected
+        # here to match the other actionable-tier producer stamps.
+        assert parsed["data"]["tier"] == "actionable"
 
         # Releasing it then emits the ordinary terminal event, so anything
         # downstream that only knows `queue-abandoned` still sees the scope

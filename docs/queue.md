@@ -33,6 +33,12 @@ their scope tokens overlap. Overlapping items end up in the same group;
 within a group they run one-at-a-time (priority, FIFO tiebreak). Disjoint
 groups run in parallel.
 
+**Priority: 1 = highest priority.** A LOWER `--priority` number always wins
+over a higher one (5 is the default); FIFO (`created_at`) only breaks ties
+between items at the *same* priority. This applies everywhere priority is
+compared — spawn/readiness ordering, `queue list` display order, and the
+queue-minisite web UI.
+
 State: `~/.config/session/queue.json` (fcntl.flock-protected).
 
 ### Scope tokens
@@ -50,6 +56,7 @@ State: `~/.config/session/queue.json` (fcntl.flock-protected).
 
 ```
 session-task queue add "..." --scope <s> [--summary "..."] [--priority N]
+                                          # 1 = highest priority; default 5
 session-task queue list [--ready] [--running] [--blocked]
 session-task queue show <id>
 session-task queue scope <id>             # show effective scope
@@ -61,7 +68,7 @@ session-task queue register <id>          # atomic ready→running
 session-task queue done <id>              # mark completed
 session-task queue abandon <id> [--reason R] [--confirmed-dead [--force]]
 session-task queue release <id> [--reason R] [--force]  # quarantine -> abandoned
-session-task queue promote <id>           # raise priority
+session-task queue promote <id>           # raise priority (lower the number) to group head
 session-task queue set-summary <id> "..."
 session-task queue prune                  # drop completed/abandoned
 session-task queue banner                 # one-line top-of-resume hint
