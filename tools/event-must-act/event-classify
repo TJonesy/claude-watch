@@ -557,6 +557,21 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-quarantined", None, ACTIONABLE,
         "Queue item quarantined (scope held pending death confirmation); "
         "needs operator attention -- respawn, resurrect, or abandon."),
+    # force-start: the producer (session-task's cmd_queue_force_start) now
+    # stamps data.tier="ambient" directly (rung 2, same pattern used by
+    # queue-blocked); this row is the BACKSTOP so the event still resolves
+    # ambient (not UNCLASSIFIED->fail-loud actionable) even if a producer
+    # path ever emits force-start without the stamp. NOTE: unlike
+    # queue-quarantined above (#8745, flipped back to actionable -- a
+    # quarantine needs operator attention), a force-start is not itself the
+    # actionable signal: the real hard gate forcing a spawn is the separate
+    # `force_started_unspawned` obligation, not this event's tier.
+    ("queue", "force-start", None, AMBIENT,
+        "Force-start notification; the force_started_unspawned obligation "
+        "is the real hard gate forcing a spawn, not this event's tier -- "
+        "context only. Backstop in case a producer path emits without "
+        "the data.tier stamp (was UNCLASSIFIED -> fail-loud actionable, "
+        "flooding pending-actions)."),
 
     # Routine PR status changes: "new push", "CI pending", "CI success",
     # conflict RESOLUTION, plain "mergeable", "merged". The conditional
@@ -907,6 +922,10 @@ def _self_test() -> int:
         (("queue", "queue-running", ""), AMBIENT),
         (("queue", "queue-done", ""), AMBIENT),
         (("queue", "queue-abandoned", ""), AMBIENT),
+        (("queue", "force-start", ""), AMBIENT),
+
+        # Actionable: queue-quarantined needs operator attention (#8745).
+        (("queue", "queue-quarantined", ""), ACTIONABLE),
 
         # Ambient: workload + watcher
         (("manual", "workload-done", ""), AMBIENT),
