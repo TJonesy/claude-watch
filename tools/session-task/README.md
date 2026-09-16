@@ -17,6 +17,11 @@ Three layers of task coordination:
    scope groups run in parallel. Lives in `~/.config/session/queue.json`, guarded by
    `fcntl.flock` on every read-modify-write.
 
+   **Priority: 1 = highest priority.** A lower `--priority` number always outranks a
+   higher one; `created_at` (FIFO) only tie-breaks items at the same priority. Default
+   is 5. `queue promote`/`queue reprioritize` lower an item's number to move it earlier
+   — see `docs/queue.md` for the full contract.
+
 3. **Layer 3** — process tracking — handled by `claude-watch active-agents` and
    `claude-watch task` (not this CLI).
 

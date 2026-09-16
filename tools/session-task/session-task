@@ -25,6 +25,8 @@ Usage:
     session-task queue add "desc" --scope file:~/foo --scope repo:bar \\
         [--summary "~10 word headline"] [--priority N] [--context JSON] \\
         [--created-by WHO] [--depends-on q-AAA,q-BBB]
+        # --priority: 1 = highest priority, lower number = higher
+        # precedence; default 5.
     session-task queue list [--ready] [--all] [--group g-X] [--json]
     session-task queue show <id>
     session-task queue scope <id>
@@ -1779,13 +1781,14 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
 
 
 def _sort_key(item):
-    # Spawn/readiness ordering within a group is PRIORITY-FIRST: higher
-    # priority number sorts earlier (so it becomes the group head and goes
-    # ready first), with created_at (insertion order) only as the FIFO
-    # tiebreak among equal priorities. This is what lets a higher-priority
-    # item added LATER overtake an earlier lower-priority same-scope peer
-    # without abandon+re-add (see `queue reprioritize` / `queue promote`).
-    return (-int(item.get("priority", 5)), item.get("created_at", ""))
+    # Spawn/readiness ordering within a group is PRIORITY-FIRST: 1 = highest
+    # priority, so a LOWER priority number sorts earlier (becomes the group
+    # head and goes ready first). created_at (insertion order) is only the
+    # FIFO tiebreak among equal priorities. This is what lets a
+    # higher-priority (numerically lower) item added LATER overtake an
+    # earlier lower-priority (numerically higher) same-scope peer without
+    # abandon+re-add (see `queue reprioritize` / `queue promote`).
+    return (int(item.get("priority", 5)), item.get("created_at", ""))
 
 
 def _group_head(items, group_id):
@@ -7890,10 +7893,12 @@ def cmd_queue_promote(args):
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             sys.exit(1)
-        # Bump priority high enough to be above everyone else in the group.
+        # Drop priority low enough to be above everyone else in the group.
+        # 1 = highest priority, so "above everyone" means numerically BELOW
+        # the group's current minimum (and below the item's own value).
         members = _group_members(items, target["group_id"])
-        max_p = max((int(m.get("priority", 5)) for m in members), default=5)
-        target["priority"] = max(max_p + 1, int(target.get("priority", 5)) + 1)
+        min_p = min((int(m.get("priority", 5)) for m in members), default=5)
+        target["priority"] = min(min_p - 1, int(target.get("priority", 5)) - 1)
         target["promoted_at"] = _fmt_ts()
         # Leave created_at alone -- the priority bump alone reorders the group
         # head (spawn ordering is priority-first via _group_head/_sort_key,
@@ -7918,19 +7923,20 @@ def cmd_queue_reprioritize(args):
     --priority N`.
 
     Because spawn-readiness ordering within a group is priority-first
-    (`_group_head` -> `_sort_key`: higher priority number wins, created_at is
-    the tiebreak), raising an item's priority above its group's current head
-    makes it the next ready-to-spawn item WITHOUT abandon+re-add. Lowering it
-    de-prioritizes it behind same-group peers.
+    (`_group_head` -> `_sort_key`: 1 = highest priority, LOWER priority
+    number wins, created_at is the tiebreak), lowering an item's priority
+    number below its group's current head makes it the next ready-to-spawn
+    item WITHOUT abandon+re-add. Raising the number de-prioritizes it behind
+    same-group peers.
 
     Behavior:
       * Item must exist and be in status=pending. Reprioritizing a
         running/wedged/blocked/done/abandoned item is REFUSED (exit 1) -- the
         spawn ordering only consults priority for *pending* heads, so a
         priority edit on an in-flight item would be silently inert.
-      * `--priority N` is REQUIRED (any int; higher = earlier; 5 is the
-        system default). Recomputes group heads so `ready_now` reflects the
-        new ordering immediately.
+      * `--priority N` is REQUIRED (any int; 1 = highest priority, lower
+        number = higher precedence; 5 is the system default). Recomputes
+        group heads so `ready_now` reflects the new ordering immediately.
       * Pure metadata edit: no pingme, no claude-event (matches set-summary /
         promote). Records `priority_updated_at` for audit; keeps the prior
         priority in the output.
@@ -8803,7 +8809,14 @@ def build_parser():
             "<id> \"text\"` to add one after the fact."
         ),
     )
-    q_add.add_argument("--priority", type=int, default=5)
+    q_add.add_argument(
+        "--priority", type=int, default=5,
+        help=(
+            "Spawn-ordering priority (int). 1 = highest priority; lower "
+            "number = higher precedence. Default 5. Used to break ties "
+            "among same-scope pending items (FIFO by created_at otherwise)."
+        ),
+    )
     q_add.add_argument("--context")
     q_add.add_argument("--created-by")
     q_add.add_argument(
@@ -9318,10 +9331,11 @@ def build_parser():
         "promote",
         aliases=["bump"],
         help=(
-            "Convenience: raise a pending item's priority just above its "
-            "group's current head so it becomes the next ready-to-spawn item "
-            "(without abandon+re-add). For an explicit target priority use "
-            "`queue reprioritize <id> --priority N`."
+            "Convenience: lower a pending item's priority number just below "
+            "its group's current head (1 = highest priority) so it becomes "
+            "the next ready-to-spawn item (without abandon+re-add). For an "
+            "explicit target priority use `queue reprioritize <id> "
+            "--priority N`."
         ),
     )
     q_promote.add_argument("id")
@@ -9330,17 +9344,21 @@ def build_parser():
         "reprioritize",
         help=(
             "Set a PENDING item's priority to an explicit value, in place "
-            "(no abandon+re-add). Higher priority number = earlier in spawn "
-            "ordering among same-group peers (created_at is the tiebreak); 5 "
-            "is the default. Raising it above the group head makes it ready "
-            "first; lowering it de-prioritizes it. Refused on non-pending "
-            "items (priority only affects pending spawn ordering)."
+            "(no abandon+re-add). 1 = highest priority: a LOWER priority "
+            "number wins earlier spawn ordering among same-group peers "
+            "(created_at is the tiebreak); 5 is the default. Lowering it "
+            "below the group head's number makes it ready first; raising "
+            "it de-prioritizes it. Refused on non-pending items (priority "
+            "only affects pending spawn ordering)."
         ),
     )
     q_reprioritize.add_argument("id")
     q_reprioritize.add_argument(
         "--priority", type=int, required=True,
-        help="New priority (int; higher = earlier; default elsewhere is 5).",
+        help=(
+            "New priority (int). 1 = highest priority, lower number = "
+            "higher precedence; default elsewhere is 5."
+        ),
     )
     q_reprioritize.add_argument("--json", action="store_true")
 
