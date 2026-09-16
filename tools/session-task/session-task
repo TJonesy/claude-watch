@@ -4714,6 +4714,18 @@ def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
         silent=getattr(args, "silent", False),
     )
 
+    # data.tier=ambient: `queue-quarantined` is a routine queue lifecycle
+    # transition (same class as queue-done / queue-abandoned above), not a
+    # standalone actionable signal -- the actionable signal for an actually
+    # dead/failed job rides on the SEPARATE `hostjob-done` event (which
+    # carries the rc). Without this stamp the event fell through to the
+    # fail-LOUD UNCLASSIFIED->actionable default (rung 2 in event-classify's
+    # precedence; see the `queue-blocked` stamp above for the same pattern),
+    # spamming the event_must_act N-call gate on every quarantine. The
+    # Pushover push above stays priority="normal" (a human glancing at their
+    # phone still benefits from "look at this soon"); it's only the
+    # claude-event tier -- which gates the main loop's Bash calls -- that's
+    # ambient.
     _claude_event_notify(
         tag="queue-quarantined",
         message=(
@@ -4730,6 +4742,7 @@ def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
             "prior_status": prior_status,
             "quarantined_at": target.get("quarantined_at"),
             "created_by": target.get("created_by", ""),
+            "tier": "ambient",
         },
         priority="low",
         silent=getattr(args, "silent", False),

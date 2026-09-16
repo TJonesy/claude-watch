@@ -542,6 +542,17 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Queue item done; context only."),
     ("queue", "queue-abandoned", None, AMBIENT,
         "Queue item abandoned; context only."),
+    # queue-quarantined: a routine lifecycle transition, same class as
+    # queue-done/queue-abandoned above -- the actionable signal for an
+    # actually-dead job rides on the separate hostjob-done event (with rc),
+    # not this one. The producer (session-task's cmd_queue_quarantine) now
+    # stamps data.tier="ambient" directly (rung 2, same pattern as
+    # queue-blocked); this row is the BACKSTOP so the event still resolves
+    # ambient (not UNCLASSIFIED->fail-loud actionable) even if a producer
+    # path ever emits queue-quarantined without the stamp (#8732).
+    ("queue", "queue-quarantined", None, AMBIENT,
+        "Queue item quarantined (scope held pending death confirmation); "
+        "context only -- the actionable dead-job signal is hostjob-done."),
 
     # Routine PR status changes: "new push", "CI pending", "CI success",
     # conflict RESOLUTION, plain "mergeable", "merged". The conditional
