@@ -473,6 +473,7 @@ test-hostjob: ## hostjob detached host-job runner tests
 	examples/compose/bin/tests/hostjob.test
 	uv run --python 3.11 --with pytest pytest -v \
 		examples/compose/bin/tests/test_hostjob_broker.py \
+		examples/compose/bin/tests/test_hostjob_broker_stop_endpoint.py \
 		examples/compose/bin/tests/test_hostjob_queue.py \
 		examples/compose/bin/tests/test_hostjob_stop.py
 

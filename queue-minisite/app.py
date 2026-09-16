@@ -52,6 +52,7 @@ import re
 import shlex
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -200,6 +201,11 @@ HOSTJOB_LOG_DIR = os.environ.get(
 HOSTJOB_BROKER_URL = os.environ.get(
     "HOSTJOB_BROKER_URL", "http://host.docker.internal:8799"
 )
+# Grace (seconds) the host-side broker waits between SIGTERM and SIGKILL when
+# the Stop button kills a hostjob worker (see ``_hostjob_broker_stop``). Kept
+# small so the stop POST returns well within the front-end's patience; the
+# broker still hard-kills after this if the worker ignores SIGTERM.
+HOSTJOB_STOP_GRACE_SECONDS = int(os.environ.get("HOSTJOB_STOP_GRACE_SECONDS", "5"))
 # Label format: same as queue-id-ish — letters, digits, dots, dashes,
 # underscores. Path-traversal guard for the tail endpoint. Shared by both
 # the workload and hostjob label extractors / tail endpoints.
@@ -1712,8 +1718,34 @@ def _shape(
                 is_reconciled_hostjob = True
                 reconciled_errored_hostjob = bool(_eff.get("errored"))
                 reconciled_hostjob_exit = _eff.get("exit_code", "")
+    # Hostjob PROMOTE (mirror of the demote above, opposite direction). A
+    # hostjob whose queue row is still ``pending`` -- a launch that lost the
+    # scope-claiming ``queue register`` race, or one run with ``--no-queue`` --
+    # can already have a LIVE worker. Left as-is it renders in the pending
+    # backlog as a spawn-able item (nonsensical "force start"), is not tailed as
+    # a hostjob, and its "abandon" wouldn't kill the worker. Consult the
+    # authoritative status.json (same source as the demote / ``hostjob list``)
+    # and, when the runner EXPLICITLY reports the worker running, render it
+    # exactly like a registered running hostjob: RUNNING section, tailable, real
+    # Stop button. We only ever promote on an explicit ``running``; a terminal
+    # or absent status.json leaves the pending row for the reaper's own flip.
+    _promoted_started_iso = ""
+    if status == "pending":
+        _hj_label = _extract_hostjob_label(item.get("scope") or [])
+        if _hj_label:
+            _hj_st = _read_hostjob_status(_hj_label)
+            if _hj_st is not None and _hj_st.get("status") == "running":
+                status = "running"
+                is_reconciled_hostjob = True
+                _ts = _hj_st.get("started_at")
+                if isinstance(_ts, (int, float)):
+                    _promoted_started_iso = datetime.fromtimestamp(
+                        _ts, timezone.utc
+                    ).isoformat()
     created = _parse_iso(item.get("created_at"))
-    started = _parse_iso(item.get("registered_at") or item.get("started_at"))
+    started = _parse_iso(
+        item.get("registered_at") or item.get("started_at") or _promoted_started_iso
+    )
     completed = _parse_iso(item.get("completed_at"))
     abandoned = _parse_iso(item.get("abandoned_at"))
 
@@ -1893,7 +1925,11 @@ def _shape(
         "depends_on": depends_on,
         "depends_on_status": depends_on_status,
         "created_at_iso": item.get("created_at", ""),
-        "started_at_iso": (item.get("registered_at") or item.get("started_at") or ""),
+        "started_at_iso": (
+            item.get("registered_at")
+            or item.get("started_at")
+            or _promoted_started_iso
+        ),
         "completed_at_iso": item.get("completed_at", ""),
         "abandoned_at_iso": item.get("abandoned_at", ""),
         "blocked_at_iso": item.get("blocked_at", ""),
@@ -2057,6 +2093,69 @@ def _extract_hostjob_label(scope: list[Any]) -> str:
             if _WORKLOAD_LABEL_RE.match(label):
                 return label
     return ""
+
+
+def _read_hostjob_status(label: str) -> dict[str, Any] | None:
+    """Read a hostjob's authoritative ``status.json`` (the same file
+    ``hostjob list`` reads), or ``None`` when it is absent / unreadable /
+    malformed. Fail-soft: never raises."""
+    if not label:
+        return None
+    sp = Path(HOSTJOB_LOG_DIR) / label / "status.json"
+    try:
+        with open(sp, "r", encoding="utf-8", errors="replace") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return st if isinstance(st, dict) else None
+
+
+def _hostjob_broker_stop(label: str) -> dict[str, Any]:
+    """SIGTERM/SIGKILL a hostjob worker by asking the host-side broker.
+
+    THE point of this function: session-task ``queue abandon`` only flips the
+    queue ROW -- it does NOT kill anything. A hostjob has no owning agent and no
+    obligations gate, so an abandoned/stopped hostjob row would otherwise leave
+    its worker running forever (Andrew #8650/#8667). The minisite runs in a
+    container and cannot ``os.kill()`` a host pid (different PID namespace), so
+    it POSTs to the ``hostjob broker`` -- a host-side singleton in the host PID
+    namespace (the same broker the live-tail subscribes to over
+    ``host.docker.internal``) -- which calls ``hostjob``'s own ``_stop_one``.
+
+    Returns a small result dict ``{"reached", "ok", ...}``; NEVER raises. When
+    the broker is unreachable we report ``reached=False`` and let the caller
+    still flip the queue row -- an honest "row abandoned, worker MAY still be
+    live" beats refusing the whole operation.
+    """
+    url = (
+        HOSTJOB_BROKER_URL.rstrip("/")
+        + "/stop/"
+        + label
+        + "?grace="
+        + str(HOSTJOB_STOP_GRACE_SECONDS)
+    )
+    req = urllib.request.Request(url, method="POST", data=b"")
+    try:
+        resp = urllib.request.urlopen(req, timeout=HOSTJOB_STOP_GRACE_SECONDS + 5)
+        raw = resp.read().decode("utf-8", "replace")
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = {"raw": raw}
+        return {"reached": True, "ok": bool(body.get("ok")), "detail": body}
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        return {
+            "reached": True,
+            "ok": False,
+            "error": "broker HTTP %s" % exc.code,
+            "detail": detail,
+        }
+    except Exception as exc:
+        return {"reached": False, "ok": False, "error": repr(exc)}
 
 
 def _hostjob_effective_terminal(
@@ -2595,10 +2694,28 @@ def _do_abandon(
     else:
         reason = f"{reason} (via UI by {user})"
 
+    # Resolve the target item's scope + raw status once so we can (a) detect a
+    # hostjob-bound row and (b) actually KILL its host worker below. A hostjob
+    # whose worker is live can legitimately sit in the queue as EITHER running
+    # (registered) OR pending (lost the register race / ``--no-queue``), so a
+    # hostjob row is a valid Stop/Abandon target in either state regardless of
+    # which button (stop -> running, abandon -> pending) invoked us.
+    hj_label = ""
+    _raw_status = ""
+    _qdata, _qerr = _read_queue()
+    if _qerr is None and isinstance(_qdata, dict):
+        for _it in _qdata.get("items", []) or []:
+            if isinstance(_it, dict) and _it.get("id") == qid:
+                hj_label = _extract_hostjob_label(_it.get("scope") or [])
+                _raw_status = _it.get("status") or ""
+                break
+
     # Refuse the call early if the item isn't in an allowed status.
     # Avoids spurious "abandon" of done items + cuts the subprocess on
     # bad input.
     eligible = _ids_by_status(*allowed_statuses)
+    if hj_label and _raw_status in ("running", "pending"):
+        eligible = {**eligible, qid: _raw_status}
     if qid not in eligible:
         allowed_str = "/".join(allowed_statuses) if allowed_statuses else "<none>"
         return (
@@ -2612,6 +2729,15 @@ def _do_abandon(
             ),
             404,
         )
+
+    # Kill the host worker BEFORE flipping the queue row. For a hostjob this is
+    # the ONLY thing that actually stops the work -- the abandon below just
+    # updates queue.json (no owning agent, no obligations gate to notice). Done
+    # first so the worker is signalled even if the abandon step later fails; the
+    # abandon works on a pending OR running row, so ordering is safe. Fail-soft:
+    # ``_hostjob_broker_stop`` never raises, and an unreachable broker still
+    # lets the abandon proceed (reported in the response).
+    hostjob_stop = _hostjob_broker_stop(hj_label) if hj_label else None
 
     preflight = _session_task_preflight()
     if preflight is not None:
@@ -2678,12 +2804,25 @@ def _do_abandon(
             "reason": reason,
             "stdout": proc.stdout,
             "stderr": proc.stderr,
-            "kill_mechanism": "abandon-only",
+            "kill_mechanism": "hostjob-stop+abandon" if hj_label else "abandon-only",
+            "hostjob_label": hj_label,
+            "hostjob_stop": hostjob_stop,
             "kill_note": (
-                "The owning agent (if any) will be denied on its next "
-                "non-exempt tool call by the obligations gate (queue id "
-                "no longer in 'running' status). No process kill is "
-                "attempted."
+                (
+                    "Hostjob worker signalled via the host-side broker "
+                    "(SIGTERM/grace/SIGKILL), then the queue row abandoned."
+                    if (hostjob_stop or {}).get("ok")
+                    else "Queue row abandoned, but the hostjob broker could "
+                    "not confirm the worker was killed -- it may still be "
+                    "running; check `hostjob list`."
+                )
+                if hj_label
+                else (
+                    "The owning agent (if any) will be denied on its next "
+                    "non-exempt tool call by the obligations gate (queue id "
+                    "no longer in 'running' status). No process kill is "
+                    "attempted."
+                )
             ),
         }
     )
