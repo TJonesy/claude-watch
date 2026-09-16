@@ -451,6 +451,9 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1010,22 +1013,152 @@ def _audit_evaluator(record):
         pass
 
 
+# --- Pushover credential resolution (mirrors session-task/queue-notify) ----
+#
+# An audited override disables EVERY safety gate, so its creation MUST reach
+# Andrew's phone reliably. The historical implementation shelled to a `pingme`
+# binary via shutil.which and silently no-op'd when pingme was absent from the
+# subagent PATH -- the common case -- and even when present used `-p low`, a
+# priority Pushover often delivers silently. Both failure modes meant the most
+# consequential event in the system routinely produced NO phone alert.
+#
+# The hardening below keeps pingme as the preferred path (raised to a
+# non-silent priority) but adds a self-contained Pushover-API fallback that
+# resolves creds exactly the way queue-notify does -- so an override notifies
+# even with no pingme on PATH. Everything stays best-effort: no failure here
+# may break the override path itself.
+
+PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
+
+
+def _pushover_config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def _pushover_parse_env_file(path: Path) -> dict:
+    """Parse a tiny ``KEY="value"`` env file. No shell execution.
+
+    Tolerates blank lines, ``#`` comments, an optional ``export`` prefix, and
+    single/double quoted values. Unknown lines are skipped. Mirrors
+    queue-notify's ``_parse_env_file`` so both surfaces read the same secret.
+    """
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def _pushover_resolve_token() -> str | None:
+    for var in ("QUEUE_NOTIFY_TOKEN", "PUSHOVER_TOKEN"):
+        v = os.environ.get(var)
+        if v:
+            return v
+    env_path = Path(
+        os.environ.get("QUEUE_NOTIFY_ENV")
+        or (_pushover_config_home() / "queue-notify" / "env")
+    )
+    return _pushover_parse_env_file(env_path).get("PUSHOVER_TOKEN") or None
+
+
+def _pushover_resolve_user() -> str | None:
+    v = os.environ.get("PUSHOVER_USER")
+    if v:
+        return v
+    qn_path = Path(
+        os.environ.get("QUEUE_NOTIFY_ENV")
+        or (_pushover_config_home() / "queue-notify" / "env")
+    )
+    v = _pushover_parse_env_file(qn_path).get("PUSHOVER_USER")
+    if v:
+        return v
+    pingme_path = Path(
+        os.environ.get("PINGME_ENV")
+        or (_pushover_config_home() / "pingme" / "env")
+    )
+    return _pushover_parse_env_file(pingme_path).get("PUSHOVER_USER") or None
+
+
+def _pushover_post(title: str, body: str, priority: int = 1) -> bool:
+    """POST one notification directly to the Pushover API. Returns True on
+    success, False on any failure (missing creds, network error, non-200).
+
+    ``OBLIGATIONS_PINGME_SINK`` short-circuits the network POST, appending the
+    composed delivery as a JSON line to that file. This is the seam the test
+    suite uses to assert the fallback fired (and at what priority) without
+    hitting Pushover -- the same pattern as queue-notify's ``QUEUE_NOTIFY_SINK``.
+    """
+    sink = os.environ.get("OBLIGATIONS_PINGME_SINK")
+    if sink:
+        try:
+            with open(sink, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "title": title, "message": body,
+                    "priority": priority, "ts": time.time(),
+                }) + "\n")
+            return True
+        except OSError:
+            return False
+    token = _pushover_resolve_token()
+    user = _pushover_resolve_user()
+    if not token or not user:
+        return False
+    fields = {
+        "user": user,
+        "token": token,
+        "title": title,
+        "message": body,
+        "priority": str(priority),
+    }
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(PUSHOVER_API_URL, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 -- best-effort; never break the override
+        return False
+
+
 def _pingme_override(ov_id, reason, duration_secs):
     """Fire a Pushover notification when an audited override is created.
 
-    Best-effort: any failure (missing pingme, exec error, timeout) is
-    swallowed so the override path itself never breaks. Test-suite
-    isolation: when ``OBLIGATIONS_DISABLE_PINGME=1`` is set, this is a
-    no-op (so unit tests don't spam Andrew's phone).
+    An override disables ALL of Andrew's safety gates, so its creation MUST
+    reach his phone. Delivery is attempted two ways, best-effort:
 
-    The notification carries the override id, reason, and duration --
-    the same data audited to obligations-bypass.log -- so a phone glance
-    is enough to know what was just bypassed and for how long.
+      1. The ``pingme`` CLI, if on PATH, at a NON-silent priority (``high``,
+         raised from the old ``low`` that Pushover often delivered silently).
+      2. If pingme is missing OR its invocation fails, a self-contained POST
+         straight to the Pushover API (priority 1 = high), resolving creds the
+         same way ``queue-notify`` does. This is the reliable fallback that the
+         old shutil.which-only path lacked -- a subagent with no pingme on PATH
+         previously produced NO alert at all.
+
+    Any failure (missing pingme AND missing creds, exec error, timeout,
+    network error) is swallowed so the override path itself never breaks. Test
+    isolation: ``OBLIGATIONS_DISABLE_PINGME=1`` makes this a full no-op (so
+    unit tests don't spam Andrew's phone); ``OBLIGATIONS_PINGME_SINK`` diverts
+    the direct-POST fallback to a file.
+
+    The notification carries the override id, reason, and duration -- the same
+    data audited to obligations-bypass.log -- so a phone glance is enough to
+    know what was just bypassed and for how long.
     """
     if os.environ.get("OBLIGATIONS_DISABLE_PINGME", "").strip() not in ("", "0"):
-        return
-    cli = shutil.which("pingme")
-    if not cli:
         return
     title = "obligations override"
     # Format duration human-friendly: <60s shows seconds, <3600 minutes,
@@ -1037,13 +1170,23 @@ def _pingme_override(ov_id, reason, duration_secs):
     else:
         dur_str = f"{duration_secs / 3600:.1f}h".rstrip("0").rstrip(".")
     body = f"{ov_id} ({dur_str}): {reason}"
-    try:
-        subprocess.run(
-            [cli, "-p", "low", body, title],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
+
+    # 1. Prefer the pingme CLI, at a non-silent priority.
+    cli = shutil.which("pingme")
+    if cli:
+        try:
+            proc = subprocess.run(
+                [cli, "-p", "high", body, title],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if proc.returncode == 0:
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass  # fall through to the direct-POST fallback
+
+    # 2. Fallback: POST directly to Pushover (priority high). Reliable even
+    #    when pingme is absent from the (subagent) PATH.
+    _pushover_post(title, body, priority=1)
 
 
 def _emit_override_event(ov_id, reason, duration_secs, created_by):
