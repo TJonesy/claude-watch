@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Tests for `queue reprioritize` and priority-first spawn ordering.
 
+Priority convention: 1 = highest priority. A LOWER `--priority` number
+always outranks a higher one; `created_at` (FIFO) only tie-breaks items at
+the same priority. Default is 5.
+
 Covers:
 
   * Spawn-readiness ordering within a group honors PRIORITY, not just
-    insertion order: a higher-priority item added LATER overtakes an
-    earlier lower-priority same-scope peer and becomes ready first --
-    without abandon+re-add.
+    insertion order: a higher-priority (numerically lower, e.g. 1) item
+    added LATER overtakes an earlier lower-priority (numerically higher,
+    e.g. 5) same-scope peer and becomes ready first -- without
+    abandon+re-add. This is the proof that priority 1 outranks priority 5.
   * `queue reprioritize <id> --priority N` sets a pending item's priority
     in place, recomputes group heads, and surfaces the new ready_now.
   * `queue reprioritize` is REFUSED on non-pending items (exit 1).
@@ -60,18 +65,21 @@ def _spawn_check(env, qid):
 
 
 # ---------------------------------------------------------------------------
-# 1. Priority-first spawn ordering: later higher-priority item overtakes.
+# 1. Priority-first spawn ordering: later higher-priority (numerically
+#    LOWER, e.g. 1) item overtakes an earlier lower-priority (e.g. 5) one.
+#    This is the proof that priority 1 outranks priority 5.
 # ---------------------------------------------------------------------------
 
 
-def test_higher_priority_added_later_becomes_ready_first():
+def test_priority_1_outranks_priority_5_added_later():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         a = _add(env, "A low prio", ["repo:foo"])  # default priority 5
-        b = _add(env, "B high prio", ["repo:foo"], "--priority", "9")
-        # A added first but lower priority; B added later at higher priority.
-        # B's add-time report sees itself as the head (nothing outranks it).
-        assert b["ready_now"] is True, "B (higher priority) should be ready first"
+        b = _add(env, "B high prio", ["repo:foo"], "--priority", "1")
+        # A added first but lower priority (5); B added later at higher
+        # priority (1 = highest). B's add-time report sees itself as the
+        # head (nothing outranks it).
+        assert b["ready_now"] is True, "B (priority 1) should be ready first"
         assert b["serialized_after"] == [], "nothing outranks B"
 
         # The authoritative, recomputed gate is spawn-check (what the
@@ -79,8 +87,8 @@ def test_higher_priority_added_later_becomes_ready_first():
         # lower-priority A behind it -- priority-first, not insertion order.
         sca, rca = _spawn_check(env, a["id"])
         scb, rcb = _spawn_check(env, b["id"])
-        assert scb["ok"] is True and rcb == 0, "B must be clear to spawn"
-        assert sca["ok"] is False and rca == 2, "A must be blocked behind B"
+        assert scb["ok"] is True and rcb == 0, "B (priority 1) must be clear to spawn"
+        assert sca["ok"] is False and rca == 2, "A (priority 5) must be blocked behind B"
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +118,12 @@ def test_reprioritize_makes_blocked_item_ready():
         b = _add(env, "B", ["repo:foo"])
         assert a["ready_now"] is True and b["ready_now"] is False
 
-        r = _run(env, "queue", "reprioritize", b["id"], "--priority", "9",
+        r = _run(env, "queue", "reprioritize", b["id"], "--priority", "1",
                  "--json")
         assert r.returncode == 0
         out = json.loads(r.stdout)
         assert out["old_priority"] == 5
-        assert out["priority"] == 9
+        assert out["priority"] == 1
         assert out["ready_now"] is True
 
         scb, rcb = _spawn_check(env, b["id"])

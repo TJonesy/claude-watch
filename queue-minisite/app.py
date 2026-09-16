@@ -1640,12 +1640,15 @@ def _compute_ready_now(
     if any(m.get("status") == "running" for m in members):
         return False
 
-    # Group head: oldest pending by (priority desc, created_at asc).
+    # Group head: oldest pending by (priority asc, created_at asc). 1 =
+    # highest priority, so a LOWER priority number sorts first -- this must
+    # match the pending-section display sort below (`priority asc`), and
+    # session-task's own `_sort_key` (the canonical implementation).
     def _sort_key(m: dict[str, Any]) -> tuple[int, str]:
         try:
-            prio = -int(m.get("priority", 5))
+            prio = int(m.get("priority", 5))
         except (TypeError, ValueError):
-            prio = -5
+            prio = 5
         return (prio, str(m.get("created_at", "")))
 
     pending_members = [m for m in members if m.get("status") == "pending"]
@@ -2447,7 +2450,7 @@ def _render_payload() -> dict[str, Any]:
     #   1. ready_now=True items first (operator can spawn now)
     #   2. then non-ready group-heads (FIFO leader, blocked by deps)
     #   3. then everything else
-    #   4. tie-break by priority asc, then age desc
+    #   4. tie-break by priority asc (1 = highest priority), then age desc
     pending.sort(
         key=lambda a: (
             0 if a["ready_now"] else (1 if a["group_head"] else 2),
