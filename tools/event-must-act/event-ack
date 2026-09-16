@@ -121,6 +121,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -328,6 +329,94 @@ def ack_pending(state_dir: Path, key: str, action: str) -> dict:
             "remaining": remaining}
 
 
+# Source-event tags that mark a queue-orphaned actionable event -- the daemon's
+# WorkQueueOrphaned / running-without-owner alert. Acking one of these does NOT
+# resolve the underlying orphan: a still-``running`` item with no live owner
+# stays orphaned. So the ack of such a key is gated on the item no longer being
+# ``running`` (resolved via done / abandon / resurrect first).
+QUEUE_ORPHANED_SOURCE_EVENTS = (
+    "queue/queue-orphaned", "claude-watch/queue-orphaned")
+
+# Queue ids are ``q-YYYY-MM-DD-XXXX`` (XXXX is an alphanumeric suffix).
+_QID_RE = re.compile(r"q-\d{4}-\d{2}-\d{2}-[0-9A-Za-z]+")
+
+
+def _resolve_session_task_cli() -> str | None:
+    """Locate the session-task CLI: PATH first, then the sibling source tree
+    (``tools/session-task/session-task``) when running from a checkout."""
+    cli = shutil.which("session-task")
+    if cli:
+        return cli
+    sibling = (Path(__file__).resolve().parent.parent
+               / "session-task" / "session-task")
+    if sibling.exists():
+        return str(sibling)
+    return None
+
+
+def verify_orphan_resolved(entry: dict | None, key: str) -> tuple[bool, str]:
+    """Gate the ack of a queue-orphaned event on the orphan being resolved.
+
+    Returns ``(ok, message)``. ``ok=True`` allows the ack; ``ok=False`` refuses
+    it, with ``message`` explaining why.
+
+    Only queue-orphaned keys are gated (identified by the entry's
+    ``source_event`` being ``queue/queue-orphaned`` or
+    ``claude-watch/queue-orphaned``). For those, the q-id is parsed from the key
+    (which carries the event message) and looked up via ``session-task queue
+    show``. A still-``running`` item is REFUSED -- acking does not resolve an
+    orphan; the item must be resolved via done / abandon / resurrect first. Any
+    other status (done, abandoned, blocked, pending, not-found, ...) is allowed.
+
+    DEFAULT-OPEN: if the entry is not a queue-orphaned event, the q-id is
+    unparseable, session-task is unavailable, or the lookup errors / times out /
+    returns unparseable output, the ack is ALLOWED (and the reason logged to
+    stderr). A verification failure must never blackhole the ack path.
+    """
+    source_event = (entry or {}).get("source_event", "") or ""
+    if source_event not in QUEUE_ORPHANED_SOURCE_EVENTS:
+        return (True, "")  # not a queue-orphaned event -- no gate
+
+    m = _QID_RE.search(key or "")
+    if not m:
+        print(f"event-ack: orphan-verify default-open: no q-id parseable "
+              f"from key {key!r}", file=sys.stderr)
+        return (True, "")
+    qid = m.group(0)
+
+    cli = _resolve_session_task_cli()
+    if not cli:
+        print("event-ack: orphan-verify default-open: session-task "
+              "unavailable", file=sys.stderr)
+        return (True, "")
+
+    try:
+        proc = subprocess.run(
+            [cli, "queue", "show", qid],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        print(f"event-ack: orphan-verify default-open: session-task show "
+              f"failed for {qid}: {exc}", file=sys.stderr)
+        return (True, "")
+
+    if proc.returncode != 0:
+        print(f"event-ack: orphan-verify default-open: session-task show "
+              f"{qid} exited {proc.returncode}", file=sys.stderr)
+        return (True, "")
+
+    try:
+        status = json.loads(proc.stdout).get("status")
+    except (ValueError, AttributeError) as exc:
+        print(f"event-ack: orphan-verify default-open: could not parse "
+              f"session-task show {qid}: {exc}", file=sys.stderr)
+        return (True, "")
+
+    if status == "running":
+        return (False,
+                f"{qid} still running-orphaned -- resolve via "
+                f"done/abandon/resurrect first; ack does not resolve it")
+    return (True, "")
 
 
 def list_state(state_dir: Path) -> dict:
@@ -667,6 +756,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "ack":
         action = (args.action or "").strip()
         entry = _find_pending_entry(state_dir, args.key)
+        # Queue-orphaned events: an ack does NOT resolve the orphan. Refuse the
+        # ack while the underlying queue item is still `running` -- it must be
+        # resolved (done / abandon / resurrect) first. Default-open on any
+        # verification failure so a lookup problem never blackholes the ack.
+        ok, why = verify_orphan_resolved(entry, args.key)
+        if not ok:
+            print(f"REFUSED: {why}", file=sys.stderr)
+            return 2
         # A genuine actionable event REQUIRES a substantive --action: the ack
         # is the record of what you did. Pure-liveness entries (keepalive) and
         # idempotent no-ops (key not pending) do not.
@@ -1080,6 +1177,96 @@ def _self_test() -> int:
                  f"be allowed, got rc={rc}")
         if any(e["key"] == lkey for e in list_state(sd)["pending"]):
             fail("per-key liveness ack must remove the entry")
+
+        # ---- Orphan-ack verification (queue-orphaned events) --------------
+        # A queue-orphaned event marks a `running` queue item with no live
+        # owner; acking it does NOT resolve the orphan. verify_orphan_resolved
+        # refuses the ack while the item is still `running`, and default-opens
+        # on any lookup problem. A fake `session-task` on PATH returns a
+        # controllable status so the whole gate is exercised without a live
+        # queue. It takes precedence over the real sibling CLI (which
+        # `_resolve_session_task_cli` only falls back to when PATH has none).
+        fake_bin = sd / "fakebin"
+        fake_bin.mkdir()
+        fake_st = fake_bin / "session-task"
+        fake_st.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '{\"status\": \"%s\"}\\n' \"${FAKE_ST_STATUS:-running}\"\n"
+            "exit \"${FAKE_ST_RC:-0}\"\n"
+        )
+        fake_st.chmod(0o755)
+        os.environ["PATH"] = str(fake_bin) + os.pathsep + os.environ["PATH"]
+
+        orphan_entry = {"source_event": "queue/queue-orphaned"}
+        cw_orphan_entry = {"source_event": "claude-watch/queue-orphaned"}
+        orphan_key = "queue-orphaned:q-2026-01-02-abcd running w/o owner"
+
+        # 25. Non-orphan source_event -> always allowed (no lookup gate).
+        ok, _m = verify_orphan_resolved(
+            {"source_event": "torrent/torrent-completed"}, "k:x")
+        if not ok:
+            fail("non-orphan entry must be allowed by verify_orphan_resolved")
+        # None entry (idempotent no-op ack of an absent key) -> allowed.
+        ok, _m = verify_orphan_resolved(None, orphan_key)
+        if not ok:
+            fail("None entry must be allowed by verify_orphan_resolved")
+
+        # 26. Orphan + status running -> REFUSED, for BOTH source spellings.
+        os.environ["FAKE_ST_STATUS"] = "running"
+        os.environ["FAKE_ST_RC"] = "0"
+        ok, msg = verify_orphan_resolved(orphan_entry, orphan_key)
+        if ok or "still running-orphaned" not in msg or \
+                "q-2026-01-02-abcd" not in msg:
+            fail(f"running orphan must be refused: ok={ok} msg={msg!r}")
+        ok, _m = verify_orphan_resolved(cw_orphan_entry, orphan_key)
+        if ok:
+            fail("running orphan (claude-watch source) must be refused")
+
+        # 27. Orphan + a non-running status -> ALLOWED.
+        for st_val in ("done", "abandoned", "blocked", "pending"):
+            os.environ["FAKE_ST_STATUS"] = st_val
+            ok, _m = verify_orphan_resolved(orphan_entry, orphan_key)
+            if not ok:
+                fail(f"orphan with status {st_val} must be allowed")
+
+        # 28. Orphan but q-id unparseable -> DEFAULT-OPEN (allow).
+        os.environ["FAKE_ST_STATUS"] = "running"
+        ok, _m = verify_orphan_resolved(orphan_entry, "queue-orphaned:no id here")
+        if not ok:
+            fail("unparseable q-id must default-open (allow)")
+
+        # 29. Orphan + session-task exits non-zero -> DEFAULT-OPEN (allow).
+        os.environ["FAKE_ST_RC"] = "1"
+        ok, _m = verify_orphan_resolved(orphan_entry, orphan_key)
+        if not ok:
+            fail("session-task non-zero exit must default-open (allow)")
+        os.environ["FAKE_ST_RC"] = "0"
+
+        # 30. End-to-end via main(): a running-orphan ack is REFUSED (rc!=0)
+        #     and the pending entry is NOT removed.
+        clear_pending(sd)
+        os.environ["FAKE_ST_STATUS"] = "running"
+        ingest(sd, "queue", "queue-orphaned",
+               "q-2026-01-02-abcd running without owner")
+        okey = list_state(sd)["pending"][0]["key"]
+        rc = main(["--state-dir", str(sd), "ack", okey,
+                   "--action", "looked at it"])
+        if rc == 0:
+            fail("main() ack of a running-orphan must be refused")
+        if not any(e["key"] == okey for e in list_state(sd)["pending"]):
+            fail("refused running-orphan ack must not remove the entry")
+
+        # 31. End-to-end via main(): once resolved (done), the ack SUCCEEDS.
+        os.environ["FAKE_ST_STATUS"] = "done"
+        rc = main(["--state-dir", str(sd), "ack", okey,
+                   "--action", "resurrected then marked done"])
+        if rc != 0:
+            fail(f"main() ack of a resolved orphan must succeed, got rc={rc}")
+        if any(e["key"] == okey for e in list_state(sd)["pending"]):
+            fail("resolved-orphan ack must remove the entry")
+
+        for _k in ("FAKE_ST_STATUS", "FAKE_ST_RC"):
+            os.environ.pop(_k, None)
 
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
