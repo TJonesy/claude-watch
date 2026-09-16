@@ -6291,6 +6291,15 @@ def cmd_queue_force_start(args):
     # Recovery bundle path is included so the main loop can paste it into
     # the spawned Agent's prompt verbatim — the Agent reads the file to
     # see what was autostopped and triages.
+    #
+    # data.tier=ambient: the actual HARD enforcement that a spawn happens
+    # is the SEPARATE `force_started_unspawned` obligation registered right
+    # after this call (`_obligations_register_force_start`), not this
+    # claude-event's tier. This event is informational only -- surfacing
+    # the force-start distinctly on the bus -- so it should not also flood
+    # pending-actions as actionable (same pattern as queue-quarantined
+    # above). Without this stamp the event fell through to the fail-LOUD
+    # UNCLASSIFIED->actionable default.
     _claude_event_notify(
         tag="force-start",
         message=(
@@ -6319,6 +6328,7 @@ def cmd_queue_force_start(args):
             "co_run": co_run,
             "autostopped_peers": [b["queue_id"] for b in autostop_bundles],
             "recovery_bundle_path": bundle_path,
+            "tier": "ambient",
         },
         priority="normal",
         silent=getattr(args, "silent", False),

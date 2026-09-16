@@ -553,6 +553,17 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-quarantined", None, AMBIENT,
         "Queue item quarantined (scope held pending death confirmation); "
         "context only -- the actionable dead-job signal is hostjob-done."),
+    # force-start: the producer (session-task's cmd_queue_force_start) now
+    # stamps data.tier="ambient" directly (rung 2, same pattern as
+    # queue-quarantined above); this row is the BACKSTOP so the event still
+    # resolves ambient (not UNCLASSIFIED->fail-loud actionable) even if a
+    # producer path ever emits force-start without the stamp.
+    ("queue", "force-start", None, AMBIENT,
+        "Force-start notification; the force_started_unspawned obligation "
+        "is the real hard gate forcing a spawn, not this event's tier -- "
+        "context only. Backstop in case a producer path emits without "
+        "the data.tier stamp (was UNCLASSIFIED -> fail-loud actionable, "
+        "flooding pending-actions)."),
 
     # Routine PR status changes: "new push", "CI pending", "CI success",
     # conflict RESOLUTION, plain "mergeable", "merged". The conditional
@@ -903,6 +914,8 @@ def _self_test() -> int:
         (("queue", "queue-running", ""), AMBIENT),
         (("queue", "queue-done", ""), AMBIENT),
         (("queue", "queue-abandoned", ""), AMBIENT),
+        (("queue", "queue-quarantined", ""), AMBIENT),
+        (("queue", "force-start", ""), AMBIENT),
 
         # Ambient: workload + watcher
         (("manual", "workload-done", ""), AMBIENT),

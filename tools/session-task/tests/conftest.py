@@ -32,6 +32,35 @@ If a future test starts shelling out to a process that calls real
 suppression itself (via the same ``env[...] = "0"`` pattern), not push
 the burden up here.
 
+Why ``CLAUDE_EVENT_QUEUE`` / ``CRON_EVENT_QUEUE`` ARE stripped here
+(previously broken -- fixed 2026-09-16):
+
+* The ``$HOME``-tempdir isolation claimed above only holds if
+  ``claude-event`` actually falls through to ``$HOME``. It doesn't when
+  either env var is already set in the OUTER shell: ``claude-event``
+  resolves its queue dir as
+  ``os.environ.get("CLAUDE_EVENT_QUEUE", os.environ.get("CRON_EVENT_QUEUE",
+  str(Path.home() / "claude-events")))`` -- i.e. these vars take
+  PRIORITY over ``$HOME``.
+* Several test files build the subprocess env via ``os.environ.copy()``
+  / ``dict(os.environ)`` and only override ``HOME``. If the ambient shell
+  (e.g. a live container session) exports ``CLAUDE_EVENT_QUEUE``, that
+  value rides straight through the copy and every claude-event emitted
+  during the test run lands in the REAL live bus, not the per-test
+  tmpdir -- silently defeating the isolation this docstring used to
+  assume was automatic. (A couple of individual test files -- see
+  ``test_queue_force_start_co_run.py`` / ``test_queue_force_start_new_scope.py``
+  -- had already worked around this ad hoc with their own
+  ``env.pop("CLAUDE_EVENT_QUEUE", None)``; most others hadn't.)
+* Fix: pop both vars from THIS process's own ``os.environ`` at import
+  time (not ``setdefault`` -- they are already set in the leaking case,
+  so ``setdefault`` would no-op). Every test that copies from
+  ``os.environ`` now copies from an already-scrubbed environment, so
+  ``HOME`` becomes the only source of the queue dir again, with no
+  per-test-file changes required. A test that genuinely needs a REAL
+  ``CLAUDE_EVENT_QUEUE`` value should re-set it itself, explicitly, in
+  that test.
+
 Why ``CLAUDE_AGENTS_STATE_FALLBACK_BIN`` is suppressed here:
 
 * When ``CLAUDE_AGENTS_STATE`` points at a missing / empty tmp file
@@ -48,4 +77,11 @@ Why ``CLAUDE_AGENTS_STATE_FALLBACK_BIN`` is suppressed here:
 import os
 
 os.environ.setdefault("PINGME_SESSION_TASK", "0")
+
+# Strip (not setdefault -- see docstring above): these are typically
+# ALREADY SET in the ambient shell, and the whole point is overriding an
+# already-set value so tests that copy os.environ don't leak onto the
+# real live event bus.
+os.environ.pop("CLAUDE_EVENT_QUEUE", None)
+os.environ.pop("CRON_EVENT_QUEUE", None)
 os.environ.setdefault("CLAUDE_AGENTS_STATE_FALLBACK_BIN", "")
