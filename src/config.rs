@@ -909,10 +909,16 @@ pub struct ReauthConfig {
     pub expiry_watch_enabled: bool,
 
     /// Drive `self-login` automatically when the warning is corroborated,
-    /// instead of only alerting. AUTO-FIRE IS INTRUSIVE BY NATURE: `/login`
-    /// opens a modal that swallows the session's keystrokes until somebody
-    /// pastes the authorization code, so the loop stops working until then.
-    /// `self_login_abandon_seconds` is what bounds that.
+    /// instead of only alerting.
+    ///
+    /// AUTO-FIRE IS INTRUSIVE BY NATURE, AND IT CANNOT FINISH ON ITS OWN.
+    /// `/login` opens a modal that swallows the session's keystrokes, and the
+    /// only thing that closes it is an authorization code a PERSON has to
+    /// fetch from a signed-in browser and hand back via `self-login code
+    /// <CODE>`. Nothing in this crate can obtain that code, so what this
+    /// setting buys is the URL arriving BEFORE the credentials lapse rather
+    /// than after — the operator still completes the login. Until they do the
+    /// loop is stopped, and `self_login_abandon_seconds` is what bounds that.
     #[serde(default = "default_expiry_auto_self_login")]
     pub expiry_auto_self_login: bool,
 

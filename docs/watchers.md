@@ -319,6 +319,19 @@ modal that swallows the loop's own keystrokes, and normally somebody has to be
 sitting at the terminal. `self-login` drives the whole flow from outside, so it
 works from a phone.
 
+> **A person is still required, and always has been.** `self-login` automates
+> everything on *this* side of the OAuth exchange — injecting `/login`, driving
+> the method picker, scraping the authorize URL, typing the code back, verifying
+> the outcome, and cleaning up a dialog nobody answered. It cannot automate the
+> middle: somebody has to open that URL in a browser where they are signed in,
+> approve the grant, and hand the resulting authorization code back via
+> `self-login code <CODE>`. Nothing in this repository obtains that code — it is
+> only ever printed for a human to act on. So an auto-fired login **parks the
+> session in a modal until a person finishes it** (bounded by
+> `self_login_abandon_seconds`; see below). Read "drives the flow
+> programmatically" below as "needs no typing at the terminal", not as
+> "completes unattended".
+
 ```
 self-login start                 # inject /login, scrape the OAuth URL, publish it
 self-login code <CODE>           # type the authorization code into the dialog
@@ -356,11 +369,19 @@ Two details worth knowing if you touch this code:
 - The authorization code is still typed with raw `tmux send-keys`, **not**
   `claude-watch inject`. The original reason (inject always opened with an
   Escape blast, and Escape cancels the login modal) expired when the flag
-  became opt-in on 2026-08-18; others did not. Inject enters INSERT by probing
-  with a literal `i` it can only un-type by seeing it on a prompt line, and a
-  modal has none — so the code arrives as `i<code>`. Any configured FleetView
+  became opt-in on 2026-08-18; others did not. Any configured FleetView
   focus-to-main keys are sent first and land in the modal's text field as raw
   escape sequences.
+
+  Inject's INSERT probe used to be the other half of this: it enters INSERT by
+  typing a literal `i` that it can only un-type by spotting it on a prompt
+  line, and a modal draws none — so the code arrived as `i<code>`, and every
+  *other* inject tier that reached a standing modal left an `i` behind too, one
+  per attempt (an auto-fired dialog that stood for an hour collected a row of
+  them in the code field). Since 2026-09-17 `ensure_insert_mode` recognizes the
+  `/login` modal and sends no probe at all, and
+  `tmux::interactive_prompt_visible` treats the modal as a live interactive
+  prompt so the routine inject tiers suppress instead of typing into it.
 
   Since 2026-08-19 inject additionally refuses to press Enter unless the prompt
   line holds its payload and nothing else. A modal has no prompt line, so that
@@ -368,9 +389,9 @@ Two details worth knowing if you touch this code:
   reports `prompt_dirty` / exit 4. That replaced the older and more dangerous
   behaviour, where the success check ("the payload cleared from the prompt
   line") was vacuous in a modal and inject reported `submitted` over the
-  corrupted code. The typing defects above are unchanged, so the raw path is
-  still required — but a mistake here now fails loudly instead of
-  authenticating with a corrupted code.
+  corrupted code. The focus-key defect above is unchanged, and the refusal gate
+  is unconditional, so the raw path is still required — but a mistake here now
+  fails loudly instead of authenticating with a corrupted code.
 
   All of this is reproduced against a real tmux pane in
   `tools/watchers/tests/test_self_login_tmux.sh` — the typing defects via a
@@ -454,6 +475,20 @@ brakes:
 
 Alerts are separately rate-limited by `alert_interval_seconds`, the same
 cooldown the reactive path uses.
+
+**All four brakes share one state, and a masked pane used to wipe it.** The
+retry clock, the attempt count and the pending-dialog latch all live in the
+daemon's state file, and the "expiry resolved" branch clears every one of them.
+That branch fires when the pane shows no warning — and the `/login` modal
+covers the entire TUI, warning included. So a dialog the daemon opened itself
+made the daemon forget it had opened one, about a minute later: budget back to
+zero, retry clock forgotten, latch released. Observed 2026-09-17 as two
+auto-fires seven minutes apart, both logged as "attempt 1", with the spacing
+configured at an hour. A dialog on the pane now HOLDS the window instead
+(`policy::expiry_window_is_masked`), alongside the reactive path's login screen
+and 401 banner, which were already treated that way. Genuine renewal is still
+recognized, because that check reads the stored expiry MOVING and does not care
+what is on screen.
 
 **And if nobody answers it.** Auto-fire at 3am publishes a URL to a sleeping
 operator, and the modal it opened would hold the session until morning. The

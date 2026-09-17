@@ -148,15 +148,26 @@ tmux kill-session -t "$SESSION" 2>/dev/null
 # There are TWO independent reasons, and they are probed separately below
 # because they live at different stages of the choreography:
 #
-#   * The TYPING corrupts the payload (probe A, checks 4a-4c). inject's
-#     INSERT-mode probe `i` and the configured FleetView focus keys are typed
-#     into the modal ahead of the code. This is unchanged and is why the code
-#     must never be routed through inject's typing path.
+#   * The TYPING corrupts the payload (probe A, checks 4a-4c). The configured
+#     FleetView focus keys are typed into the modal ahead of the code, as raw
+#     escape sequences. That is why the code must never be routed through
+#     inject's typing path.
 #
-#   * The SUBMIT now refuses outright (probe B, check 4d). Since the prompt
-#     line must hold our payload and nothing else before Enter, and a modal has
-#     no prompt line at all, inject can never satisfy that gate in a modal — it
-#     retracts and reports `prompt_dirty`.
+#     The INSERT-mode probe `i` used to be the second half of this, and check
+#     4b asserted it. It is NOT any more: as of 2026-09-17 `ensure_insert_mode`
+#     recognizes a `/login` modal and sends nothing at all, because the probe's
+#     only cleanup path (diff the prompt line, Backspace a literal `i`) keys on
+#     the `❯` glyph, which a modal does not draw — so on a modal the probe
+#     could deposit an `i` and never take it back. It did, once per inject, for
+#     as long as an auto-fired dialog stood unanswered (operator-observed
+#     `…iiiiii` in the paste-code field). 4b now pins the SUPPRESSION, so a
+#     regression that re-introduces the probe fails here.
+#
+#   * The SUBMIT refuses outright (probe B, check 4d). Since the prompt line
+#     must hold our payload and nothing else before Enter, and a modal has no
+#     prompt line at all, inject can never satisfy that gate in a modal — it
+#     retracts and reports `prompt_dirty`. This is the reason that holds even
+#     on a deployment with no focus keys configured.
 #
 # Probe A deliberately uses `--no-submit` and commits with a RAW tmux Enter.
 # That is not a workaround for the new gate, it is what isolates the typing
@@ -209,15 +220,18 @@ else
   ok "claude-watch inject corrupts a code typed into a login modal (raw send-keys path is still required)"
 fi
 
-# --- 4b. the corruption is the stray INSERT-mode probe `i` ---
+# --- 4b. the INSERT-mode probe `i` is SUPPRESSED on a login modal ---
 #
 # inject enters INSERT by sending one `i` and un-types it only if it can see
 # the literal land on the prompt line. A modal shows no `-- INSERT --` and no
-# prompt glyph, so the detection is ambiguous, inject fails open, and the `i`
-# stays glued to the front of the payload.
+# `❯` prompt glyph, so that detection can never fire and the `i` would stay
+# glued to the front of the payload — one per inject, forever, since nothing
+# downstream can take it back. `ensure_insert_mode` therefore recognizes the
+# modal and sends no probe at all. Assert the absence: an `i` immediately
+# before the code means the suppression regressed.
 case "$PROBE_RECEIVED" in
-  *i"$PROBE_CODE") ok "the INSERT-probe \`i\` arrives as a literal prefix on the code" ;;
-  *) bad "expected a literal \`i\` immediately before the code, got: $(printf '%s' "$PROBE_RECEIVED" | od -c | head -2)" ;;
+  *i"$PROBE_CODE") bad "the INSERT-probe \`i\` landed in the modal's code field — the /login-modal suppression in ensure_insert_mode has regressed (this is the 2026-09-17 \`…iiiiii\` bug)" ;;
+  *) ok "the INSERT-probe \`i\` is suppressed on a /login modal (no stray char in the code field)" ;;
 esac
 
 # --- 4c. the configured FleetView focus keys leak into the modal ---
