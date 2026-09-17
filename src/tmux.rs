@@ -2823,6 +2823,102 @@ pub(crate) fn check_lines_for_401_banner(pane_output: &str) -> bool {
         && (squashed.contains("apierror:401") || squashed.contains("oauthaccesstokenhasexpired"))
 }
 
+/// Claude Code's "you have no usage credits left" turn failure, as it appears
+/// on the pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditBanner {
+    /// The model Claude Code offers to keep using, i.e. the one that ran out,
+    /// as printed (`"Fable 5"`). A pane that wrapped mid-word yields a
+    /// squashed, lowercased form instead (`"fable5"`); both are only ever used
+    /// for display and for the alphanumeric-only comparison in
+    /// `policy::model_ids_match`, so neither form changes a decision. `None`
+    /// when the offer clause could not be read at all — the message is still
+    /// the message without it.
+    pub exhausted_model: Option<String>,
+}
+
+/// Pure function: is Claude Code's usage-credit exhaustion message on a LIVE
+/// pane?
+///
+/// The third way to lose a session, and the one none of the other detectors
+/// recognise. When the account's usage credits for the current model run out,
+/// Claude Code keeps the TUI fully intact — tokens footer, permission-mode
+/// banner, `❯` prompt — and answers EVERY turn with one line:
+///
+/// ```text
+/// You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.
+/// ```
+///
+/// Credentials are fine, the process is fine, nothing is "dead": the session
+/// simply cannot produce a turn. Observed shape of the resulting outage — the
+/// loop answers every injected notification with that sentence, events pile up
+/// unconsumed, and the ack-staleness alert fires while every other monitor
+/// reports a healthy session.
+///
+/// Matching strategy is `detect_login_expiry_warning`'s: strip ALL whitespace
+/// and lowercase before matching, because a tmux pane hard-wraps with no
+/// separator and a sentence this long can be split at any column. Both halves
+/// are required — the phrase AND the `/usage-credits` remedy — so that prose
+/// merely containing "out of usage credits" needs the command next to it too.
+///
+/// **This is text, and text on a live pane is conversation until something
+/// off-screen says otherwise.** The sentence above is on the pane of any
+/// session reading this file, its tests, or the diff that added them. The
+/// false-positive guard is not here: it is the transcript corroboration in
+/// `token_usage::recent_credit_failures_at`, consumed by
+/// `policy::decide_credit_action`.
+pub(crate) fn detect_credit_exhaustion(pane_output: &str) -> Option<CreditBanner> {
+    let lower = pane_output.to_lowercase();
+    if !tui_visible(&lower) {
+        // The wedge this detects keeps the TUI up. A pane with no TUI on it is
+        // some other detector's business (login screen, crashed process), and
+        // guessing here would step on them.
+        return None;
+    }
+    let squashed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    if !squashed.contains("outofusagecredits") || !squashed.contains("/usage-credits") {
+        return None;
+    }
+
+    // Which model ran out, read off the offer Claude Code makes. Two passes,
+    // both with BOUNDED repetition so a pane where the sentence is interleaved
+    // with other text cannot swallow half the screen into the "model name":
+    //
+    //  1. whitespace-normalized original, case preserved -> "Fable 5", which
+    //     is what the operator's push notification should say;
+    //  2. the squashed form as a fallback, which still matches when the pane
+    //     wrapped mid-word inside the offer clause itself.
+    static RE_PRETTY: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    static RE_SQUASHED: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re_pretty = RE_PRETTY.get_or_init(|| {
+        regex_lite::Regex::new(r"(?i)to keep using (.{1,40}?) or /model")
+            .expect("static credit-exhaustion display pattern is valid")
+    });
+    let re_squashed = RE_SQUASHED.get_or_init(|| {
+        regex_lite::Regex::new(r"tokeepusing(.{1,40}?)or/model")
+            .expect("static credit-exhaustion pattern is valid")
+    });
+    let normalized = pane_output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let exhausted_model = re_pretty
+        .captures(&normalized)
+        .or_else(|| re_squashed.captures(&squashed))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|m| !m.is_empty());
+
+    Some(CreditBanner { exhausted_model })
+}
+
+/// Capture the pane and report Claude Code's usage-credit exhaustion message.
+///
+/// A separate capture from `reauth_signal`, deliberately: the two signals are
+/// independent (an out-of-credits pane is perfectly well authenticated) and
+/// folding them into one classifier would make either able to mask the other.
+pub async fn credit_exhaustion_banner(pane: &str) -> Option<CreditBanner> {
+    let out = capture_pane(pane).await?;
+    detect_credit_exhaustion(&out)
+}
+
 /// Every OAuth authorize-URL prefix a Claude Code login screen can print.
 ///
 /// Claude Code MOVED its subscription authorize endpoint: current builds use
@@ -5522,6 +5618,125 @@ mod tests {
             "  bypass permissions on · 55,000 tokens\n"
         );
         assert!(check_lines_for_401_banner(output));
+    }
+
+    // ---- Usage-credit exhaustion ----
+
+    /// The pane as it looked during the real incident: TUI fully intact, one
+    /// line answering the turn.
+    const CREDITS_EXHAUSTED_PANE: &str = concat!(
+        "● You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.\n",
+        "\n",
+        "❯ \n",
+        "  bypass permissions on · 143,201 tokens\n"
+    );
+
+    #[test]
+    fn credit_exhaustion_is_detected_on_a_live_tui() {
+        let banner = detect_credit_exhaustion(CREDITS_EXHAUSTED_PANE)
+            .expect("the incident pane must be detected");
+        assert_eq!(
+            banner.exhausted_model.as_deref(),
+            Some("Fable 5"),
+            "the push notification has to name the model as the operator knows it"
+        );
+    }
+
+    #[test]
+    fn credit_exhaustion_survives_a_hard_wrap_mid_word() {
+        // tmux wraps with NO separator and no hyphenation, so the sentence
+        // can split at any column — including inside "credits" and inside
+        // the model name.
+        let wrapped = concat!(
+            "● You're out of usage cre\n",
+            "dits. Run /usage-credi\n",
+            "ts to keep using Fabl\n",
+            "e 5 or /model to switch models.\n",
+            "❯ \n",
+            "  bypass permissions on · 143,201 tokens\n"
+        );
+        let banner = detect_credit_exhaustion(wrapped).expect("wrapped pane must still match");
+        // The display form degrades on a mid-word wrap; what must survive is
+        // the identity of the model, which is all any decision uses (see
+        // policy::model_ids_match, which compares alphanumerics only).
+        let alnum: String = banner
+            .exhausted_model
+            .as_deref()
+            .expect("a model name")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        assert_eq!(alnum, "fable5");
+    }
+
+    #[test]
+    fn credit_exhaustion_needs_the_remedy_command_too() {
+        // Prose that happens to contain the phrase, without the command next
+        // to it, is not the banner.
+        let prose = concat!(
+            "● We ran out of usage credits about an hour before the weekly reset.\n",
+            "❯ \n",
+            "  bypass permissions on · 143,201 tokens\n"
+        );
+        assert!(detect_credit_exhaustion(prose).is_none());
+    }
+
+    #[test]
+    fn credit_exhaustion_needs_a_live_tui() {
+        // No TUI on the pane = somebody else's detector (login screen, dead
+        // process). Guessing here would step on them.
+        let no_tui = "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.\n";
+        assert!(detect_credit_exhaustion(no_tui).is_none());
+    }
+
+    #[test]
+    fn credit_exhaustion_text_in_conversation_is_still_detected_as_text() {
+        // Somebody reading THIS file, or the PR that added it, has the
+        // sentence on their pane while their account is in perfectly good
+        // standing. The detector says "message present" — it is text, and it
+        // cannot know better. The false-positive guard lives one layer up, in
+        // the transcript corroboration (policy::decide_credit_action), and
+        // that is where the healthy case is asserted silent.
+        let quoting = concat!(
+            "  /// You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.\n",
+            "❯ \n",
+            "  bypass permissions on · 55,000 tokens\n"
+        );
+        assert!(detect_credit_exhaustion(quoting).is_some());
+    }
+
+    #[test]
+    fn credit_exhaustion_model_name_is_optional() {
+        // A pane where the offer clause is missing or reworded still carries
+        // the banner; only the name is unknown.
+        let no_offer = concat!(
+            "● You're out of usage credits. Run /usage-credits to continue.\n",
+            "❯ \n",
+            "  bypass permissions on · 55,000 tokens\n"
+        );
+        let banner = detect_credit_exhaustion(no_offer).expect("banner without the offer clause");
+        assert_eq!(banner.exhausted_model, None);
+    }
+
+    #[test]
+    fn credit_exhaustion_model_capture_is_bounded() {
+        // Two far-apart fragments must not let the capture swallow the screen
+        // between them into a "model name".
+        let far_apart = format!(
+            "● You're out of usage credits. Run /usage-credits to keep using\n{}\nor /model to switch models.\n❯ \n  57,129 tokens\n",
+            "x".repeat(200)
+        );
+        let banner = detect_credit_exhaustion(&far_apart).expect("still the banner");
+        assert_eq!(banner.exhausted_model, None, "capture must stay bounded");
+    }
+
+    #[test]
+    fn a_healthy_pane_has_no_credit_banner() {
+        assert!(detect_credit_exhaustion("● Done.\n\n❯ \n  57,129 tokens\n").is_none());
+        assert!(detect_credit_exhaustion("").is_none());
+        // Neither of the auth signals is this one.
+        assert!(detect_credit_exhaustion(BANNER_401_WITH_TUI).is_none());
     }
 
     #[test]

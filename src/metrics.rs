@@ -388,6 +388,7 @@ fn build_metrics(
     let auto_update_interrupts = num(state, "auto_update_interrupts_total");
     let reauth_inject_interrupts = num(state, "reauth_inject_interrupts_total");
     let self_login_autofire = num(state, "self_login_autofire_total");
+    let credit_demote_interrupts = num(state, "credit_demote_interrupts_total");
     let post_restart_resume_inject_interrupts =
         num(state, "post_restart_resume_inject_interrupts_total");
     let fresh_session_inject_interrupts = num(state, "fresh_session_inject_interrupts_total");
@@ -543,6 +544,15 @@ fn build_metrics(
         format!(
             "claude_interrupts_total{{kind=\"self_login_autofire\"}} {}",
             self_login_autofire
+        ),
+        // One-way model demotion after the account ran out of usage credits
+        // for the running model. Its own kind because it is the only
+        // interrupt that changes WHICH MODEL the loop runs on, and the
+        // operator has to promote back by hand after the credit reset — a
+        // non-zero value here is a question for a human, not just a stat.
+        format!(
+            "claude_interrupts_total{{kind=\"credit_demote\"}} {}",
+            credit_demote_interrupts
         ),
         format!(
             "claude_interrupts_total{{kind=\"post_restart_resume_inject\"}} {}",
@@ -2928,6 +2938,7 @@ mod tests {
             "auto_update_interrupts_total": 19,
             "reauth_inject_interrupts_total": 1,
             "self_login_autofire_total": 9,
+            "credit_demote_interrupts_total": 3,
             "post_restart_resume_inject_interrupts_total": 4,
             "fresh_session_inject_interrupts_total": 5,
             "fresh_clear_resume_inject_interrupts_total": 6,
@@ -2953,6 +2964,7 @@ mod tests {
             ("auto_update", 19),
             ("reauth_inject", 1),
             ("self_login_autofire", 9),
+            ("credit_demote", 3),
             ("post_restart_resume_inject", 4),
             ("fresh_session_inject", 5),
             ("fresh_clear_resume_inject", 6),

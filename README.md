@@ -50,6 +50,7 @@ claude-watch captures the Claude Code tmux pane every few seconds and parses it 
 - **Recovery actions**: Injects prompts to resume stalled sessions, triggers context clears, sends push-notification alerts (via a pluggable `pingme` shim — wire it to whatever notification service you prefer)
 - **Fresh session detection**: Detects when Claude Code starts fresh (via `dashboard --recreate --fresh`) and injects a resume prompt
 - **Task monitoring**: Watches Claude Code's background task output files, tracks agent lifecycle, cleans up orphaned tmux panes
+- **Usage-credit exhaustion**: Detects a loop that is authenticated and healthy but out of usage credits for the model it is running — every turn fails with `You're out of usage credits`, while every other detector reports a healthy session — corroborates it against the session transcript's turn-failure records, and injects `/model <target>` once to get it working again. Demote-only: it never switches back. See [`docs/watchers.md`](docs/watchers.md)
 - **Bypass-Permissions consent dialog**: Gets a relaunched Claude past the startup consent dialog before anything types into the pane — see below
 
 ### The Bypass-Permissions consent dialog

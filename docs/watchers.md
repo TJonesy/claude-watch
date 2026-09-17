@@ -530,6 +530,144 @@ being asked to refresh it, reads the same as a live failure and would fire.
 The attempt budget and the abandon watchdog bound the cost; a session that is
 doing anything at all scrolls the old banner off long before that.
 
+## Automatic model demotion when the usage credits run out
+
+Both paths above are about *credentials*. There is a third way to lose the main
+loop that has nothing to do with authentication, and none of the older
+detectors recognise it.
+
+When the account's usage credits for the model the loop is running are gone,
+Claude Code keeps everything: the process, the TUI, the tokens footer, the
+prompt, valid credentials. It simply answers every turn with one line.
+
+```
+● You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.
+```
+
+Observed shape of the resulting outage: credits ran out about an hour before
+the weekly reset, and from then on every injected notification — including the
+daemon's own `WATCHER(S) DOWN` nudge — was answered with that sentence. Events
+went unconsumed for twenty minutes and the ack-staleness alert fired critical,
+while every existing detector reported a healthy session, because by their
+definitions it *was* one. A human eventually typed `/model` by hand.
+
+The daemon now detects that and switches the model itself
+(`[credit_exhaustion]` in `config.toml`, default on).
+
+**Two signals, because the pane is not enough.** The sentence above is on the
+pane of any session reading this document, the detector's tests, or the diff
+that added them — the identical false positive the login detectors exist to
+survive. Where those corroborate against the credential store, this
+corroborates against the session's own JSONL transcript, because Claude Code
+records a turn it could **not produce** as a structurally distinct line rather
+than as conversation content:
+
+```json
+{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text",
+ "text":"You're out of usage credits. …"}]},
+ "apiError":"model_requires_usage_credits","isApiErrorMessage":true,
+ "apiErrorStatus":429}
+```
+
+`isApiErrorMessage` is the load-bearing field: it exists only on a turn-failure
+record. The same sentence typed, pasted or quoted lands in a normal line with a
+real model id and no such field, so it can never be counted as a failure.
+
+| On the pane | Recent turn failures on record | Result |
+| --- | --- | --- |
+| message | ≥ `min_failures` (default 2) | **inject `/model <target_model>`** — the incident shape |
+| message | exactly 1 | wait; one failed turn can be a transient 429 the next attempt sails through |
+| message | none | ignore outright; it is conversation text |
+| message | transcript unreadable | alert only, qualified as uncorroborated; never demote on UNKNOWN |
+
+"Recent" is `recent_window_seconds` (default 15 minutes), and that bound is
+load-bearing in its own right: an exhaustion that was already handled leaves
+its records behind in the transcript tail and its message on the scrolled pane,
+and without the window that residue would trigger a second demotion.
+
+**What the corroboration cannot rule out.** It proves that turns really are
+failing for want of credits. It does not prove the pane and the transcript
+belong to the same session: the transcript is located as "the most recently
+written top-level transcript", which is this daemon's one-active-main-session
+topology rather than a verified identity. A host running two main loops at once
+could corroborate pane A with session B's failures. In practice both share one
+account and one credit balance, but it is not proven.
+
+**Demote-only. The daemon never switches back.** Promoting the loop onto the
+model that ran out would re-wedge it, and the weekly reset is the operator's
+cue, not ours — so the capability does not exist rather than being merely
+unused. `policy::demote_command` is the only thing that builds a `/model`
+command and it takes the configured target; nothing anywhere records which
+model was in use before a demotion, so there is nothing to restore. Closing the
+exhaustion window resets the attempt **budget** and nothing else. The alert
+says so out loud, and it is the operator's prompt to promote back after the
+reset.
+
+**What stops it re-firing.** The message stands on the pane for as long as the
+condition lasts, so a naive detector re-injects every poll. Five brakes:
+
+| Brake | Default | What it stops |
+| --- | --- | --- |
+| `min_failures` | 2 | Demoting on a single sighting. Floored at 1, so it cannot be configured into "fire on sight". |
+| `settle_seconds` | 60 | A second `/model` typed into the picker the first one opened. |
+| `retry_seconds` | 300 | Re-firing on the next poll. |
+| `max_attempts` | 2 | Re-firing forever. The budget resets only when the exhaustion stops being observed — never on a timer. |
+| pending-dialog check | — | Injecting into a login modal the reauth path opened, which would cancel that flow. |
+
+A sixth guard is not a brake but a no-op filter: if the model the pane says ran
+out looks like `target_model`, switching to it achieves nothing, so the path
+holds and says why. The name match is loose (a pane display name against a
+config model id) and can only ever suppress.
+
+**Telling the operator is part of the action, not a sink hanging off it.** The
+standing "still out of credits" alerts go out as `credits-exhausted` on the
+usual `alert_interval_seconds` cooldown, so a session the daemon cannot or may
+not act on is never silent. The **demotion** notification is handled
+differently on purpose, because it happens once and the only remedy is a human
+promoting back after the reset:
+
+* it is sent through `alert::send_push_verified`, which **reads the notify
+  command's exit status** instead of discarding it and captures any receipt the
+  tool prints. A failed push is logged loudly and recorded as `failed` in the
+  `credit_demote_push` event — "we ran a command" is never reported as "the
+  operator was told";
+* it consults **no cooldown and no alert-suppression counter**
+  (`policy::credit_should_notify` returns true for a demotion whatever the
+  cooldown says, and its tests pin that). Sharing a bucket with chatty alerts is
+  exactly how a rare, high-value notification gets coalesced away;
+* the structured claude-event is emitted **separately and afterwards** as the
+  machine-readable record. A downstream consumer that filters or suppresses
+  that event cannot take the push down with it.
+
+The body is kept short enough to read on a lock screen and names the three
+things needed to act: the model that ran out, the model the loop is on now, and
+that restoring is manual.
+
+Diagnosing it from the log: the first sighting writes one
+`credit_exhaustion_detected` JSONL event carrying what the transcript said
+(`transcript`: `recent` / `none` / `unknown`, `recent_failures`) and what was
+decided (`action`, `reason`); a fire writes `credit_demote_injected` with the
+exact command; the message leaving the pane writes
+`credit_exhaustion_resolved`. The demotion also increments
+`claude_interrupts_total{kind="credit_demote"}` — a non-zero value there is a
+question for a human, not just a stat.
+
+Set `auto_demote = false` to keep the detection and the alert but type the
+command yourself; `enabled = false` turns the whole path off.
+
+"Stops being observed" means the **corroboration** goes quiet — no recent
+failure on record — not merely the pane text scrolling away, and that
+distinction is load-bearing. The message can linger in the visible capture of
+an idle session long after the demotion worked; if only the pane closed the
+window, a budget spent this week would still be spent when the *next*
+exhaustion arrives, and the path would refuse to act on it.
+
+**Known limit, stated plainly:** the `/model <id>` injection is assumed to
+apply the model directly rather than open a picker that then needs answering.
+`settle_seconds` and the attempt budget bound the cost if a given Claude Code
+build disagrees, and the failures stopping is what the daemon treats as "it
+worked".
+
 ## Tests
 
 ```
