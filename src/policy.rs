@@ -4210,6 +4210,42 @@ pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
     ExpiryAction::AutoLogin { days_left }
 }
 
+/// Is this cycle's "no expiry warning on the pane" a MASKED reading rather
+/// than a resolved one?
+///
+/// `check_login_expiry` keys on a warning Claude Code paints on the TUI. Three
+/// things cover that TUI, and while any of them is up the absence of the
+/// warning says nothing at all about the credentials:
+///
+///   * a login SCREEN the reactive path is driving (`reauth_detected`);
+///   * the 401 banner path mid-recovery (`reauth_banner_detected`);
+///   * the `/login` MODAL — which, in the case this function exists for, the
+///     proactive path OPENED ITSELF moments earlier.
+///
+/// The third was missing, and it is the one that mattered. Observed
+/// 2026-09-17: auto-fire opened the dialog, and 74 seconds later the same
+/// check read the covered pane as "nothing is expiring" and ran its resolved
+/// branch — clearing `last_self_login_attempt`, zeroing
+/// `self_login_attempts_this_window`, and releasing
+/// `self_login_dialog_opened_at`. Every bound on the flow went with it: the
+/// hour of retry spacing, the three-attempt ceiling, the one-dialog-at-a-time
+/// latch, and the abandon watchdog's clock. The daemon re-fired seven minutes
+/// later, logged it as "attempt 1" again, and would have gone on doing so for
+/// as long as the credentials stayed inside the warning window.
+///
+/// A dialog on the pane is therefore HOLD, never RESOLVE. Credentials that
+/// genuinely renewed are recognized by the renewal check at the top of
+/// `check_login_expiry` (the stored expiry MOVING), which reads the file and
+/// does not care what is on screen — so nothing that is truly resolved is
+/// stuck behind this.
+pub(crate) fn expiry_window_is_masked(
+    reauth_detected: bool,
+    reauth_banner_detected: bool,
+    login_dialog_on_pane: bool,
+) -> bool {
+    reauth_detected || reauth_banner_detected || login_dialog_on_pane
+}
+
 /// Proactive counterpart to `check_reauth`: act on Claude Code's warning that
 /// the login is ABOUT to lapse, rather than waiting for it to actually lapse.
 ///
@@ -4217,7 +4253,18 @@ pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
 /// means the recovery always happens at the worst possible moment. This one
 /// runs while everything still works.
 async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
-    let pane_days_left = tmux::login_expiry_warning(pane).await;
+    // ONE capture, two questions. They must be answered off the SAME frame:
+    // "no expiry warning on the pane" and "a login modal is covering the pane"
+    // are the same pixels, and reading them a second apart is what lets the
+    // window resolve underneath a dialog that is still up.
+    let pane_frame = tmux::capture_pane(pane).await;
+    let pane_days_left = pane_frame
+        .as_deref()
+        .and_then(tmux::detect_login_expiry_warning);
+    let login_dialog_on_pane = pane_frame
+        .as_deref()
+        .map(tmux::login_dialog_visible)
+        .unwrap_or(false);
 
     let creds_path = credentials_path(config);
     let credentials = crate::credentials::read(&creds_path);
@@ -4276,7 +4323,11 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
         // window (resetting the attempt budget mid-flow) nor release the
         // dialog latch, because that latch is what stops the reactive path
         // from injecting `/login` into the dialog the daemon itself opened.
-        if state.reauth_detected || state.reauth_banner_detected {
+        if expiry_window_is_masked(
+            state.reauth_detected,
+            state.reauth_banner_detected,
+            login_dialog_on_pane,
+        ) {
             return;
         }
         if state.login_expiry_detected {
@@ -9379,6 +9430,33 @@ mod tests {
                 corroborated: true,
             }
         );
+    }
+
+    /// The 2026-09-17 regression, at the level it actually bit.
+    ///
+    /// `login_pending` (above) is the right veto, but it only holds while
+    /// `self_login_dialog_opened_at` is SET — and the resolved branch was
+    /// clearing it 74 seconds after the dialog opened, because the modal
+    /// covers the warning it keys on. With the latch gone the veto is gone,
+    /// the attempt budget is zeroed and the hour of retry spacing is
+    /// forgotten: the daemon re-fires as "attempt 1" indefinitely. A dialog
+    /// on the pane must therefore HOLD the window, never resolve it.
+    #[test]
+    fn a_login_dialog_on_the_pane_masks_the_expiry_window() {
+        assert!(expiry_window_is_masked(false, false, true));
+    }
+
+    #[test]
+    fn a_reactive_login_screen_or_banner_still_masks_the_window() {
+        assert!(expiry_window_is_masked(true, false, false));
+        assert!(expiry_window_is_masked(false, true, false));
+    }
+
+    #[test]
+    fn a_clean_pane_does_not_mask_the_window() {
+        // Nothing covering the TUI: an absent warning really is an absent
+        // warning, and the window is free to resolve.
+        assert!(!expiry_window_is_masked(false, false, false));
     }
 
     /// A dialog we already opened is still waiting for its code. Firing a

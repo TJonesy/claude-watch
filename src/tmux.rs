@@ -342,6 +342,16 @@ pub async fn is_interactive_prompt(pane: &str) -> bool {
 ///     none of (1)–(5) match it — yet an inject here submits the
 ///     default-selected "No, exit" and Claude EXITS. See
 ///     `bypass_permissions_dialog_visible`.
+///  7. The `/login` OAuth modal ("Select login method" / "Browser didn't
+///     open? …" / "Paste code here if prompted"), which claude-watch opens
+///     itself via `self-login` when the credentials are about to lapse. It
+///     covers the whole TUI, so the token count reads 0 and the session
+///     looks freshly started; none of (1)–(6) match it; and an inject here
+///     types the payload into the AUTHORIZATION-CODE field — the
+///     non-cancelling path leaving one literal `i` per attempt (the
+///     operator-observed `…iiiiii` in the code box, 2026-09-17), the
+///     cancelling path's leading Escape destroying the login outright. See
+///     `login_dialog_visible`.
 ///
 /// ## Conservative bias
 ///
@@ -425,6 +435,13 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
     // idle prompt and an inject submits the default "No, exit" — which exits
     // Claude. Delegated to the shared detector `policy` also acts on.
     if bypass_permissions_dialog_visible(pane_output) {
+        return true;
+    }
+
+    // (7) The `/login` OAuth modal. Same shape of hazard as (6), but the
+    // daemon is usually the one that OPENED it (`self-login`), so suppressing
+    // here is what stops claude-watch typing into its own dialog.
+    if login_dialog_visible(pane_output) {
         return true;
     }
 
@@ -632,6 +649,88 @@ pub(crate) fn bypass_permissions_dialog_visible(pane_output: &str) -> bool {
         }
     }
     saw_mode && saw_confirm_label
+}
+
+/// Pure function: does the pane show Claude Code's `/login` dialog — the
+/// modal the OAuth flow renders, in either of its two phases?
+///
+/// ```text
+///   Select login method:
+/// ❯ Claude account with subscription
+///   Anthropic Console account
+/// ```
+/// then, after a method is picked:
+/// ```text
+///   Browser didn't open? Use the url below to sign in (c to copy):
+///   https://claude.com/cai/oauth/authorize?…
+///   Paste code here if prompted > ▊
+/// ```
+///
+/// ## Why the daemon needs this
+///
+/// This modal covers the ENTIRE TUI: the status line with the token count,
+/// the `❯` input prompt, and the "Your login expires in N days" warning all
+/// vanish behind it. Every detector that keys on one of those reads the pane
+/// wrong while it is up:
+///
+///   * the token parse returns 0, so the dead-process / fresh-session
+///     machinery classifies a perfectly healthy session as freshly started;
+///   * `interactive_prompt_visible`'s six existing signatures all MISS it
+///     (no "do you want to", no `to select`+confirm footer, no `❯ 1.` /
+///     `❯ ●` row), so nothing suppresses an inject — and an inject into this
+///     modal types its payload into the authorization-code field. The
+///     non-cancelling path's INSERT probe leaves a literal `i` behind each
+///     time (see `ensure_insert_mode`); the cancelling path's leading Escape
+///     destroys the login outright;
+///   * the expiry warning is gone from the pane, so the proactive expiry
+///     check reads "nothing is expiring" and RESOLVES its own window —
+///     resetting the retry spacing, the attempt budget and the
+///     one-dialog-at-a-time latch while the dialog it opened is still up.
+///
+/// So this is a "the pane is not the session's right now" signal, not a
+/// cosmetic one.
+///
+/// ## Signatures
+///
+/// The same strings `container/bin/self-login` drives the flow with, kept in
+/// step with it deliberately — one vocabulary for one dialog. Both the
+/// typographic and the ASCII apostrophe are matched because the rendered
+/// glyph has differed across builds.
+///
+/// Scoped to the recent tail, like the sibling detectors, so a scrollback
+/// mention — this doc read into a pane, a transcript quoting the dialog —
+/// does not trip it.
+pub(crate) fn login_dialog_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    for line in &lines[start..] {
+        let lower = line.trim().to_lowercase();
+        if lower.contains("paste code here")
+            || lower.contains("browser didn't open")
+            || lower.contains("browser didn\u{2019}t open")
+            || lower.contains("select login method")
+            || lower.contains("claude account with subscription")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Capture the pane and report whether the `/login` modal is on it.
+///
+/// Companion to `login_expiry_warning`, and a deliberately separate capture
+/// for the same reason: the two answer different questions about the same
+/// pane and neither may be inferred from the other's miss.
+pub async fn login_dialog_on_pane(pane: &str) -> bool {
+    capture_pane(pane)
+        .await
+        .map(|out| login_dialog_visible(&out))
+        .unwrap_or(false)
 }
 
 /// Pure function: is the pane at a Claude idle prompt that is NOT the
@@ -1667,7 +1766,35 @@ pub(crate) fn insert_key_landed_literal(before: Option<&str>, after: Option<&str
 ///         or vim couldn't switch): Backspace exactly that one char.
 ///      c. else ambiguous -> proceed (fail-open); the payload types either way.
 ///   Only ONE `i` is ever sent, so a stuck probe can never accumulate `iii`.
+///
+/// ## The `/login` modal is exempt
+///
+/// Step (2b) is the only thing that erases a literal `i`, and it recognizes
+/// one by diffing `prompt_line_text` — which keys entirely on the `❯` glyph.
+/// The `/login` modal draws no `❯`, so `prompt_line_text` returns `None`
+/// before AND after, `insert_key_landed_literal` cannot fire, and the probe
+/// falls through to (2c) and leaves the `i` sitting in the authorization-code
+/// field. Per inject. That is the operator-observed `…iiiiii` in the paste-code
+/// box (2026-09-17): the probe has no way to clean up after itself there, so
+/// it must not run there at all.
+///
+/// `interactive_prompt_visible` (signature 7) already suppresses the inject
+/// tiers before they reach this function; this is the backstop for the ones
+/// that do not consult it and for the race where the modal arrives between
+/// the guard and the keystroke. Skipping the probe costs nothing on a modal —
+/// there is no INSERT mode to reach — and the caller's payload is no worse off
+/// than it already was.
 async fn ensure_insert_mode(pane: &str) {
+    // (0) A `/login` modal owns the pane: probing it deposits a literal `i`
+    // that nothing downstream can take back. Send NOTHING.
+    if login_dialog_on_pane(pane).await {
+        debug!(
+            pane = %pane,
+            "ensure_insert_mode: /login modal on the pane -- skipping the INSERT probe \
+             (a literal `i` here lands in the authorization-code field)"
+        );
+        return;
+    }
     // (1) Already INSERT -- never send a redundant `i`.
     if is_insert_mode(pane).await {
         return;
@@ -4786,6 +4913,80 @@ mod tests {
         assert!(check_lines_for_idle_prompt(BYPASS_DIALOG_PANE));
         assert!(interactive_prompt_visible(BYPASS_DIALOG_PANE));
         assert!(!idle_prompt_without_bypass_dialog(BYPASS_DIALOG_PANE));
+    }
+
+    // login_dialog_visible — the `/login` OAuth modal claude-watch opens
+    // itself (2026-09-17: the daemon typed into its own dialog and resolved
+    // its own expiry window behind it).
+
+    /// The code-paste phase, as the modal renders once a method is picked.
+    /// Note what is NOT here: no `❯`, no status line, no token count, and no
+    /// "Your login expires in N days" — all of it covered by the modal.
+    const LOGIN_CODE_PANE: &str = "\
+ Claude Code\n\
+\n\
+ Browser didn't open? Use the url below to sign in (c to copy):\n\
+\n\
+ https://claude.com/cai/oauth/authorize?code=true&client_id=REDACTED&response_type=code\n\
+\n\
+ Paste code here if prompted > \n";
+
+    /// The method-picker phase, which `self-login` drives with Down/Enter.
+    const LOGIN_MENU_PANE: &str = "\
+ Select login method:\n\
+\n\
+\u{276f} Claude account with subscription\n\
+  Anthropic Console account\n";
+
+    #[test]
+    fn login_dialog_matches_both_phases_of_the_modal() {
+        assert!(login_dialog_visible(LOGIN_CODE_PANE));
+        assert!(login_dialog_visible(LOGIN_MENU_PANE));
+    }
+
+    #[test]
+    fn login_dialog_matches_the_ascii_and_typographic_apostrophe() {
+        assert!(login_dialog_visible("  Browser didn't open? Use the url below"));
+        assert!(login_dialog_visible(
+            "  Browser didn\u{2019}t open? Use the url below"
+        ));
+    }
+
+    #[test]
+    fn login_dialog_not_fired_on_a_healthy_pane() {
+        let output = "\u{25cf} Done\n\u{276f} \n\
+                      \u{23f5}\u{23f5} bypass permissions on · 4 monitors\n\
+                                                       91928 tokens";
+        assert!(!login_dialog_visible(output));
+    }
+
+    #[test]
+    fn login_dialog_ignores_old_scrollback() {
+        // The modal 40 lines up is a transcript, not a live dialog.
+        let mut lines = vec!["scrollback".to_string(); 40];
+        lines.insert(0, LOGIN_CODE_PANE.to_string());
+        assert!(!login_dialog_visible(&lines.join("\n")));
+    }
+
+    #[test]
+    fn login_dialog_suppresses_injects() {
+        // The regression. The code-paste phase draws NO `❯`, so it does not
+        // even read as idle; the method picker DOES (`❯ Claude account …`),
+        // which is exactly the shape that slipped past every guard. Both must
+        // now suppress.
+        assert!(interactive_prompt_visible(LOGIN_CODE_PANE));
+        assert!(interactive_prompt_visible(LOGIN_MENU_PANE));
+    }
+
+    #[test]
+    fn login_code_prompt_has_no_prompt_line_for_the_insert_probe_to_undo() {
+        // Why `ensure_insert_mode` must skip the probe on this modal rather
+        // than rely on its literal-`i` cleanup: that cleanup diffs
+        // `prompt_line_text`, which keys on `❯`. There is none here, so the
+        // before/after diff can never fire and the `i` stays in the code
+        // field — one per inject, the observed `…iiiiii`.
+        assert_eq!(prompt_line_text(LOGIN_CODE_PANE), None);
+        assert!(!insert_key_landed_literal(None, None));
     }
 
     #[test]

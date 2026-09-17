@@ -501,10 +501,16 @@ expiry_watch_enabled = true
 
 # Drive `self-login` automatically, instead of only alerting.
 #
-# AUTO-FIRE IS INTRUSIVE BY NATURE: /login opens a modal that swallows the
-# session's keystrokes until somebody pastes the authorization code, so the
-# loop stops working until then. self_login_abandon_seconds is what bounds
-# that. Set false to be told about the expiry and handle it yourself.
+# AUTO-FIRE IS INTRUSIVE BY NATURE, AND IT CANNOT FINISH ON ITS OWN. /login
+# opens a modal that swallows the session's keystrokes, and the only thing that
+# closes it is an authorization code that a PERSON has to fetch: open the
+# published URL in a signed-in browser, approve the grant, then run
+# `self-login code <CODE>`. Nothing here can obtain that code. So what this
+# setting buys is the URL arriving before the credentials lapse rather than
+# after — the operator still completes the login, just on their own schedule
+# instead of at 3am. Until they do, the loop is stopped;
+# self_login_abandon_seconds is what bounds that. Set false to be told about
+# the expiry and open the dialog yourself when you are ready to finish it.
 expiry_auto_self_login = true
 
 # Auto-fire only once the warning is down to this many days. Claude Code
