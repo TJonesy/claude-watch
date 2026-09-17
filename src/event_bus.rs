@@ -80,9 +80,15 @@ pub struct ClaudeWatchAlert<'a> {
     /// Discriminator string matching the codebase alert paths:
     ///   `heartbeat-stale`, `prolonged-thinking`, `watcher-down`,
     ///   `fresh-clear-stuck`, `claude-crashed`, `auto-update-failed`,
-    ///   `auto-update-complete`, `reauth-needed`, `wedged-pane`,
-    ///   `permission-prompt`, `permission-prompt-denied`,
+    ///   `auto-update-complete`, `reauth-needed`, `credits-exhausted`,
+    ///   `wedged-pane`, `permission-prompt`, `permission-prompt-denied`,
     ///   `permission-prompt-deny-failed`.
+    ///
+    /// NOTE on `credits-exhausted`: the session is authenticated and healthy —
+    /// it is out of usage credits for the model it is running, so every turn
+    /// fails. It names a session that needs its MODEL changed, and it is also
+    /// how the daemon reports that it changed one itself (demote-only; the
+    /// promotion back after a credit reset is always a human's).
     ///
     /// NOTE on the `permission-prompt*` family: these name a BLOCKED TOOL
     /// CALL, not an unhealthy session. `permission-prompt` says a tool call is
@@ -156,7 +162,14 @@ pub fn build_event_json(alert: &ClaudeWatchAlert<'_>) -> serde_json::Value {
     // forwards data.tier to `event-ack ingest --tier`, so stamping it here
     // routes watcher-down ACTIONABLE. Other alert_types keep their existing
     // (conditional-fatal / ambient) classification.
-    if alert.alert_type == "watcher-down" {
+    //
+    // `credits-exhausted` is stamped for the same reason. It names a loop that
+    // cannot produce a turn, and the demotion flavour of it names a model
+    // change only a human can undo after the credit reset — neither is passive
+    // context. (Its phone notification does not depend on this: the demotion
+    // push is sent directly and verified, precisely so that no routing or
+    // suppression decision downstream can swallow it.)
+    if alert.alert_type == "watcher-down" || alert.alert_type == "credits-exhausted" {
         event["data"]["tier"] = serde_json::Value::from("actionable");
     }
     event
@@ -849,6 +862,24 @@ mod tests {
         // list, not the claude-watch-alert ambient row (incident
         // 2026-08-21).
         assert_eq!(v["data"]["tier"], "actionable");
+    }
+
+    /// A loop that cannot produce a turn, and a model change only a human can
+    /// undo, are not passive context either.
+    #[test]
+    fn build_event_json_stamps_credits_exhausted_actionable() {
+        let alert = ClaudeWatchAlert {
+            alert_type: "credits-exhausted",
+            stuck_reason: "claude code out of usage credits, model demoted",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: Severity::High,
+            message: "demoted the main loop; promote it back after the credit reset",
+        };
+        let v = build_event_json(&alert);
+        assert_eq!(v["data"]["alert_type"], "credits-exhausted");
+        assert_eq!(v["data"]["tier"], "actionable");
+        assert_eq!(v["priority"], "high");
     }
 
     #[test]

@@ -156,7 +156,7 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
 }
 
-fn default_projects_dir() -> PathBuf {
+pub(crate) fn default_projects_dir() -> PathBuf {
     home_dir().join(".claude/projects")
 }
 
@@ -507,6 +507,141 @@ fn latest_context_tokens(tail: &str) -> Option<u64> {
         }
     }
     ctx
+}
+
+/// What the main session's transcript says about usage-credit exhaustion.
+///
+/// The off-screen ground truth for `tmux::detect_credit_exhaustion`, and the
+/// reason that detector's sentence can be acted on at all. Claude Code records
+/// a turn it could NOT produce as a structurally distinct transcript line —
+/// not as conversation content:
+///
+/// ```json
+/// {"type":"assistant","timestamp":"…","message":{"model":"<synthetic>",
+///  "content":[{"type":"text","text":"You're out of usage credits. …"}]},
+///  "apiError":"model_requires_usage_credits","isApiErrorMessage":true,
+///  "apiErrorStatus":429}
+/// ```
+///
+/// `isApiErrorMessage` is the load-bearing field: it exists only on a
+/// turn-failure record. The same sentence typed, pasted, quoted or reasoned
+/// about lands in a normal user/assistant line carrying a real model id and no
+/// such field, so it can never be mistaken for a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditFailures {
+    /// No transcript could be located or read. UNKNOWN, never a negative.
+    Unknown,
+    /// The transcript was read and holds no recent credit-exhaustion turn
+    /// failure. Whatever is on the pane is conversation.
+    None,
+    /// `count` distinct recent turn failures blamed on usage credits.
+    Recent { count: u32 },
+}
+
+impl CreditFailures {
+    /// Stable lowercase label for logs and JSONL events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CreditFailures::Unknown => "unknown",
+            CreditFailures::None => "none",
+            CreditFailures::Recent { .. } => "recent",
+        }
+    }
+
+    /// How many recent failures were counted (0 for `None` and `Unknown` —
+    /// which are NOT the same thing, and callers must not treat them alike).
+    pub fn count(self) -> u32 {
+        match self {
+            CreditFailures::Recent { count } => count,
+            _ => 0,
+        }
+    }
+}
+
+/// The transcript field Claude Code sets on a turn it failed to produce
+/// because the account is out of usage credits.
+const CREDIT_API_ERROR: &str = "model_requires_usage_credits";
+
+/// Count distinct recent usage-credit turn failures in a transcript tail.
+///
+/// Pure: no I/O, no clock. `now_epoch` and `window_secs` bound how far back a
+/// failure still counts, which is what keeps an OLD, already-handled
+/// exhaustion (its records still sitting in the tail) from re-triggering.
+///
+/// Dedups on `uuid`, because the counting rule is "how many turns failed",
+/// not "how many lines mention it".
+pub fn parse_credit_failures(tail: &str, now_epoch: i64, window_secs: i64) -> CreditFailures {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in tail.lines() {
+        // Cheap structural pre-filter. Safe here (unlike on a wrapped pane):
+        // this is a JSONL line, so the field name is never split.
+        if !line.contains("\"isApiErrorMessage\"") {
+            continue;
+        }
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if obj.get("isApiErrorMessage").and_then(|v| v.as_bool()) != Some(true) {
+            continue;
+        }
+        // Two ways to recognise the credit flavour of a turn failure: the
+        // exact `apiError` code, or the rendered sentence on a line that is
+        // ALREADY established as a turn failure. The second prong survives a
+        // rename of the code without loosening anything — it still requires
+        // `isApiErrorMessage`, which conversation text never has.
+        let by_code = obj.get("apiError").and_then(|v| v.as_str()) == Some(CREDIT_API_ERROR);
+        let by_text = line.to_lowercase().contains("out of usage credits");
+        if !by_code && !by_text {
+            continue;
+        }
+        let Some(ts) = obj.get("timestamp").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(when) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        let age = now_epoch - when.timestamp();
+        // Negative age = a clock skew between the writer and us, not evidence
+        // of anything; treat it as in-window rather than discarding it.
+        if age > window_secs {
+            continue;
+        }
+        let id = obj
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or(ts)
+            .to_string();
+        seen.insert(id);
+    }
+    match u32::try_from(seen.len()).unwrap_or(u32::MAX) {
+        0 => CreditFailures::None,
+        count => CreditFailures::Recent { count },
+    }
+}
+
+/// Recent usage-credit turn failures in the ACTIVE main session's transcript.
+///
+/// `Unknown` on any I/O failure — an unreadable transcript is not evidence
+/// that the session is healthy. The projects dir is injected (rather than
+/// defaulted here) so a deployment can point `transcripts_dir` elsewhere and
+/// so tests can point at a tempdir; `policy::transcripts_dir` supplies
+/// `default_projects_dir()` when the config leaves it empty.
+pub fn recent_credit_failures_at(
+    projects_dir: &Path,
+    now_epoch: i64,
+    window_secs: i64,
+) -> CreditFailures {
+    let Some(path) = find_main_transcript(projects_dir) else {
+        return CreditFailures::Unknown;
+    };
+    // The same tail window the context reader uses. A wedged loop writes one
+    // small line per failed turn and nothing else, so the failures are always
+    // at the very end of the file.
+    let Some(tail) = read_tail(&path, MAIN_TAIL_BYTES) else {
+        return CreditFailures::Unknown;
+    };
+    parse_credit_failures(&tail, now_epoch, window_secs)
 }
 
 /// Current context-window size of the active main session, read directly
@@ -934,5 +1069,182 @@ mod tests {
         let tail = read_tail(&path, MAIN_TAIL_BYTES).expect("tail read should succeed");
         assert!(tail.contains("msg_tail"), "the real usage line must survive truncation");
         assert_eq!(latest_context_tokens(&tail), Some(77));
+    }
+
+    // ---- Usage-credit turn failures (the demote path's corroboration) ----
+
+    /// Reference clock for the credit tests: 2026-09-17T21:20:00Z, a couple of
+    /// minutes after the real incident's failures.
+    const CREDIT_NOW: i64 = 1_789_680_000;
+    const CREDIT_WINDOW: i64 = 900;
+
+    /// A turn-failure record, copied field-for-field from the shape Claude
+    /// Code actually wrote during the incident.
+    fn failure_line(ts: &str, uuid: &str) -> String {
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"{uuid}","timestamp":"{ts}","message":{{"id":"m","model":"<synthetic>","role":"assistant","type":"message","content":[{{"type":"text","text":"You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models."}}]}},"apiError":"model_requires_usage_credits","error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}}"#
+        )
+    }
+
+    /// A normal conversation line that MENTIONS the sentence — what a session
+    /// reading this file, or the PR that added it, has in its transcript.
+    fn conversation_line(ts: &str, uuid: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"text","text":"the pane said: You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models."}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn two_recent_turn_failures_are_counted() {
+        let tail = format!(
+            "{}\n{}\n",
+            failure_line("2026-09-17T21:14:47.276Z", "u1"),
+            failure_line("2026-09-17T21:15:06.213Z", "u2"),
+        );
+        assert_eq!(
+            parse_credit_failures(&tail, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Recent { count: 2 }
+        );
+    }
+
+    /// THE false positive. The sentence in conversation content carries no
+    /// `isApiErrorMessage`, so it can never be mistaken for a failed turn —
+    /// and `None` is emphatically not `Unknown`.
+    #[test]
+    fn conversation_text_about_credits_is_not_a_failure() {
+        let tail = format!(
+            "{}\n{}\n",
+            conversation_line("2026-09-17T21:19:00.000Z", "c1"),
+            conversation_line("2026-09-17T21:19:30.000Z", "c2"),
+        );
+        assert_eq!(
+            parse_credit_failures(&tail, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::None
+        );
+    }
+
+    /// An exhaustion that was already handled leaves its records behind in the
+    /// tail. Out of the window, they must not count — this is what stops a
+    /// second demotion firing off yesterday's incident.
+    #[test]
+    fn stale_turn_failures_fall_out_of_the_window() {
+        let tail = format!(
+            "{}\n{}\n",
+            failure_line("2026-09-17T18:00:00.000Z", "old1"),
+            failure_line("2026-09-17T18:00:30.000Z", "old2"),
+        );
+        assert_eq!(
+            parse_credit_failures(&tail, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::None
+        );
+    }
+
+    /// The same record written twice (Claude Code does emit duplicate lines)
+    /// is ONE failed turn, not two. The count feeds a repeat requirement, so
+    /// double-counting would defeat it.
+    #[test]
+    fn duplicate_records_count_once() {
+        let one = failure_line("2026-09-17T21:15:06.213Z", "u1");
+        let tail = format!("{one}\n{one}\n");
+        assert_eq!(
+            parse_credit_failures(&tail, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Recent { count: 1 }
+        );
+    }
+
+    /// A turn failure whose `apiError` code is renamed upstream is still
+    /// recognised by its rendered text — but only because the line is already
+    /// established as a turn failure by `isApiErrorMessage`.
+    #[test]
+    fn a_renamed_error_code_is_still_recognised_by_its_text() {
+        let renamed = r#"{"type":"assistant","uuid":"r1","timestamp":"2026-09-17T21:15:06.213Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models."}]},"apiError":"something_else_entirely","isApiErrorMessage":true,"apiErrorStatus":429}"#;
+        assert_eq!(
+            parse_credit_failures(renamed, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Recent { count: 1 }
+        );
+    }
+
+    /// A DIFFERENT api error (a plain overload, say) is not a credit failure.
+    #[test]
+    fn an_unrelated_api_error_is_not_a_credit_failure() {
+        let other = r#"{"type":"assistant","uuid":"o1","timestamp":"2026-09-17T21:15:06.213Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 overloaded_error"}]},"apiError":"overloaded","isApiErrorMessage":true,"apiErrorStatus":529}"#;
+        assert_eq!(
+            parse_credit_failures(other, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::None
+        );
+    }
+
+    /// A missing projects tree is UNKNOWN, never a negative — the caller must
+    /// be able to tell "healthy" from "could not look".
+    #[test]
+    fn a_missing_transcript_tree_is_unknown_not_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            recent_credit_failures_at(&tmp.path().join("nope"), CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Unknown
+        );
+        // An empty (but readable) tree has no transcript to read either.
+        let empty = tmp.path().join("projects");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            recent_credit_failures_at(&empty, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Unknown
+        );
+    }
+
+    #[test]
+    fn recent_credit_failures_at_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-home-x");
+        std::fs::create_dir_all(&slug).unwrap();
+        let tail = format!(
+            "{}\n{}\n{}\n",
+            conversation_line("2026-09-17T21:13:00.000Z", "c1"),
+            failure_line("2026-09-17T21:14:47.276Z", "u1"),
+            failure_line("2026-09-17T21:15:06.213Z", "u2"),
+        );
+        std::fs::write(slug.join("uuid-1.jsonl"), tail).unwrap();
+        assert_eq!(
+            recent_credit_failures_at(&projects, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Recent { count: 2 }
+        );
+    }
+
+    /// A wedged loop writes one small line per failed turn and nothing else,
+    /// so the failures are always at the very END of the file — which is
+    /// exactly what the tail window can see.
+    #[test]
+    fn failures_at_the_end_of_a_huge_transcript_are_still_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-home-x");
+        std::fs::create_dir_all(&slug).unwrap();
+        let filler = "x".repeat(1024);
+        let mut content = String::new();
+        for _ in 0..400 {
+            content.push_str(&filler);
+            content.push('\n');
+        }
+        content.push_str(&failure_line("2026-09-17T21:14:47.276Z", "u1"));
+        content.push('\n');
+        content.push_str(&failure_line("2026-09-17T21:15:06.213Z", "u2"));
+        content.push('\n');
+        assert!(content.len() as u64 > MAIN_TAIL_BYTES, "must exceed the tail window");
+        std::fs::write(slug.join("uuid-1.jsonl"), content).unwrap();
+        assert_eq!(
+            recent_credit_failures_at(&projects, CREDIT_NOW, CREDIT_WINDOW),
+            CreditFailures::Recent { count: 2 }
+        );
+    }
+
+    #[test]
+    fn credit_failure_labels_distinguish_none_from_unknown() {
+        assert_eq!(CreditFailures::Unknown.as_str(), "unknown");
+        assert_eq!(CreditFailures::None.as_str(), "none");
+        assert_eq!(CreditFailures::Recent { count: 3 }.as_str(), "recent");
+        assert_eq!(CreditFailures::Unknown.count(), 0);
+        assert_eq!(CreditFailures::None.count(), 0);
+        assert_eq!(CreditFailures::Recent { count: 3 }.count(), 3);
     }
 }

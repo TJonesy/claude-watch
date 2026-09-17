@@ -345,6 +345,43 @@ pub struct State {
     /// Cumulative count of auto-fired `self-login` runs (for metrics).
     #[serde(default)]
     pub self_login_autofire_total: u64,
+    // Usage-credit exhaustion tracking (auto-demote). Sibling of the reauth
+    // fields above: same latch / budget / spacing shape, different failure.
+    //
+    // NOTE, and it is the point of the whole path: there is deliberately NO
+    // field here recording which model was in use before a demotion. The
+    // daemon must never be able to promote the loop back onto the model that
+    // ran out — that would re-wedge it — so the information needed to do so
+    // is not kept anywhere. The weekly credit reset is the operator's cue,
+    // not the daemon's.
+    /// Latched while Claude Code's usage-credit exhaustion message is standing
+    /// on the pane. Used to log the first sighting and the resolution once
+    /// each; the decision to act is re-made against the transcript every cycle.
+    #[serde(default)]
+    pub credit_exhaustion_detected: bool,
+    /// Last time the exhaustion was alerted on (rate limiting).
+    #[serde(default)]
+    pub last_credit_exhaustion_alert: Option<String>,
+    /// Last time a `/model` demotion was injected (retry spacing).
+    #[serde(default)]
+    pub last_credit_demote_attempt: Option<String>,
+    /// Demotion attempts spent in the CURRENT exhaustion window. Reset when
+    /// the exhaustion stops being observed — never on a timer.
+    #[serde(default)]
+    pub credit_demote_attempts_this_window: u32,
+    /// When the last `/model` demotion was injected, held until it has had
+    /// `settle_seconds` to take effect. `/model` can open a picker, and a
+    /// second injection while that picker is up types into it.
+    #[serde(default)]
+    pub credit_demote_injected_at: Option<String>,
+    /// The model the loop was last demoted TO (the configured target at the
+    /// time). A record for the operator, never a restore point — see the note
+    /// above.
+    #[serde(default)]
+    pub credit_demoted_to: Option<String>,
+    /// Cumulative count of `/model` demotion injections (for metrics).
+    #[serde(default)]
+    pub credit_demote_interrupts_total: u64,
     /// Last observed `refreshTokenExpiresAt`. Watched for MOVEMENT, not
     /// position: a value that jumps forward is the credentials being renewed,
     /// which is the one unambiguous "this is resolved" signal available. It

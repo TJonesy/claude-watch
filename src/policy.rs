@@ -3511,6 +3511,593 @@ async fn check_reauth_banner(config: &Config, state: &mut State, pane: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage-credit exhaustion -> one-way model demotion
+// ---------------------------------------------------------------------------
+
+/// What the usage-credit path decided to do this cycle.
+///
+/// There is no `Promote` variant, and there never will be. See
+/// `decide_credit_action`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CreditAction {
+    /// The transcript holds no recent credit-exhaustion turn failure, so the
+    /// message on the pane is conversation text. Stay silent.
+    Ignore,
+    /// Corroborated, but the failure has not REPEATED yet. Say nothing and
+    /// look again next cycle — one failed turn can be a transient 429.
+    Wait { failures: u32 },
+    /// Say so, but do not touch the session. `reason` names which brake held.
+    AlertOnly {
+        corroborated: bool,
+        reason: &'static str,
+    },
+    /// Inject `/model <target_model>`.
+    Demote { failures: u32 },
+}
+
+/// Evidence available to the usage-credit decision on one cycle. The pane
+/// message is a precondition (this is only evaluated when it is on the pane).
+pub(crate) struct CreditEvidence {
+    /// What the main session's transcript says — the off-screen ground truth.
+    pub failures: crate::token_usage::CreditFailures,
+    /// How many failures must be on record before acting (`min_failures`).
+    pub min_failures: u32,
+    /// `auto_demote`.
+    pub auto_enabled: bool,
+    /// The configured target looks like the model that just ran out, so
+    /// switching to it would achieve nothing.
+    pub target_is_exhausted_model: bool,
+    /// Seconds since the last demotion attempt, if there was one.
+    pub since_last_attempt: Option<f64>,
+    /// Minimum spacing between attempts.
+    pub retry_seconds: u64,
+    /// Attempts already spent in this exhaustion window.
+    pub attempts: u32,
+    /// Attempt ceiling for one window.
+    pub max_attempts: u32,
+    /// Something else already owns the pane's input: a login dialog the
+    /// reauth path opened, or a login screen / 401 banner it is working on.
+    pub dialog_pending: bool,
+    /// A `/model` this path injected has not had time to take effect yet.
+    pub inject_settling: bool,
+}
+
+/// Decide what the usage-credit path should do, given this cycle's evidence.
+/// Pure, for the same reason `decide_banner_action` is.
+///
+/// **The corroboration.** The pane message is one sentence on a live TUI, and
+/// that sentence is on the pane of any session reading this file, its tests,
+/// or the diff that added them — the identical false positive the login
+/// detectors exist to survive. Where those corroborate against the credential
+/// store, this corroborates against the main session's JSONL transcript, which
+/// records a turn Claude Code could NOT produce as a structurally distinct
+/// line (`isApiErrorMessage: true`, `apiError: model_requires_usage_credits`)
+/// rather than as conversation content. So:
+///
+///   * message + recent failures on record, repeated -> demote. The incident.
+///   * message + ONE recent failure               -> wait. A single 429 is not
+///     yet an exhaustion, and the next cycle costs ten seconds.
+///   * message + no recent failure                -> IGNORE. Conversation.
+///   * message + transcript unreadable            -> alert, uncorroborated.
+///     UNKNOWN is never a negative, but it is also not enough to retype a
+///     running session's model on.
+///
+/// **What the corroboration cannot rule out.** It proves that turns really are
+/// failing on usage credits; it does not prove the pane belongs to the same
+/// session as the transcript (`find_main_transcript` picks the most recently
+/// written top-level transcript, which is cw's one-active-main-session
+/// topology, not a verified identity). A host running two main loops at once
+/// could therefore corroborate pane A with session B's failures. Both would be
+/// out of credits on the same account in practice, but it is not proven.
+///
+/// **Demote-only, by construction.** No branch of this function, and no caller
+/// of it, can move the loop back UP. The injected command is always
+/// `/model <target_model>` from config; the pre-demotion model is never
+/// recorded anywhere (see `state::State`), so there is nothing to restore.
+/// Flapping back onto the exhausted model would simply re-wedge the loop, and
+/// the weekly credit reset is the operator's cue, not the daemon's. Closing
+/// the exhaustion window resets the attempt BUDGET and nothing else.
+pub(crate) fn decide_credit_action(ev: &CreditEvidence) -> CreditAction {
+    use crate::token_usage::CreditFailures;
+
+    let failures = match ev.failures {
+        // The transcript says no turn actually failed. Conversation text.
+        CreditFailures::None => return CreditAction::Ignore,
+        CreditFailures::Unknown => {
+            return CreditAction::AlertOnly {
+                corroborated: false,
+                reason: "transcript unreadable",
+            }
+        }
+        CreditFailures::Recent { count } => count,
+    };
+
+    // A repeat requirement, not a threshold on severity: `min_failures` is
+    // floored at 1 so a config of 0 cannot turn this into "fire on sight".
+    if failures < ev.min_failures.max(1) {
+        return CreditAction::Wait { failures };
+    }
+
+    let held = |reason: &'static str| CreditAction::AlertOnly {
+        corroborated: true,
+        reason,
+    };
+    // Demoting to the model that just ran out is a no-op that still costs an
+    // interrupt. The check is a loose name match and can only ever SUPPRESS
+    // the action, which is the safe direction for a heuristic.
+    if ev.target_is_exhausted_model {
+        return held("target model is the one that ran out");
+    }
+    if !ev.auto_enabled {
+        return held("auto-demote disabled");
+    }
+    // Typing `/model …` into a login modal the reauth path opened would
+    // cancel that flow and lose the keystrokes.
+    if ev.dialog_pending {
+        return held("another dialog owns the pane");
+    }
+    // `/model` can open a picker; a second one types into the first.
+    if ev.inject_settling {
+        return held("previous /model inject still settling");
+    }
+    if ev.attempts >= ev.max_attempts {
+        return held("attempt budget exhausted");
+    }
+    if let Some(elapsed) = ev.since_last_attempt {
+        if elapsed < ev.retry_seconds as f64 {
+            return held("retry spacing");
+        }
+    }
+    CreditAction::Demote { failures }
+}
+
+/// Does this outcome notify the operator on THIS cycle?
+///
+/// The distinction is the whole reason this is a function rather than an `if`
+/// at each site. The standing "still out of credits" alerts repeat for as long
+/// as the condition lasts, so they are rate-limited by
+/// `alert_interval_seconds`. **A demotion is not one of those.** It happens
+/// once, it changes which model the loop runs on, and the only remedy — a
+/// human promoting it back after the weekly credit reset — is gated entirely
+/// on them knowing about it. Putting it in the same cooldown bucket as the
+/// chatty alerts is precisely how such a notification gets coalesced away, so
+/// it is unconditional here and its push is sent through
+/// `alert::send_push_verified`, which consults no gate and reads the exit
+/// status.
+pub(crate) fn credit_should_notify(action: &CreditAction, cooldown_elapsed: bool) -> bool {
+    match action {
+        // Never gated. Not by a cooldown, not by an alert counter.
+        CreditAction::Demote { .. } => true,
+        CreditAction::AlertOnly { .. } => cooldown_elapsed,
+        // Nothing happened worth a phone buzz.
+        CreditAction::Ignore | CreditAction::Wait { .. } => false,
+    }
+}
+
+/// The push body the operator reads on a lock screen.
+///
+/// Pure so the wording is pinned by a test: it has to carry the three things
+/// needed to act — which model ran out, which one the loop is on now, and that
+/// restoring is a manual step because the daemon never promotes.
+pub(crate) fn demote_push_body(from_model: Option<&str>, target: &str) -> String {
+    let from = from_model.unwrap_or("its model");
+    format!(
+        "claude-watch demoted the main loop: {from} out of usage credits -> {target}. \
+         Restore manually after the weekly reset (never automatic)."
+    )
+}
+
+/// The ONLY model change this path can produce.
+///
+/// One function, one direction: the target comes from config and nothing in
+/// the codebase builds a `/model` command out of anything else. There is no
+/// counterpart that moves the loop back up.
+pub(crate) fn demote_command(target_model: &str) -> String {
+    format!("/model {}", target_model.trim())
+}
+
+/// Does the model the pane says ran out look like `target`?
+///
+/// Deliberately loose: the pane prints a display name (`Fable 5`, squashed to
+/// `fable5` by the detector) while the config carries a model id
+/// (`claude-opus-5[1m]`). Compare on alphanumerics only and accept containment
+/// either way. A false MATCH suppresses a demotion (safe, and says why in the
+/// alert); a false MISS lets one no-op `/model` through, bounded by the
+/// attempt budget.
+pub(crate) fn model_ids_match(a: &str, b: &str) -> bool {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    };
+    let (a, b) = (norm(a), norm(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a.contains(&b) || b.contains(&a)
+}
+
+/// Where this deployment's Claude Code transcripts live.
+fn transcripts_dir(config: &Config) -> std::path::PathBuf {
+    if config.credit_exhaustion.transcripts_dir.is_empty() {
+        crate::token_usage::default_projects_dir()
+    } else {
+        std::path::PathBuf::from(&config.credit_exhaustion.transcripts_dir)
+    }
+}
+
+/// Detect a main loop that has run out of usage credits for its model, and
+/// demote it instead of leaving it wedged.
+///
+/// The failure this exists for, observed in production: the account's credits
+/// for the running model ran out about an hour before the weekly reset. The
+/// TUI stayed up, the credentials stayed valid, the process stayed healthy —
+/// and every single turn from then on, including every injected notification
+/// and the daemon's own watcher-down nudge, was answered with
+///
+/// ```text
+/// You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.
+/// ```
+///
+/// Events went unconsumed for twenty minutes and the ack-staleness alert fired
+/// critical, while every existing detector reported a healthy session: nothing
+/// was dead, nothing was rate-limited in a way `/clear` could shed, nothing was
+/// unauthenticated. A human eventually typed `/model` by hand.
+///
+/// Structured as the reactive 401 path's sibling — pane text, corroborated
+/// off-screen, one bounded injection, an alert either way — and it is
+/// **demote-only**: see `decide_credit_action`.
+async fn check_credit_exhaustion(config: &Config, state: &mut State, pane: &str) {
+    let banner = tmux::credit_exhaustion_banner(pane).await;
+
+    let Some(banner) = banner else {
+        close_credit_window(config, state, pane, "message off the pane");
+        return;
+    };
+
+    let now_epoch = Utc::now().timestamp();
+    let failures = crate::token_usage::recent_credit_failures_at(
+        &transcripts_dir(config),
+        now_epoch,
+        config.credit_exhaustion.recent_window_seconds,
+    );
+
+    let target = config.credit_exhaustion.target_model.clone();
+    let settling = state
+        .credit_demote_injected_at
+        .as_deref()
+        .and_then(elapsed_since)
+        .map(|e| e < config.credit_exhaustion.settle_seconds as f64)
+        .unwrap_or(false);
+
+    let action = decide_credit_action(&CreditEvidence {
+        failures,
+        min_failures: config.credit_exhaustion.min_failures,
+        auto_enabled: config.credit_exhaustion.auto_demote,
+        target_is_exhausted_model: banner
+            .exhausted_model
+            .as_deref()
+            .map(|m| model_ids_match(m, &target))
+            .unwrap_or(false),
+        since_last_attempt: state
+            .last_credit_demote_attempt
+            .as_deref()
+            .and_then(elapsed_since),
+        retry_seconds: config.credit_exhaustion.retry_seconds,
+        attempts: state.credit_demote_attempts_this_window,
+        max_attempts: config.credit_exhaustion.max_attempts,
+        // The reauth path's dialog latch AND its two live states: any of them
+        // means somebody else may be driving this pane's input, and `/model …`
+        // typed into a login modal cancels that flow. `reauth_banner_detected`
+        // latches on banner TEXT (the reauth path corroborates separately), so
+        // a pane that merely quotes a 401 can suppress a demotion. That is the
+        // safe direction for an over-broad check, and the alert names it.
+        dialog_pending: state.self_login_dialog_opened_at.is_some()
+            || state.reauth_detected
+            || state.reauth_banner_detected,
+        inject_settling: settling,
+    });
+
+    if !state.credit_exhaustion_detected {
+        // First sighting: log it ONCE with everything the next incident's
+        // diagnosis needs. The decision is re-made every cycle (a brake can
+        // release, a failure can land), so later cycles log only when they act.
+        info!(
+            transcript = failures.as_str(),
+            recent_failures = failures.count(),
+            exhausted_model = ?banner.exhausted_model,
+            decision = ?action,
+            "usage-credit exhaustion message on pane: first detection"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "credit_exhaustion_detected",
+            serde_json::json!({
+                "pane": pane,
+                "transcript": failures.as_str(),
+                "recent_failures": failures.count(),
+                "exhausted_model": banner.exhausted_model,
+                "target_model": target,
+                "action": match &action {
+                    CreditAction::Ignore => "ignore",
+                    CreditAction::Wait { .. } => "wait",
+                    CreditAction::AlertOnly { .. } => "alert_only",
+                    CreditAction::Demote { .. } => "demote",
+                },
+                "reason": match &action {
+                    CreditAction::AlertOnly { reason, .. } => *reason,
+                    CreditAction::Ignore => "no recent credit failure in the transcript",
+                    CreditAction::Wait { .. } => "waiting for the failure to repeat",
+                    CreditAction::Demote { .. } => "credit failures repeated on record",
+                },
+            }),
+        );
+        state.credit_exhaustion_detected = true;
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    // Has the standing-alert cooldown elapsed? Computed once, and consulted
+    // ONLY through `credit_should_notify` — which ignores it for a demotion.
+    let cooldown_elapsed = match &state.last_credit_exhaustion_alert {
+        Some(last) => elapsed_since(last)
+            .map(|e| e >= config.credit_exhaustion.alert_interval_seconds as f64)
+            .unwrap_or(true),
+        None => true,
+    };
+    let notify_now = credit_should_notify(&action, cooldown_elapsed);
+
+    match action {
+        CreditAction::Ignore => {
+            debug!(
+                "usage-credit message on pane but no recent turn failure on record; \
+                 conversation text"
+            );
+            // The corroboration going quiet is the REAL resolution signal, and
+            // it matters more than the pane text going away. The message can
+            // linger in the visible capture of an idle session long after the
+            // demotion worked; if only the pane closed the window, a spent
+            // attempt budget would still be spent days later when the NEXT
+            // exhaustion arrives, and the path would refuse to act on it.
+            close_credit_window(config, state, pane, "no recent credit failure on record");
+        }
+        CreditAction::Wait { failures } => {
+            debug!(
+                failures,
+                "usage-credit turn failure on record but not repeated yet; waiting"
+            );
+        }
+        CreditAction::Demote { failures } => {
+            fire_model_demote(config, state, pane, &target, failures, &banner, notify_now).await;
+        }
+        CreditAction::AlertOnly { corroborated, reason } => {
+            let should_alert = notify_now;
+            if !should_alert {
+                debug!(reason, "usage-credit exhaustion standing, alert cooldown active");
+                return;
+            }
+            let qualifier = if corroborated {
+                ""
+            } else {
+                " (seen on the pane only — the session transcript was not readable)"
+            };
+            let tail = if config.credit_exhaustion.auto_demote {
+                format!(" Auto-demote did not fire: {reason}.")
+            } else {
+                format!(" Auto-demote is disabled; run `/model {target}` in the session.")
+            };
+            warn!(reason, "main loop is out of usage credits; alerting");
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "credits-exhausted",
+                stuck_reason: "claude code out of usage credits for the running model",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!(
+                    "Main loop is out of usage credits for its model{qualifier} — \
+                     every turn fails until it is switched.{tail}"
+                ),
+            })
+            .await;
+            write_jsonl_log(
+                &config.general.log_file,
+                "credit_exhaustion_alert",
+                serde_json::json!({
+                    "pane": pane,
+                    "corroborated": corroborated,
+                    "reason": reason,
+                }),
+            );
+            write_legacy_log(
+                &config.general.legacy_log_file,
+                &format!("Out of usage credits: sent high-priority alert ({reason})"),
+            );
+            state.last_credit_exhaustion_alert = Some(Local::now().to_rfc3339());
+            crate::state::save_state(&config.general.state_file, state);
+        }
+    }
+}
+
+/// Close the exhaustion window: drop the latch and hand the next exhaustion a
+/// full attempt budget.
+///
+/// This resets a BUDGET. It does not, and cannot, move the loop back onto the
+/// model that ran out — the only thing a fresh budget buys is the right to
+/// demote AGAIN, later, if the credits run out again.
+fn close_credit_window(config: &Config, state: &mut State, pane: &str, why: &str) {
+    if !state.credit_exhaustion_detected {
+        return;
+    }
+    info!(why, "usage-credit exhaustion window closed");
+    write_jsonl_log(
+        &config.general.log_file,
+        "credit_exhaustion_resolved",
+        serde_json::json!({
+            "pane": pane,
+            "why": why,
+            "demoted_to": state.credit_demoted_to,
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        &format!("Usage credits: exhaustion window closed ({why})"),
+    );
+    state.credit_exhaustion_detected = false;
+    state.last_credit_exhaustion_alert = None;
+    state.credit_demote_attempts_this_window = 0;
+    state.last_credit_demote_attempt = None;
+    state.credit_demote_injected_at = None;
+    crate::state::save_state(&config.general.state_file, state);
+}
+
+/// Inject the one-way `/model` demotion and tell the operator it happened.
+///
+/// Books the attempt BEFORE injecting, for the reason `fire_self_login` does:
+/// an unbooked attempt re-fires on the next cycle and every cycle after it.
+async fn fire_model_demote(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    target: &str,
+    failures: u32,
+    banner: &tmux::CreditBanner,
+    notify_now: bool,
+) {
+    let now = Local::now().to_rfc3339();
+    state.last_credit_demote_attempt = Some(now.clone());
+    state.credit_demote_injected_at = Some(now);
+    state.credit_demote_attempts_this_window =
+        state.credit_demote_attempts_this_window.saturating_add(1);
+    state.credit_demote_interrupts_total = state.credit_demote_interrupts_total.saturating_add(1);
+    state.credit_demoted_to = Some(target.to_string());
+    let attempt = state.credit_demote_attempts_this_window;
+    crate::state::save_state(&config.general.state_file, state);
+
+    let command = demote_command(target);
+    warn!(
+        target,
+        attempt,
+        failures,
+        exhausted_model = ?banner.exhausted_model,
+        "out of usage credits: demoting the main loop's model"
+    );
+    inject_dispatch::inject_to_agent(pane, &command).await;
+    write_jsonl_log(
+        &config.general.log_file,
+        "credit_demote_injected",
+        serde_json::json!({
+            "pane": pane,
+            "command": command,
+            "target_model": target,
+            "exhausted_model": banner.exhausted_model,
+            "recent_failures": failures,
+            "attempt": attempt,
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        &format!(
+            "Out of usage credits: injected `{command}` (attempt {attempt}, \
+             {failures} failed turns on record)"
+        ),
+    );
+
+    // --- Tell the operator, on a channel that cannot be coalesced away ---
+    //
+    // A demotion happens once and never repeats, and the ONE thing only a
+    // human can do about it — promote back after the weekly credit reset — is
+    // gated on them knowing it happened. So the push is a step of the action,
+    // not a sink hanging off it:
+    //
+    //  * it goes through `send_push_verified`, which reads the notify
+    //    command's exit status instead of discarding it and captures any
+    //    receipt the tool prints, so "we ran a command" is never mistaken for
+    //    "the operator was told";
+    //  * it consults NO cooldown and no alert-suppression counter. The
+    //    `alert_interval_seconds` cooldown that rate-limits the standing
+    //    "still exhausted" alerts deliberately does not apply here — sharing
+    //    a bucket with chatty alerts is exactly how a rare, high-value
+    //    notification gets swallowed;
+    //  * the structured claude-event is emitted separately and AFTER, as the
+    //    machine-readable record. A downstream consumer that filters or
+    //    suppresses that event cannot take the push down with it.
+    //
+    // Body kept short enough to read on a lock screen, and it names the three
+    // things needed to act: from, to, and that restoring is manual.
+    let from = banner.exhausted_model.as_deref().unwrap_or("its model");
+    let push_body = demote_push_body(banner.exhausted_model.as_deref(), target);
+    // `notify_now` is `credit_should_notify(Demote, _)`, which is TRUE for
+    // every cooldown state — the demotion push is not gated, and
+    // `credit_should_notify`'s tests pin that. Threaded through rather than
+    // recomputed so there is exactly one place the question is answered.
+    let push = if notify_now {
+        alert::send_push_verified(&push_body, "high").await
+    } else {
+        warn!("demotion push suppressed by the notification gate; this should be unreachable");
+        alert::PushResult {
+            attempted: false,
+            delivered: false,
+            receipt: None,
+            detail: "suppressed by the notification gate".to_string(),
+        }
+    };
+    if push.delivered {
+        info!(
+            receipt = ?push.receipt,
+            "demotion push notification delivered"
+        );
+    } else {
+        // FAIL LOUD. A demotion the operator was never told about is a loop
+        // silently running a different model than they think it is.
+        warn!(
+            status = push.as_str(),
+            detail = %push.detail,
+            "demotion push notification did NOT go out"
+        );
+        write_legacy_log(
+            &config.general.legacy_log_file,
+            &format!(
+                "Out of usage credits: demotion push notification {} ({})",
+                push.as_str(),
+                push.detail
+            ),
+        );
+    }
+    write_jsonl_log(
+        &config.general.log_file,
+        "credit_demote_push",
+        serde_json::json!({
+            "status": push.as_str(),
+            "attempted": push.attempted,
+            "delivered": push.delivered,
+            "receipt": push.receipt,
+            "detail": push.detail,
+            "from_model": banner.exhausted_model,
+            "to_model": target,
+            "body": push_body,
+        }),
+    );
+
+    // The structured record, on the event channel every other alert uses.
+    // `emit_event` rather than `notify` on purpose: `notify` would send a
+    // SECOND push for the same demotion.
+    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "credits-exhausted",
+        stuck_reason: "claude code out of usage credits, model demoted",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: &format!(
+            "Main loop was out of usage credits ({from}) after {failures} failed turns; \
+             injected `{command}` to keep it running. claude-watch will NOT switch back — \
+             promote it yourself once credits reset."
+        ),
+    });
+    state.last_credit_exhaustion_alert = Some(Local::now().to_rfc3339());
+    crate::state::save_state(&config.general.state_file, state);
+}
+
 /// What the proactive expiry check decided to do this cycle.
 ///
 /// Split out as a pure function so the whole decision — the corroboration
@@ -6538,6 +7125,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         check_login_expiry(config, state, &effective_pane).await;
     }
 
+    // --- Usage-credit exhaustion -> one-way model demotion ---
+    //
+    // Runs after the reauth checks, not inside them: the credentials are
+    // FINE in this failure. The TUI is up, the process is healthy, and the
+    // session still cannot produce a turn, which is why every detector above
+    // reports a healthy session while events pile up unconsumed. Ordering
+    // matters only in that the reauth checks have already set the latches this
+    // one treats as "another dialog owns the pane".
+    if config.credit_exhaustion.enabled && !effective_pane.is_empty() {
+        check_credit_exhaustion(config, state, &effective_pane).await;
+    }
+
     // --- Post-clear resume detection ---
     //
     // Covers the blind spot BELOW the fresh-/clear token window. A pane that
@@ -9025,6 +9624,390 @@ mod tests {
             Some(2)
         );
         assert_eq!(SelfLoginTrigger::Banner401.days_left(), None);
+    }
+
+    // ---- Usage-credit exhaustion -> one-way model demotion ----
+
+    use crate::token_usage::CreditFailures;
+
+    /// The incident shape: the message is on the pane and the transcript holds
+    /// two recent turn failures blamed on usage credits.
+    fn credit_evidence() -> CreditEvidence {
+        CreditEvidence {
+            failures: CreditFailures::Recent { count: 2 },
+            min_failures: 2,
+            auto_enabled: true,
+            target_is_exhausted_model: false,
+            since_last_attempt: None,
+            retry_seconds: 300,
+            attempts: 0,
+            max_attempts: 2,
+            dialog_pending: false,
+            inject_settling: false,
+        }
+    }
+
+    /// THE incident: repeated, corroborated credit failures -> demote.
+    #[test]
+    fn repeated_credit_failures_demote_the_model() {
+        assert_eq!(
+            decide_credit_action(&credit_evidence()),
+            CreditAction::Demote { failures: 2 }
+        );
+    }
+
+    /// THE false-positive guard, and the reason the pane detector alone is not
+    /// trusted. The sentence is on the pane of any session reading this file,
+    /// its tests, or the diff that introduced them — including the one that
+    /// wrote this feature. The transcript says no turn actually failed, so the
+    /// message is conversation: silence, not an alert.
+    #[test]
+    fn credit_message_with_no_transcript_failure_is_ignored_outright() {
+        let ev = CreditEvidence {
+            failures: CreditFailures::None,
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Ignore);
+        // ...even with every brake released and auto on.
+        let ev = CreditEvidence {
+            failures: CreditFailures::None,
+            since_last_attempt: Some(99999.0),
+            attempts: 0,
+            min_failures: 1,
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Ignore);
+    }
+
+    /// The repeat requirement: one failed turn can be a transient 429 the next
+    /// attempt sails through. Wait — do not demote, and do not page either.
+    #[test]
+    fn a_single_credit_failure_waits_for_the_repeat() {
+        let ev = CreditEvidence {
+            failures: CreditFailures::Recent { count: 1 },
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Wait { failures: 1 });
+
+        // The next cycle's second failure is what authorises the demotion.
+        let ev = CreditEvidence {
+            failures: CreditFailures::Recent { count: 2 },
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Demote { failures: 2 });
+    }
+
+    /// `min_failures = 0` must not become "fire on sight" — the floor is 1.
+    #[test]
+    fn min_failures_cannot_be_configured_below_one() {
+        let ev = CreditEvidence {
+            failures: CreditFailures::Recent { count: 1 },
+            min_failures: 0,
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Demote { failures: 1 });
+        // ...and zero failures is still Ignore, whatever min_failures says.
+        let ev = CreditEvidence {
+            failures: CreditFailures::None,
+            min_failures: 0,
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Ignore);
+    }
+
+    /// An unreadable transcript is UNKNOWN, never a negative — but it is also
+    /// not enough evidence to retype a running session's model on. Alert, and
+    /// say the sighting stands alone.
+    #[test]
+    fn credit_message_with_an_unreadable_transcript_alerts_and_never_demotes() {
+        let ev = CreditEvidence {
+            failures: CreditFailures::Unknown,
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: false,
+                reason: "transcript unreadable",
+            }
+        );
+    }
+
+    /// Auto off degrades to the high-priority alert, never to silence.
+    #[test]
+    fn credit_auto_demote_disabled_degrades_to_alert_only() {
+        let ev = CreditEvidence {
+            auto_enabled: false,
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "auto-demote disabled",
+            }
+        );
+    }
+
+    /// Demoting to the model that just ran out is a no-op that still costs an
+    /// interrupt. Held, and the alert says why.
+    #[test]
+    fn demoting_to_the_exhausted_model_is_refused() {
+        let ev = CreditEvidence {
+            target_is_exhausted_model: true,
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "target model is the one that ran out",
+            }
+        );
+    }
+
+    /// Walk a window the way `fire_model_demote` books it and check each brake
+    /// engages in turn — and that every held cycle still alerts.
+    #[test]
+    fn credit_demote_is_bounded_by_four_brakes() {
+        let max_attempts = 2;
+        let mut attempts = 0;
+
+        // Cycle 1: nothing booked -> demote. The fire books the attempt and
+        // sets the settle latch before the inject runs.
+        let ev = CreditEvidence {
+            attempts,
+            max_attempts,
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Demote { failures: 2 });
+        attempts += 1;
+
+        // Cycle 2: the `/model` we just injected has not taken effect yet.
+        // `/model` can open a picker, and a second one types into it.
+        let ev = CreditEvidence {
+            attempts,
+            max_attempts,
+            since_last_attempt: Some(5.0),
+            inject_settling: true,
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "previous /model inject still settling",
+            }
+        );
+
+        // Cycle 3: settled, but inside the retry spacing.
+        let ev = CreditEvidence {
+            attempts,
+            max_attempts,
+            since_last_attempt: Some(120.0),
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "retry spacing",
+            }
+        );
+
+        // Cycle 4: spacing satisfied, budget still has one -> demote again.
+        let ev = CreditEvidence {
+            attempts,
+            max_attempts,
+            since_last_attempt: Some(9999.0),
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&ev), CreditAction::Demote { failures: 2 });
+        attempts += 1;
+
+        // Budget spent -> held until the window closes, still alerting.
+        let ev = CreditEvidence {
+            attempts,
+            max_attempts,
+            since_last_attempt: Some(9999.0),
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "attempt budget exhausted",
+            }
+        );
+    }
+
+    /// The fourth brake: a login dialog or an in-flight reauth owns the pane's
+    /// input. Typing `/model …` into a login modal cancels that flow.
+    #[test]
+    fn credit_demote_holds_while_another_dialog_owns_the_pane() {
+        let ev = CreditEvidence {
+            dialog_pending: true,
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "another dialog owns the pane",
+            }
+        );
+    }
+
+    /// ONE-WAY-NESS, part 1: the only model change this path can produce is
+    /// `/model <configured target>`. There is no command builder that takes a
+    /// "previous" model, and the target is never derived from the pane.
+    #[test]
+    fn the_only_injection_is_a_demote_to_the_configured_target() {
+        assert_eq!(demote_command("claude-opus-5[1m]"), "/model claude-opus-5[1m]");
+        assert_eq!(demote_command("  sonnet-4-5  "), "/model sonnet-4-5");
+    }
+
+    /// ONE-WAY-NESS, part 2: closing the exhaustion window resets the attempt
+    /// BUDGET, and that is all it does. Once the failures stop being recorded,
+    /// the decision is `Ignore` — never a promotion back onto the model that
+    /// ran out, whatever the budget says.
+    #[test]
+    fn closing_the_window_resets_the_budget_and_never_promotes() {
+        // Budget fully spent, exhaustion over (no recent failures on record).
+        let resolved = CreditEvidence {
+            failures: CreditFailures::None,
+            attempts: 99,
+            since_last_attempt: Some(1.0),
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&resolved), CreditAction::Ignore);
+
+        // Fresh budget, exhaustion still over -> still nothing to do. The only
+        // thing a reset budget buys is the right to demote AGAIN later.
+        let fresh = CreditEvidence {
+            failures: CreditFailures::None,
+            attempts: 0,
+            since_last_attempt: None,
+            ..credit_evidence()
+        };
+        assert_eq!(decide_credit_action(&fresh), CreditAction::Ignore);
+    }
+
+    /// ONE-WAY-NESS, part 3: the daemon keeps no record of the model the loop
+    /// was on BEFORE a demotion, so it has nothing to promote back to even if
+    /// a future edit wanted to. Guards the invariant structurally rather than
+    /// by comment.
+    #[test]
+    fn state_records_no_pre_demotion_model_to_restore() {
+        let state = State::default();
+        let json = serde_json::to_value(&state).expect("state serialises");
+        let keys: Vec<String> = json
+            .as_object()
+            .expect("state is an object")
+            .keys()
+            .cloned()
+            .collect();
+        for key in &keys {
+            assert!(
+                !(key.contains("previous_model")
+                    || key.contains("prior_model")
+                    || key.contains("model_before")
+                    || key.contains("promote")),
+                "state field {key:?} looks like a promote-back record; the credit path \
+                 is demote-only and must keep nothing that could restore the exhausted model"
+            );
+        }
+        // The one model the state DOES remember is the demotion TARGET, which
+        // is a record for the operator, not a restore point.
+        assert!(keys.iter().any(|k| k == "credit_demoted_to"));
+    }
+
+    /// The demotion push must NOT share a cooldown bucket with the standing
+    /// "still out of credits" alerts. Those repeat and are rate-limited; a
+    /// demotion happens once, and the only remedy is a human promoting back
+    /// after the credit reset — which cannot happen if the notification was
+    /// coalesced away behind an unrelated alert.
+    #[test]
+    fn the_demotion_notification_is_never_cooldown_gated() {
+        let demote = CreditAction::Demote { failures: 2 };
+        // Cooldown wide open, and cooldown fully closed: notifies either way.
+        assert!(credit_should_notify(&demote, true));
+        assert!(
+            credit_should_notify(&demote, false),
+            "a demotion must notify even mid-cooldown"
+        );
+
+        // The standing alerts, by contrast, ARE gated — that is what keeps a
+        // ten-second poll from paging all day.
+        let standing = CreditAction::AlertOnly {
+            corroborated: true,
+            reason: "auto-demote disabled",
+        };
+        assert!(credit_should_notify(&standing, true));
+        assert!(!credit_should_notify(&standing, false));
+
+        // Nothing happened -> no phone buzz, whatever the cooldown says.
+        assert!(!credit_should_notify(&CreditAction::Ignore, true));
+        assert!(!credit_should_notify(&CreditAction::Wait { failures: 1 }, true));
+    }
+
+    /// The push body is what the operator reads on a lock screen. It has to
+    /// carry the model it came FROM, the model it went TO, the reason, and the
+    /// fact that restoring is manual.
+    #[test]
+    fn the_demotion_push_body_says_from_to_and_manual() {
+        let body = demote_push_body(Some("Fable 5"), "claude-opus-5[1m]");
+        assert!(body.contains("Fable 5"), "names the model that ran out: {body}");
+        assert!(body.contains("claude-opus-5[1m]"), "names the new model: {body}");
+        assert!(body.contains("usage credits"), "names the reason: {body}");
+        assert!(
+            body.to_lowercase().contains("manual"),
+            "says restoring is manual: {body}"
+        );
+        assert!(
+            body.len() <= 200,
+            "lock-screen length, got {} chars: {body}",
+            body.len()
+        );
+
+        // Unknown source model still produces a sendable body.
+        let body = demote_push_body(None, "claude-opus-5[1m]");
+        assert!(body.contains("its model"), "{body}");
+        assert!(body.contains("claude-opus-5[1m]"), "{body}");
+    }
+
+    /// A receipt, when the notifier prints one, so a delivery claim can point
+    /// at something. Absence is not a failure — the exit status is what says
+    /// whether the push went out.
+    #[test]
+    fn push_receipts_are_captured_when_the_notifier_prints_one() {
+        use crate::alert::extract_push_receipt;
+        assert_eq!(
+            extract_push_receipt(r#"{"status":1,"request":"abc-123"}"#),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(
+            extract_push_receipt(r#"{"receipt":"r-9"}"#),
+            Some("r-9".to_string())
+        );
+        assert_eq!(extract_push_receipt("sent\n"), None);
+        assert_eq!(extract_push_receipt(""), None);
+        assert_eq!(extract_push_receipt(r#"{"status":1}"#), None);
+    }
+
+    /// The loose name match exists to suppress a pointless `/model`, and it
+    /// has to bridge a pane display name against a config model id.
+    #[test]
+    fn model_id_matching_bridges_display_names_and_ids() {
+        // The pane prints "Opus 5" (squashed to "opus5" by the detector)
+        // against a configured id.
+        assert!(model_ids_match("opus5", "claude-opus-5[1m]"));
+        assert!(model_ids_match("claude-opus-5[1m]", "opus5"));
+        // Different model -> no match, so the demotion is allowed to proceed.
+        assert!(!model_ids_match("fable5", "claude-opus-5[1m]"));
+        // Empty either side is not a match (it would suppress everything).
+        assert!(!model_ids_match("", "claude-opus-5[1m]"));
+        assert!(!model_ids_match("opus5", ""));
     }
 
     #[test]

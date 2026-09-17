@@ -23,6 +23,12 @@ pub struct Config {
     pub auto_update: AutoUpdateConfig,
     #[serde(default)]
     pub reauth: ReauthConfig,
+    /// Auto-demote the main loop's model when the account runs out of usage
+    /// credits for the one it is on. A sibling of `[reauth]`'s reactive half —
+    /// same shape (pane text, corroborated off-screen, bounded injection,
+    /// alert), different failure. See `CreditExhaustionConfig`.
+    #[serde(default)]
+    pub credit_exhaustion: CreditExhaustionConfig,
     #[serde(default)]
     pub task_watch: TaskWatchConfig,
     #[serde(default)]
@@ -985,6 +991,137 @@ impl Default for ReauthConfig {
             self_login_command: default_self_login_command(),
         }
     }
+}
+
+/// Auto-demote the main loop's model when the account is out of usage credits
+/// for the model it is running.
+///
+/// Built as a sibling of `[reauth]`'s reactive 401 path, because it is the same
+/// shape of problem: a sentence on a live pane, believable only when something
+/// off-screen agrees, acted on by one bounded injection, and never silent.
+/// What differs is the failure — credentials are fine here, the process is
+/// fine, the TUI is intact, and the session simply cannot produce a turn.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CreditExhaustionConfig {
+    /// Watch for the exhaustion message at all. Off leaves everything else
+    /// untouched.
+    #[serde(default = "default_credit_enabled")]
+    pub enabled: bool,
+
+    /// Inject `/model <target_model>`, instead of only alerting.
+    ///
+    /// Default on, matching `auth_error_auto_self_login`, and for the same
+    /// reason: this acts on a session that has ALREADY stopped being able to
+    /// do anything, where the only alternative is a human noticing and typing
+    /// the command. Off keeps the detection and the alert.
+    #[serde(default = "default_credit_auto_demote")]
+    pub auto_demote: bool,
+
+    /// The model to demote TO — a model id `/model` accepts.
+    ///
+    /// Configurable because the right fallback is a deployment's own call, and
+    /// because this is the ONE place the target is written down: the injection
+    /// path takes it from here rather than hardcoding a literal.
+    #[serde(default = "default_credit_target_model")]
+    pub target_model: String,
+
+    /// How many distinct credit-exhaustion turn failures the transcript must
+    /// hold before the demotion fires. **2 by default: the failure has to
+    /// REPEAT.** One failed turn can be a transient 429 that the next attempt
+    /// sails through; a second one across consecutive turns is the account
+    /// being out of credits. Values below 1 are treated as 1.
+    #[serde(default = "default_credit_min_failures")]
+    pub min_failures: u32,
+
+    /// How recent a transcript failure has to be to count, in seconds.
+    ///
+    /// This is what stops an exhaustion that was ALREADY handled — its records
+    /// still sitting in the transcript tail, its message still on the scrolled
+    /// pane — from triggering a second demotion. Default 900 (15 minutes).
+    #[serde(default = "default_credit_window_seconds")]
+    pub recent_window_seconds: i64,
+
+    /// Minimum gap between demotion attempts, in seconds (default 300). The
+    /// message persists on the pane, so without this a ten-second poll
+    /// re-injects `/model` all day.
+    #[serde(default = "default_credit_retry_seconds")]
+    pub retry_seconds: u64,
+
+    /// Attempts allowed in one exhaustion window (default 2). The window
+    /// closes — and the budget resets — only when the exhaustion stops being
+    /// observed. Resetting the budget is NOT a promotion: see
+    /// `policy::decide_credit_action`.
+    #[serde(default = "default_credit_max_attempts")]
+    pub max_attempts: u32,
+
+    /// How long an injected `/model` is given to take effect before another
+    /// attempt may be considered, in seconds (default 60). `/model` can open a
+    /// picker, and a second injection while the first is still on screen types
+    /// into that picker.
+    #[serde(default = "default_credit_settle_seconds")]
+    pub settle_seconds: u64,
+
+    /// Interval between repeated alerts, in seconds. Same default as
+    /// `[reauth]`'s (10800 = 3 hours).
+    #[serde(default = "default_reauth_alert_interval")]
+    pub alert_interval_seconds: u64,
+
+    /// Claude Code's transcript root, which the pane message is corroborated
+    /// against. Empty = `$HOME/.claude/projects`. Mirrors
+    /// `ReauthConfig::credentials_file`: an unreadable tree is UNKNOWN, not a
+    /// negative — the daemon alerts and says the sighting stands alone, and it
+    /// never demotes on UNKNOWN.
+    #[serde(default)]
+    pub transcripts_dir: String,
+}
+
+impl Default for CreditExhaustionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_credit_enabled(),
+            auto_demote: default_credit_auto_demote(),
+            target_model: default_credit_target_model(),
+            min_failures: default_credit_min_failures(),
+            recent_window_seconds: default_credit_window_seconds(),
+            retry_seconds: default_credit_retry_seconds(),
+            max_attempts: default_credit_max_attempts(),
+            settle_seconds: default_credit_settle_seconds(),
+            alert_interval_seconds: default_reauth_alert_interval(),
+            transcripts_dir: String::new(),
+        }
+    }
+}
+
+fn default_credit_enabled() -> bool {
+    true
+}
+
+fn default_credit_auto_demote() -> bool {
+    true
+}
+
+fn default_credit_target_model() -> String {
+    "claude-opus-5[1m]".to_string()
+}
+
+fn default_credit_min_failures() -> u32 {
+    2
+}
+
+fn default_credit_window_seconds() -> i64 {
+    900 // 15 minutes
+}
+
+fn default_credit_retry_seconds() -> u64 {
+    300
+}
+
+fn default_credit_max_attempts() -> u32 {
+    2
+}
+
+fn default_credit_settle_seconds() -> u64 {
+    60
 }
 
 fn default_reauth_enabled() -> bool {
@@ -2645,6 +2782,54 @@ cooldown = 300
         assert!(!config.reauth.expiry_from_credentials);
         assert_eq!(config.reauth.credentials_file, "");
         assert_eq!(config.reauth.self_login_command, "self-login");
+    }
+
+    /// `[credit_exhaustion]` is newer than every deployed config file, so the
+    /// whole section must default in when absent — including the target model,
+    /// which is the one value the injection path cannot make up.
+    #[test]
+    fn test_credit_exhaustion_defaults_apply_when_the_section_is_absent() {
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(
+            !SAMPLE_CONFIG.contains("[credit_exhaustion]"),
+            "the sample config must NOT carry the section; this test asserts the defaults"
+        );
+        assert!(config.credit_exhaustion.enabled);
+        assert!(config.credit_exhaustion.auto_demote);
+        assert_eq!(config.credit_exhaustion.target_model, "claude-opus-5[1m]");
+        // The repeat requirement: two failures, not one.
+        assert_eq!(config.credit_exhaustion.min_failures, 2);
+        assert_eq!(config.credit_exhaustion.recent_window_seconds, 900);
+        assert_eq!(config.credit_exhaustion.retry_seconds, 300);
+        assert_eq!(config.credit_exhaustion.max_attempts, 2);
+        assert_eq!(config.credit_exhaustion.settle_seconds, 60);
+        assert_eq!(config.credit_exhaustion.alert_interval_seconds, 10800);
+        assert_eq!(config.credit_exhaustion.transcripts_dir, "");
+    }
+
+    /// The target model must be overridable without touching the binary, and
+    /// auto-demote must be switchable off while keeping the detection and the
+    /// alert — "tell me, I'll type it" is a supported mode.
+    #[test]
+    fn test_credit_exhaustion_knobs_are_overridable() {
+        let toml = format!(
+            "{SAMPLE_CONFIG}\n\
+             [credit_exhaustion]\n\
+             auto_demote = false\n\
+             target_model = \"sonnet-4-5\"\n\
+             min_failures = 4\n\
+             max_attempts = 1\n\
+             transcripts_dir = \"/srv/transcripts\"\n"
+        );
+        let config = parse_config(&toml).unwrap();
+        assert!(config.credit_exhaustion.enabled, "detection stays on");
+        assert!(!config.credit_exhaustion.auto_demote);
+        assert_eq!(config.credit_exhaustion.target_model, "sonnet-4-5");
+        assert_eq!(config.credit_exhaustion.min_failures, 4);
+        assert_eq!(config.credit_exhaustion.max_attempts, 1);
+        assert_eq!(config.credit_exhaustion.transcripts_dir, "/srv/transcripts");
+        // Untouched knobs keep their defaults.
+        assert_eq!(config.credit_exhaustion.retry_seconds, 300);
     }
 
     /// Auto-fire must be switchable off WITHOUT losing the reactive path or
