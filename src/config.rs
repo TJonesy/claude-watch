@@ -1072,6 +1072,24 @@ pub struct CreditExhaustionConfig {
     #[serde(default = "default_reauth_alert_interval")]
     pub alert_interval_seconds: u64,
 
+    /// Answer Claude Code's `/model` confirmation dialog, which is what makes
+    /// the demotion actually take effect.
+    ///
+    /// Typing `/model <id>` opens a "Switch model?" confirmation and WAITS on
+    /// it; with nothing answering, the session stays on the model that ran out
+    /// (operator-observed, 2026-09-20). Default on. Off keeps the injection
+    /// and leaves the dialog for a human — in which case the notification says
+    /// the switch is unconfirmed, because it is.
+    #[serde(default = "default_credit_answer_switch_dialog")]
+    pub answer_switch_dialog: bool,
+
+    /// Seconds allowed for the confirmation dialog to appear, and again for it
+    /// to be answered and go away (default 20 each). A budget, not a timer:
+    /// the daemon stops pressing keys when it expires and reports the switch
+    /// as unconfirmed rather than assuming it worked.
+    #[serde(default = "default_credit_switch_dialog_wait_secs")]
+    pub switch_dialog_wait_secs: u64,
+
     /// Claude Code's transcript root, which the pane message is corroborated
     /// against. Empty = `$HOME/.claude/projects`. Mirrors
     /// `ReauthConfig::credentials_file`: an unreadable tree is UNKNOWN, not a
@@ -1093,6 +1111,8 @@ impl Default for CreditExhaustionConfig {
             max_attempts: default_credit_max_attempts(),
             settle_seconds: default_credit_settle_seconds(),
             alert_interval_seconds: default_reauth_alert_interval(),
+            answer_switch_dialog: default_credit_answer_switch_dialog(),
+            switch_dialog_wait_secs: default_credit_switch_dialog_wait_secs(),
             transcripts_dir: String::new(),
         }
     }
@@ -1108,6 +1128,14 @@ fn default_credit_auto_demote() -> bool {
 
 fn default_credit_target_model() -> String {
     "claude-opus-5[1m]".to_string()
+}
+
+fn default_credit_answer_switch_dialog() -> bool {
+    true
+}
+
+fn default_credit_switch_dialog_wait_secs() -> u64 {
+    20
 }
 
 fn default_credit_min_failures() -> u32 {
@@ -2810,6 +2838,10 @@ cooldown = 300
         assert_eq!(config.credit_exhaustion.max_attempts, 2);
         assert_eq!(config.credit_exhaustion.settle_seconds, 60);
         assert_eq!(config.credit_exhaustion.alert_interval_seconds, 10800);
+        // Answering the `/model` confirmation is part of the demotion, so it
+        // defaults ON: without it the injection is typed and nothing happens.
+        assert!(config.credit_exhaustion.answer_switch_dialog);
+        assert_eq!(config.credit_exhaustion.switch_dialog_wait_secs, 20);
         assert_eq!(config.credit_exhaustion.transcripts_dir, "");
     }
 
@@ -2825,6 +2857,8 @@ cooldown = 300
              target_model = \"sonnet-4-5\"\n\
              min_failures = 4\n\
              max_attempts = 1\n\
+             answer_switch_dialog = false\n\
+             switch_dialog_wait_secs = 45\n\
              transcripts_dir = \"/srv/transcripts\"\n"
         );
         let config = parse_config(&toml).unwrap();
@@ -2834,6 +2868,8 @@ cooldown = 300
         assert_eq!(config.credit_exhaustion.min_failures, 4);
         assert_eq!(config.credit_exhaustion.max_attempts, 1);
         assert_eq!(config.credit_exhaustion.transcripts_dir, "/srv/transcripts");
+        assert!(!config.credit_exhaustion.answer_switch_dialog);
+        assert_eq!(config.credit_exhaustion.switch_dialog_wait_secs, 45);
         // Untouched knobs keep their defaults.
         assert_eq!(config.credit_exhaustion.retry_seconds, 300);
     }

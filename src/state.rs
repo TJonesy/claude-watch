@@ -379,6 +379,15 @@ pub struct State {
     /// above.
     #[serde(default)]
     pub credit_demoted_to: Option<String>,
+    /// When a `/model` demotion left Claude Code's switch confirmation
+    /// standing on the pane unanswered. `/model` does not change the model on
+    /// its own: it opens a dialog and waits, and an unanswered dialog means
+    /// the loop is still on the model that ran out. Set when the demotion's
+    /// own bounded attempt could not clear it, so later cycles keep trying;
+    /// cleared the moment the dialog is gone, and it expires on age so a
+    /// stale latch can never press keys at a pane that has moved on.
+    #[serde(default)]
+    pub credit_switch_confirm_pending: Option<String>,
     /// Cumulative count of `/model` demotion injections (for metrics).
     #[serde(default)]
     pub credit_demote_interrupts_total: u64,
