@@ -352,6 +352,12 @@ pub async fn is_interactive_prompt(pane: &str) -> bool {
 ///     operator-observed `…iiiiii` in the code box, 2026-09-17), the
 ///     cancelling path's leading Escape destroying the login outright. See
 ///     `login_dialog_visible`.
+///  8. The `/model` switch confirmation ("Switch model?" + "Yes, switch to
+///     …"), which claude-watch opens itself when it demotes a loop that has
+///     run out of usage credits. Signature (3) only matches a numbered row
+///     whose line STARTS with the cursor, so a bordered render
+///     (`│ ❯ 1. Yes, switch to …`) slips past it. See
+///     `model_switch_dialog_visible`.
 ///
 /// ## Conservative bias
 ///
@@ -442,6 +448,13 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
     // daemon is usually the one that OPENED it (`self-login`), so suppressing
     // here is what stops claude-watch typing into its own dialog.
     if login_dialog_visible(pane_output) {
+        return true;
+    }
+
+    // (8) The `/model` switch confirmation — likewise a dialog the daemon
+    // itself opens (credit demotion), and one whose bordered option rows do
+    // not satisfy signature (3).
+    if model_switch_dialog_visible(pane_output) {
         return true;
     }
 
@@ -3044,6 +3057,179 @@ pub(crate) fn detect_credit_exhaustion(pane_output: &str) -> Option<CreditBanner
 pub async fn credit_exhaustion_banner(pane: &str) -> Option<CreditBanner> {
     let out = capture_pane(pane).await?;
     detect_credit_exhaustion(&out)
+}
+
+// ---------------------------------------------------------------------------
+// The `/model` switch confirmation
+//
+// Typing `/model <id>` does not, on current Claude Code builds, change the
+// model. It opens a confirmation the session then WAITS on:
+//
+//   Switch model?
+//   Your next response will be slower and use more tokens
+//
+//   This conversation is cached for the current model. Switching
+//   to <model> means the full history gets re-read on your next message.
+//
+//   ❯ 1. Yes, switch to <model>
+//     2. No, go back
+//
+// Nothing answered it, so a demotion that "fired" left the session on the
+// model that had run out until a human pressed a key (operator-observed,
+// 2026-09-20). Answering it is therefore part of the demotion, not a nicety —
+// and every keystroke below is gated on SEEING the dialog in a fresh capture,
+// because a key typed at a pane that is NOT showing it lands in the
+// conversation instead.
+// ---------------------------------------------------------------------------
+
+/// Title lines that mark the `/model` confirmation. The hook-driven variant
+/// carries a different title with the same option rows.
+const MODEL_SWITCH_TITLES: [&str; 2] = ["switch model?", "asked you to confirm"];
+/// The option row that APPLIES the switch.
+const MODEL_SWITCH_CONFIRM_ROW: &str = "yes, switch to";
+/// The option row that abandons it.
+const MODEL_SWITCH_DECLINE_ROW: &str = "no, go back";
+/// Lines Claude Code prints once a `/model` has actually been applied.
+const MODEL_SWITCH_APPLIED_MARKERS: [&str; 2] = ["set model to", "model set to"];
+
+/// Where the selection cursor sits in the `/model` confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSwitchCursor {
+    /// On the "Yes, switch to …" row — Enter applies the switch.
+    Confirm,
+    /// On the "No, go back" row — one Up reaches the confirm row.
+    Decline,
+    /// The dialog is up, but the cursor is on neither row this code knows.
+    /// Never guessed at: see `model_switch_answer_keys`.
+    Unknown,
+}
+
+/// Pure function: is Claude Code's `/model` switch confirmation on the pane?
+///
+/// BOTH markers are required — a title AND the "Yes, switch to …" option row —
+/// for the same reason `bypass_permissions_dialog_visible` wants both: the
+/// cost of a false positive here is a keystroke typed into a live session, so
+/// one stray sentence must never be enough. Scoped to the recent tail so the
+/// dialog quoted in scrollback (this file read into a pane, a transcript) is
+/// history rather than a live modal.
+///
+/// Deliberately border-agnostic: it matches on `contains` over each line, so
+/// the box-drawing characters Claude Code frames the dialog with — present or
+/// not, in whatever style a build uses — change nothing.
+pub(crate) fn model_switch_dialog_visible(pane_output: &str) -> bool {
+    let mut title = false;
+    let mut confirm_row = false;
+    for line in recent_tail(pane_output, 25) {
+        let lower = line.to_lowercase();
+        if MODEL_SWITCH_TITLES.iter().any(|t| lower.contains(t)) {
+            title = true;
+        }
+        if lower.contains(MODEL_SWITCH_CONFIRM_ROW) {
+            confirm_row = true;
+        }
+    }
+    title && confirm_row
+}
+
+/// Pure function: which row of the `/model` confirmation is selected?
+///
+/// `None` when the dialog is not on the pane at all. The cursor is read as the
+/// `❯` (or plain `>`) glyph appearing BEFORE the row's label on the same line,
+/// which survives the box border and the option number in front of it
+/// (`│ ❯ 1. Yes, switch to …`).
+pub fn model_switch_cursor(pane_output: &str) -> Option<ModelSwitchCursor> {
+    if !model_switch_dialog_visible(pane_output) {
+        return None;
+    }
+    for line in recent_tail(pane_output, 25) {
+        let lower = line.to_lowercase();
+        if cursor_precedes(&lower, MODEL_SWITCH_CONFIRM_ROW) {
+            return Some(ModelSwitchCursor::Confirm);
+        }
+        if cursor_precedes(&lower, MODEL_SWITCH_DECLINE_ROW) {
+            return Some(ModelSwitchCursor::Decline);
+        }
+    }
+    Some(ModelSwitchCursor::Unknown)
+}
+
+/// Does a selection cursor sit before `needle` on this (lowercased) line?
+fn cursor_precedes(lower_line: &str, needle: &str) -> bool {
+    match lower_line.find(needle) {
+        Some(idx) => {
+            let prefix = &lower_line[..idx];
+            prefix.contains('\u{276f}') || prefix.contains('>')
+        }
+        None => false,
+    }
+}
+
+/// The ONLY place keystrokes for the `/model` confirmation are produced, and
+/// the safety property of this whole path: it returns `None` — press nothing —
+/// unless this exact frame shows the dialog AND says which row is selected.
+///
+/// * cursor on "Yes, switch to …" → `Enter` confirms it;
+/// * cursor on "No, go back" → one `Up`, then `Enter`;
+/// * dialog up but the cursor unreadable → `None`. A blind `Up`/`Enter`/`1`
+///   could land on the wrong row or, if the frame was stale, in the
+///   conversation itself. An unanswered dialog is recoverable and is alerted
+///   on; a stray keystroke typed into a live session is not.
+///
+/// Note that no DIGIT is ever sent. `Enter` on a verified row cannot become
+/// text if the dialog closes underneath it, whereas a `1` lands on the prompt
+/// as a literal character.
+pub fn model_switch_answer_keys(pane_output: &str) -> Option<&'static [&'static str]> {
+    match model_switch_cursor(pane_output)? {
+        ModelSwitchCursor::Confirm => Some(&["Enter"]),
+        ModelSwitchCursor::Decline => Some(&["Up", "Enter"]),
+        ModelSwitchCursor::Unknown => None,
+    }
+}
+
+/// Pure function: has a `/model` switch actually been applied on this pane?
+///
+/// Claude Code prints its own confirmation line once the model changes. Used
+/// as a POSITIVE signal that a switch landed without a dialog; never as
+/// evidence that one did not.
+pub fn model_switch_applied(pane_output: &str) -> bool {
+    recent_tail(pane_output, 25).any(|line| {
+        let lower = line.to_lowercase();
+        MODEL_SWITCH_APPLIED_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+    })
+}
+
+/// The last `n` lines of a pane capture — the "is this live or is it
+/// scrollback" scope every dialog detector here shares.
+fn recent_tail(pane_output: &str, n: usize) -> impl Iterator<Item = &str> {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines.into_iter().skip(start)
+}
+
+/// Capture the pane and report whether the `/model` confirmation is on it.
+pub async fn model_switch_dialog_on_pane(pane: &str) -> bool {
+    capture_pane(pane)
+        .await
+        .map(|out| model_switch_dialog_visible(&out))
+        .unwrap_or(false)
+}
+
+/// Send one answer sequence to the `/model` confirmation.
+///
+/// Keys go one `send-keys` at a time with a gap between them, for the reason
+/// `accept_bypass_permissions_dialog` does it: the dialog re-renders between
+/// keystrokes, and a batched `Up Enter` can land the Enter on the pre-move
+/// selection — which on this dialog means "No, go back".
+///
+/// `keys` always comes from `model_switch_answer_keys`, which produces nothing
+/// at all unless a fresh capture showed the dialog.
+pub async fn send_model_switch_answer(pane: &str, keys: &[&str]) {
+    for key in keys {
+        send_keys(pane, &[key]).await;
+        sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// Every OAuth authorize-URL prefix a Claude Code login screen can print.
@@ -5938,6 +6124,103 @@ mod tests {
         assert!(detect_credit_exhaustion("").is_none());
         // Neither of the auth signals is this one.
         assert!(detect_credit_exhaustion(BANNER_401_WITH_TUI).is_none());
+    }
+
+    // ---- The `/model` switch confirmation ----
+
+    /// The pane an operator found after the daemon's demotion "fired": the
+    /// command typed, the confirmation up, nothing answering it. Transcribed
+    /// from that capture.
+    const MODEL_SWITCH_PANE: &str = include_str!("../tests/fixtures/model_switch_dialog.txt");
+
+    #[test]
+    fn model_switch_dialog_matches_the_captured_pane() {
+        assert!(model_switch_dialog_visible(MODEL_SWITCH_PANE));
+        assert_eq!(
+            model_switch_cursor(MODEL_SWITCH_PANE),
+            Some(ModelSwitchCursor::Confirm),
+            "the dialog opens with the confirm row selected"
+        );
+    }
+
+    #[test]
+    fn model_switch_dialog_needs_both_markers() {
+        // A title alone (prose, a changelog, this file read into the pane).
+        assert!(!model_switch_dialog_visible("  Switch model?\n❯ "));
+        // An option row alone, without the dialog around it.
+        assert!(!model_switch_dialog_visible("  Yes, switch to Opus 5\n❯ "));
+        // A healthy session, and the out-of-credits pane that PRECEDES the
+        // dialog: neither is the dialog.
+        assert!(!model_switch_dialog_visible("● Done.\n❯ \n  57,129 tokens\n"));
+        assert!(!model_switch_dialog_visible(CREDITS_EXHAUSTED_PANE));
+        assert!(!model_switch_dialog_visible(""));
+    }
+
+    #[test]
+    fn model_switch_dialog_ignores_old_scrollback() {
+        // The dialog 40 lines up was answered long ago; pressing Enter at it
+        // now types into the conversation.
+        let mut lines = vec!["scrollback".to_string(); 40];
+        lines.insert(0, MODEL_SWITCH_PANE.to_string());
+        assert!(!model_switch_dialog_visible(&lines.join("\n")));
+    }
+
+    /// The safety property of the whole confirmation path: keystrokes are
+    /// produced ONLY for a frame that shows the dialog and says which row is
+    /// selected. Everything else presses nothing.
+    #[test]
+    fn model_switch_keys_are_produced_only_for_a_visible_answerable_dialog() {
+        // Idle prompt, the credits banner, an unrelated permission menu,
+        // the login modal, empty output -> press NOTHING.
+        assert_eq!(model_switch_answer_keys("● Done.\n❯ \n  57,129 tokens\n"), None);
+        assert_eq!(model_switch_answer_keys(CREDITS_EXHAUSTED_PANE), None);
+        assert_eq!(
+            model_switch_answer_keys("  Do you want to proceed?\n❯ 1. Yes\n  2. No\n"),
+            None
+        );
+        assert_eq!(model_switch_answer_keys(LOGIN_MENU_PANE), None);
+        assert_eq!(model_switch_answer_keys(""), None);
+
+        // The real dialog, confirm row selected -> a single Enter. No digit is
+        // ever sent: a stray `1` would land on the prompt as text.
+        assert_eq!(model_switch_answer_keys(MODEL_SWITCH_PANE), Some(&["Enter"][..]));
+
+        // Cursor parked on "No, go back" -> move up first, then confirm.
+        let declined = MODEL_SWITCH_PANE
+            .replace("❯ 1. Yes", "  1. Yes")
+            .replace("  2. No, go back", "❯ 2. No, go back");
+        assert_eq!(
+            model_switch_cursor(&declined),
+            Some(ModelSwitchCursor::Decline)
+        );
+        assert_eq!(model_switch_answer_keys(&declined), Some(&["Up", "Enter"][..]));
+
+        // Dialog up but no cursor anywhere (a render this code does not know):
+        // never guess a key.
+        let cursorless = MODEL_SWITCH_PANE.replace("❯ 1. Yes", "  1. Yes");
+        assert!(model_switch_dialog_visible(&cursorless));
+        assert_eq!(
+            model_switch_cursor(&cursorless),
+            Some(ModelSwitchCursor::Unknown)
+        );
+        assert_eq!(model_switch_answer_keys(&cursorless), None);
+    }
+
+    #[test]
+    fn model_switch_dialog_reads_as_an_interactive_prompt() {
+        // The bordered option rows do not start with the cursor glyph, so the
+        // numbered-row signature misses them — the dialog has to be matched
+        // explicitly or an unrelated inject types into it.
+        assert!(interactive_prompt_visible(MODEL_SWITCH_PANE));
+    }
+
+    #[test]
+    fn an_applied_model_switch_is_recognised() {
+        assert!(model_switch_applied("  ⎿  Set model to Opus 5 (1M context)\n❯ \n"));
+        assert!(model_switch_applied("  Model set to opus\n❯ \n"));
+        // The dialog still being up is not an applied switch.
+        assert!(!model_switch_applied(MODEL_SWITCH_PANE));
+        assert!(!model_switch_applied("● Done.\n❯ \n"));
     }
 
     #[test]

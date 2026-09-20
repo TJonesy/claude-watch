@@ -622,6 +622,33 @@ max_attempts = 2
 # injection while that picker is up types into it.
 settle_seconds = 60
 
+# Answer Claude Code's `/model` confirmation dialog — which is what makes the
+# demotion actually take effect.
+#
+# Typing `/model <id>` does NOT change the model: it opens
+#
+#   Switch model?
+#   ...
+#   ❯ 1. Yes, switch to <model>
+#     2. No, go back
+#
+# and waits. With nothing answering it, the demotion fired, logged "injected"
+# and pushed "demoted" while the session stayed on the model that had run out
+# (observed 2026-09-20).
+#
+# Keystrokes are only ever produced for a frame that shows the dialog AND says
+# which row is selected; anything else presses nothing, because a key typed at
+# a pane that is not showing the dialog lands in the conversation. Off keeps
+# the injection and leaves the dialog to a human — the notification then says
+# the switch is unconfirmed, because it is.
+answer_switch_dialog = true
+
+# Seconds allowed for the confirmation to appear, and again for it to be
+# answered and go away. A budget, not a timer: when it runs out the daemon
+# stops pressing keys and reports the demotion as UNCONFIRMED rather than
+# assuming it worked, then keeps trying to answer the dialog on later cycles.
+switch_dialog_wait_secs = 20
+
 # Interval between repeated alerts (seconds); 10800 = 3 hours, the same
 # cooldown [reauth] uses. The demotion alert itself is not rate-limited — a
 # one-off state change the operator has to know about.

@@ -1,0 +1,15 @@
+● Out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.
+
+> /model claude-opus-5[1m]
+
+╭──────────────────────────────────────────────────────────────────╮
+│ Switch model?                                                    │
+│ Your next response will be slower and use more tokens            │
+│                                                                  │
+│ This conversation is cached for the current model. Switching     │
+│ to Opus 5 (1M context) means the full history gets re-read on    │
+│ your next message.                                               │
+│                                                                  │
+│ ❯ 1. Yes, switch to Opus 5 (1M context)                          │
+│   2. No, go back                                                 │
+╰──────────────────────────────────────────────────────────────────╯

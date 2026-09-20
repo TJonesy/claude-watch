@@ -3559,6 +3559,10 @@ pub(crate) struct CreditEvidence {
     /// Something else already owns the pane's input: a login dialog the
     /// reauth path opened, or a login screen / 401 banner it is working on.
     pub dialog_pending: bool,
+    /// Claude Code's own `/model` switch confirmation is on the pane — almost
+    /// certainly the one a previous attempt opened. Typing another `/model`
+    /// into it would type into the dialog rather than open a new one.
+    pub switch_dialog_pending: bool,
     /// A `/model` this path injected has not had time to take effect yet.
     pub inject_settling: bool,
 }
@@ -3637,6 +3641,12 @@ pub(crate) fn decide_credit_action(ev: &CreditEvidence) -> CreditAction {
     if ev.dialog_pending {
         return held("another dialog owns the pane");
     }
+    // The `/model` confirmation from a previous attempt is still up. A second
+    // `/model` here is typed INTO that dialog, not at a prompt. The answering
+    // path (`retry_pending_switch_confirmation`) owns this case.
+    if ev.switch_dialog_pending {
+        return held("a model-switch confirmation is already on the pane");
+    }
     // `/model` can open a picker; a second one types into the first.
     if ev.inject_settling {
         return held("previous /model inject still settling");
@@ -3675,17 +3685,108 @@ pub(crate) fn credit_should_notify(action: &CreditAction, cooldown_elapsed: bool
     }
 }
 
+/// What became of the confirmation Claude Code puts in front of a `/model`
+/// switch — and therefore whether the model actually changed.
+///
+/// This distinction is the fix for the failure that made the demotion a no-op:
+/// typing the command opens a "Switch model?" dialog and the session waits on
+/// it. A demotion that types the command and stops has not demoted anything,
+/// so the outcome travels with every message the path produces rather than
+/// being assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchOutcome {
+    /// The dialog appeared and the daemon got it answered; it is gone.
+    Confirmed,
+    /// No dialog appeared within the budget — a build that applies `/model`
+    /// directly, or one that had already applied it.
+    NoDialog,
+    /// A dialog is STILL standing on the pane. The model has NOT changed and
+    /// a human has to finish it.
+    Pending,
+    /// `answer_switch_dialog` is off: the daemon typed the command and did
+    /// not look. Historic behaviour, kept as an explicit opt-out.
+    NotAttempted,
+}
+
+impl SwitchOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SwitchOutcome::Confirmed => "confirmed",
+            SwitchOutcome::NoDialog => "no_dialog",
+            SwitchOutcome::Pending => "pending",
+            SwitchOutcome::NotAttempted => "not_attempted",
+        }
+    }
+
+    /// Is the loop believed to be on the new model? `Pending` is the one
+    /// answer that must never be dressed up as a completed demotion.
+    pub(crate) fn switched(self) -> bool {
+        !matches!(self, SwitchOutcome::Pending)
+    }
+}
+
 /// The push body the operator reads on a lock screen.
 ///
 /// Pure so the wording is pinned by a test: it has to carry the three things
 /// needed to act — which model ran out, which one the loop is on now, and that
-/// restoring is a manual step because the daemon never promotes.
-pub(crate) fn demote_push_body(from_model: Option<&str>, target: &str) -> String {
+/// restoring is a manual step because the daemon never promotes. And when the
+/// switch did NOT land, it has to say so instead: an unanswered dialog leaves
+/// the loop on the exhausted model, which is the opposite of what a
+/// "demoted" push means.
+pub(crate) fn demote_push_body(
+    from_model: Option<&str>,
+    target: &str,
+    outcome: SwitchOutcome,
+) -> String {
     let from = from_model.unwrap_or("its model");
-    format!(
-        "claude-watch demoted the main loop: {from} out of usage credits -> {target}. \
-         Restore manually after the weekly reset (never automatic)."
-    )
+    match outcome {
+        SwitchOutcome::Pending => format!(
+            "claude-watch could NOT demote the main loop off {from} (out of usage credits): \
+             Claude Code's switch-model confirmation is UNANSWERED on the pane. \
+             Answer it to reach {target}."
+        ),
+        SwitchOutcome::Confirmed => format!(
+            "claude-watch demoted the main loop: {from} out of usage credits -> {target} \
+             (switch confirmed). Restore manually after the weekly reset."
+        ),
+        SwitchOutcome::NoDialog | SwitchOutcome::NotAttempted => format!(
+            "claude-watch demoted the main loop: {from} out of usage credits -> {target}. \
+             Restore manually after the weekly reset (never automatic)."
+        ),
+    }
+}
+
+/// The structured claude-event body for a demotion attempt.
+///
+/// Pure for the same reason as `demote_push_body`, and it obeys the same rule:
+/// the `Pending` wording never claims the injection worked.
+pub(crate) fn demote_event_message(
+    from_model: Option<&str>,
+    target: &str,
+    command: &str,
+    failures: u32,
+    outcome: SwitchOutcome,
+) -> String {
+    let from = from_model.unwrap_or("its model");
+    match outcome {
+        SwitchOutcome::Pending => format!(
+            "Main loop is out of usage credits ({from}) after {failures} failed turns. \
+             `{command}` was injected, but Claude Code's switch-model confirmation is \
+             STILL UNANSWERED on the pane, so the model has NOT changed — answer the \
+             dialog in the session to move it to {target}."
+        ),
+        SwitchOutcome::Confirmed => format!(
+            "Main loop was out of usage credits ({from}) after {failures} failed turns; \
+             injected `{command}` and answered Claude Code's switch-model confirmation. \
+             claude-watch will NOT switch back — promote it yourself once credits reset."
+        ),
+        SwitchOutcome::NoDialog | SwitchOutcome::NotAttempted => format!(
+            "Main loop was out of usage credits ({from}) after {failures} failed turns; \
+             injected `{command}` to keep it running (no switch-model confirmation \
+             appeared). claude-watch will NOT switch back — promote it yourself once \
+             credits reset."
+        ),
+    }
 }
 
 /// The ONLY model change this path can produce.
@@ -3750,6 +3851,13 @@ fn transcripts_dir(config: &Config) -> std::path::PathBuf {
 /// off-screen, one bounded injection, an alert either way — and it is
 /// **demote-only**: see `decide_credit_action`.
 async fn check_credit_exhaustion(config: &Config, state: &mut State, pane: &str) {
+    // An unanswered switch confirmation is handled FIRST, and unconditionally
+    // — before the banner is even looked for. While the dialog covers the
+    // pane the banner may not be visible at all, and the path that would
+    // otherwise run treats that as "the exhaustion is over". The dialog is
+    // the exhaustion, still unresolved.
+    retry_pending_switch_confirmation(config, state, pane).await;
+
     let banner = tmux::credit_exhaustion_banner(pane).await;
 
     let Some(banner) = banner else {
@@ -3797,6 +3905,10 @@ async fn check_credit_exhaustion(config: &Config, state: &mut State, pane: &str)
         dialog_pending: state.self_login_dialog_opened_at.is_some()
             || state.reauth_detected
             || state.reauth_banner_detected,
+        // Read from the pane rather than from a latch: the dialog is a fact
+        // about the screen, and the daemon is not necessarily the only thing
+        // that can have put a `/model` confirmation there.
+        switch_dialog_pending: tmux::model_switch_dialog_on_pane(pane).await,
         inject_settling: settling,
     });
 
@@ -3948,7 +4060,233 @@ fn close_credit_window(config: &Config, state: &mut State, pane: &str, why: &str
     state.credit_demote_attempts_this_window = 0;
     state.last_credit_demote_attempt = None;
     state.credit_demote_injected_at = None;
+    // NOT cleared here: `credit_switch_confirm_pending`. A dialog covering the
+    // pane is one of the ways the banner stops being visible, so closing the
+    // window is exactly when an unanswered confirmation is most likely to be
+    // standing. It is cleared by the answering path when the dialog is
+    // actually gone, and it expires on age.
     crate::state::save_state(&config.general.state_file, state);
+}
+
+/// How many answer sequences one settle may press. Bounded for the reason the
+/// bypass-dialog accept is: keep watching, never keep typing.
+const MODEL_SWITCH_MAX_ANSWER_ATTEMPTS: u32 = 3;
+
+/// How long a pending-confirmation latch stays actionable, in seconds. Past
+/// this the latch is dropped rather than carried: a dialog that has been up
+/// for ten minutes has been dealt with by a human, or the pane has moved on,
+/// and either way pressing keys at it is guesswork.
+const SWITCH_CONFIRM_PENDING_MAX_SECS: f64 = 600.0;
+
+/// Answer Claude Code's `/model` switch confirmation, so that a demotion
+/// actually demotes.
+///
+/// ## Why this exists
+///
+/// `/model <id>` does not change the model. It opens
+///
+/// ```text
+/// Switch model?
+/// …
+/// ❯ 1. Yes, switch to <model>
+///   2. No, go back
+/// ```
+///
+/// and waits. The daemon typed the command, logged "injected", pushed
+/// "demoted" — and the session sat on the exhausted model until a human
+/// pressed a key (operator-observed, 2026-09-20). The injection was never the
+/// whole action; answering the dialog is the other half of it.
+///
+/// ## Shape
+///
+/// Two bounded phases, each capped by `switch_dialog_wait_secs`, mirroring
+/// `settle_bypass_permissions_dialog`:
+///
+/// 1. **Appear.** Poll the pane. A dialog → phase 2. Claude Code's own
+///    "Set model to …" line → `NoDialog`, the switch applied directly. Budget
+///    spent with neither → `NoDialog`, i.e. exactly the old behaviour.
+/// 2. **Answer.** Press only what `tmux::model_switch_answer_keys` produces
+///    for the CURRENT frame (nothing at all unless that frame shows the dialog
+///    and says which row is selected), at most
+///    `MODEL_SWITCH_MAX_ANSWER_ATTEMPTS` times, until the dialog is gone →
+///    `Confirmed`. Still up when the budget runs out → `Pending`, which is
+///    reported as a failed demotion, never as a successful one.
+///
+/// The asymmetry that decides every ambiguous case: an unanswered dialog is
+/// visible, alerted on, and retried; a keystroke typed at a pane that is NOT
+/// showing the dialog lands in the conversation and cannot be taken back. So
+/// this never presses on a guess.
+async fn settle_model_switch_dialog(config: &Config, pane: &str) -> SwitchOutcome {
+    if !config.credit_exhaustion.answer_switch_dialog {
+        return SwitchOutcome::NotAttempted;
+    }
+    let budget =
+        std::time::Duration::from_secs(config.credit_exhaustion.switch_dialog_wait_secs.max(1));
+
+    // Phase 1: does the confirmation show up at all?
+    let appear_deadline = tokio::time::Instant::now() + budget;
+    let mut saw_dialog = false;
+    while tokio::time::Instant::now() < appear_deadline {
+        if let Some(frame) = tmux::capture_pane(pane).await {
+            if tmux::model_switch_dialog_visible(&frame) {
+                saw_dialog = true;
+                break;
+            }
+            if tmux::model_switch_applied(&frame) {
+                info!("credit-demote: `/model` applied with no confirmation to answer");
+                return SwitchOutcome::NoDialog;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !saw_dialog {
+        debug!(
+            wait_secs = config.credit_exhaustion.switch_dialog_wait_secs,
+            "credit-demote: no switch-model confirmation appeared"
+        );
+        return SwitchOutcome::NoDialog;
+    }
+
+    info!("credit-demote: switch-model confirmation on the pane — answering it");
+
+    // Phase 2: answer it, then watch for it to go away.
+    let settle_deadline = tokio::time::Instant::now() + budget;
+    let mut presses: u32 = 0;
+    while tokio::time::Instant::now() < settle_deadline {
+        let Some(frame) = tmux::capture_pane(pane).await else {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        };
+        match tmux::model_switch_answer_keys(&frame) {
+            Some(keys) if presses < MODEL_SWITCH_MAX_ANSWER_ATTEMPTS => {
+                presses += 1;
+                tmux::send_model_switch_answer(pane, keys).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Some(_) => {
+                // Presses spent — keep watching, never keep typing.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            None if tmux::model_switch_dialog_visible(&frame) => {
+                // The dialog is up but its cursor is on neither row we know.
+                // Guessing a key here is the one thing this path must not do.
+                warn!(
+                    "credit-demote: switch-model confirmation is up but its selection is \
+                     unreadable; NOT guessing a keystroke"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            None => {
+                info!(
+                    presses,
+                    applied = tmux::model_switch_applied(&frame),
+                    "credit-demote: switch-model confirmation answered"
+                );
+                return SwitchOutcome::Confirmed;
+            }
+        }
+    }
+    warn!(
+        presses,
+        "credit-demote: switch-model confirmation is STILL on the pane; the model has not \
+         changed"
+    );
+    SwitchOutcome::Pending
+}
+
+/// Keep answering a confirmation that one demotion could not clear.
+///
+/// Runs at the top of every credit check, because the dialog outlives the
+/// cycle that opened it and the demotion path cannot fire again while it is up
+/// (see `decide_credit_action`'s switch-dialog brake). One answer sequence per
+/// cycle, only for a frame that shows the dialog, and the latch expires on age
+/// — so this can neither spin nor wake up days later and press a key into a
+/// live conversation.
+async fn retry_pending_switch_confirmation(config: &Config, state: &mut State, pane: &str) {
+    let Some(opened_at) = state.credit_switch_confirm_pending.clone() else {
+        return;
+    };
+    if !config.credit_exhaustion.answer_switch_dialog {
+        state.credit_switch_confirm_pending = None;
+        crate::state::save_state(&config.general.state_file, state);
+        return;
+    }
+    let age = elapsed_since(&opened_at);
+    if age.map(|a| a > SWITCH_CONFIRM_PENDING_MAX_SECS).unwrap_or(true) {
+        info!(
+            opened_at,
+            "credit-demote: dropping the stale switch-confirmation latch"
+        );
+        state.credit_switch_confirm_pending = None;
+        crate::state::save_state(&config.general.state_file, state);
+        return;
+    }
+
+    let Some(frame) = tmux::capture_pane(pane).await else {
+        return;
+    };
+    if !tmux::model_switch_dialog_visible(&frame) {
+        info!("credit-demote: switch-model confirmation is no longer on the pane");
+        write_jsonl_log(
+            &config.general.log_file,
+            "credit_switch_confirm_cleared",
+            serde_json::json!({
+                "pane": pane,
+                "applied_line_on_pane": tmux::model_switch_applied(&frame),
+            }),
+        );
+        state.credit_switch_confirm_pending = None;
+        crate::state::save_state(&config.general.state_file, state);
+        return;
+    }
+    let Some(keys) = tmux::model_switch_answer_keys(&frame) else {
+        warn!(
+            "credit-demote: switch-model confirmation is up but its selection is unreadable; \
+             NOT guessing a keystroke"
+        );
+        return;
+    };
+    tmux::send_model_switch_answer(pane, keys).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let cleared = tmux::capture_pane(pane)
+        .await
+        .map(|f| !tmux::model_switch_dialog_visible(&f))
+        .unwrap_or(false);
+    write_jsonl_log(
+        &config.general.log_file,
+        "credit_switch_confirm_retry",
+        serde_json::json!({
+            "pane": pane,
+            "keys": keys,
+            "cleared": cleared,
+        }),
+    );
+    if !cleared {
+        return;
+    }
+    info!("credit-demote: switch-model confirmation answered on a later cycle");
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        "Usage credits: answered the pending switch-model confirmation",
+    );
+    state.credit_switch_confirm_pending = None;
+    crate::state::save_state(&config.general.state_file, state);
+    // The push already went out (as a FAILED demotion), so this is the
+    // correction: the structured record that the switch finally landed. No
+    // second push — the operator has been told once and the news here is good.
+    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "credits-exhausted",
+        stuck_reason: "claude code out of usage credits, model demotion confirmed late",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: &format!(
+            "The switch-model confirmation left over from the usage-credit demotion has been \
+             answered; the main loop is now on {}. claude-watch will NOT switch back — \
+             promote it yourself once credits reset.",
+            state.credit_demoted_to.as_deref().unwrap_or("its target model")
+        ),
+    });
 }
 
 /// Inject the one-way `/model` demotion and tell the operator it happened.
@@ -3983,6 +4321,17 @@ async fn fire_model_demote(
         "out of usage credits: demoting the main loop's model"
     );
     inject_dispatch::inject_to_agent(pane, &command).await;
+
+    // Typing the command is HALF the action: Claude Code answers `/model`
+    // with a confirmation dialog and waits on it. A demotion that stops here
+    // leaves the loop on the model that ran out.
+    let outcome = settle_model_switch_dialog(config, pane).await;
+    state.credit_switch_confirm_pending = match outcome {
+        SwitchOutcome::Pending => Some(Local::now().to_rfc3339()),
+        _ => None,
+    };
+    crate::state::save_state(&config.general.state_file, state);
+
     write_jsonl_log(
         &config.general.log_file,
         "credit_demote_injected",
@@ -3993,13 +4342,16 @@ async fn fire_model_demote(
             "exhausted_model": banner.exhausted_model,
             "recent_failures": failures,
             "attempt": attempt,
+            "switch_confirmation": outcome.as_str(),
+            "switched": outcome.switched(),
         }),
     );
     write_legacy_log(
         &config.general.legacy_log_file,
         &format!(
             "Out of usage credits: injected `{command}` (attempt {attempt}, \
-             {failures} failed turns on record)"
+             {failures} failed turns on record, switch confirmation: {})",
+            outcome.as_str()
         ),
     );
 
@@ -4024,9 +4376,11 @@ async fn fire_model_demote(
     //    suppresses that event cannot take the push down with it.
     //
     // Body kept short enough to read on a lock screen, and it names the three
-    // things needed to act: from, to, and that restoring is manual.
-    let from = banner.exhausted_model.as_deref().unwrap_or("its model");
-    let push_body = demote_push_body(banner.exhausted_model.as_deref(), target);
+    // things needed to act: from, to, and that restoring is manual. It also
+    // reports the OUTCOME rather than the intention — an unanswered
+    // confirmation is a failed demotion, and a push that called it a success
+    // would tell the operator the one thing that is not true.
+    let push_body = demote_push_body(banner.exhausted_model.as_deref(), target, outcome);
     // `notify_now` is `credit_should_notify(Demote, _)`, which is TRUE for
     // every cooldown state — the demotion push is not gated, and
     // `credit_should_notify`'s tests pin that. Threaded through rather than
@@ -4084,14 +4438,20 @@ async fn fire_model_demote(
     // SECOND push for the same demotion.
     alert::emit_event(crate::event_bus::ClaudeWatchAlert {
         alert_type: "credits-exhausted",
-        stuck_reason: "claude code out of usage credits, model demoted",
+        stuck_reason: if outcome.switched() {
+            "claude code out of usage credits, model demoted"
+        } else {
+            "claude code out of usage credits, model demotion left unconfirmed"
+        },
         stale_minutes: None,
         affected_watchers: vec![],
         severity: crate::event_bus::Severity::High,
-        message: &format!(
-            "Main loop was out of usage credits ({from}) after {failures} failed turns; \
-             injected `{command}` to keep it running. claude-watch will NOT switch back — \
-             promote it yourself once credits reset."
+        message: &demote_event_message(
+            banner.exhausted_model.as_deref(),
+            target,
+            &command,
+            failures,
+            outcome,
         ),
     });
     state.last_credit_exhaustion_alert = Some(Local::now().to_rfc3339());
@@ -9721,6 +10081,7 @@ mod tests {
             attempts: 0,
             max_attempts: 2,
             dialog_pending: false,
+            switch_dialog_pending: false,
             inject_settling: false,
         }
     }
@@ -10034,7 +10395,7 @@ mod tests {
     /// fact that restoring is manual.
     #[test]
     fn the_demotion_push_body_says_from_to_and_manual() {
-        let body = demote_push_body(Some("Fable 5"), "claude-opus-5[1m]");
+        let body = demote_push_body(Some("Fable 5"), "claude-opus-5[1m]", SwitchOutcome::Confirmed);
         assert!(body.contains("Fable 5"), "names the model that ran out: {body}");
         assert!(body.contains("claude-opus-5[1m]"), "names the new model: {body}");
         assert!(body.contains("usage credits"), "names the reason: {body}");
@@ -10049,9 +10410,99 @@ mod tests {
         );
 
         // Unknown source model still produces a sendable body.
-        let body = demote_push_body(None, "claude-opus-5[1m]");
+        let body = demote_push_body(None, "claude-opus-5[1m]", SwitchOutcome::NoDialog);
         assert!(body.contains("its model"), "{body}");
         assert!(body.contains("claude-opus-5[1m]"), "{body}");
+    }
+
+    /// THE REGRESSION. `/model <id>` does not switch the model on its own: it
+    /// opens a "Switch model?" confirmation and waits. The demotion fired,
+    /// typed the command, logged "injected" and pushed "demoted" — while the
+    /// dialog sat unanswered and the loop stayed on the model that had run
+    /// out until a human pressed a key.
+    ///
+    /// So: a pending confirmation must never be reported as a demotion, in
+    /// either channel the operator reads.
+    #[test]
+    fn a_pending_switch_confirmation_is_never_reported_as_a_demotion() {
+        assert!(
+            !SwitchOutcome::Pending.switched(),
+            "an unanswered confirmation means the model did NOT change"
+        );
+
+        let push = demote_push_body(Some("Fable 5"), "claude-opus-5[1m]", SwitchOutcome::Pending);
+        let lower = push.to_lowercase();
+        assert!(
+            !lower.contains("demoted the main loop"),
+            "the push must not claim a demotion that did not happen: {push}"
+        );
+        assert!(
+            lower.contains("unanswered") || lower.contains("not"),
+            "the push has to say the switch is outstanding: {push}"
+        );
+        assert!(
+            lower.contains("answer it"),
+            "and name the one action that finishes it: {push}"
+        );
+        assert!(push.contains("claude-opus-5[1m]"), "{push}");
+        assert!(
+            push.len() <= 200,
+            "lock-screen length, got {} chars: {push}",
+            push.len()
+        );
+
+        let event = demote_event_message(
+            Some("Fable 5"),
+            "claude-opus-5[1m]",
+            "/model claude-opus-5[1m]",
+            2,
+            SwitchOutcome::Pending,
+        );
+        assert!(
+            event.contains("has NOT changed"),
+            "the event must state the model did not change: {event}"
+        );
+        assert!(
+            !event.contains("to keep it running"),
+            "and must not reuse the success wording: {event}"
+        );
+
+        // The answered case, by contrast, says so plainly — the operator's cue
+        // to promote back after the reset depends on it being unambiguous.
+        let confirmed = demote_event_message(
+            Some("Fable 5"),
+            "claude-opus-5[1m]",
+            "/model claude-opus-5[1m]",
+            2,
+            SwitchOutcome::Confirmed,
+        );
+        assert!(confirmed.contains("answered"), "{confirmed}");
+        assert!(confirmed.contains("NOT switch back"), "{confirmed}");
+        for outcome in [
+            SwitchOutcome::Confirmed,
+            SwitchOutcome::NoDialog,
+            SwitchOutcome::NotAttempted,
+        ] {
+            assert!(outcome.switched(), "{outcome:?} leaves the loop switched");
+        }
+    }
+
+    /// The dialog a previous attempt opened is not a prompt: a second
+    /// `/model` typed while it is up goes INTO it. Held, and the alert says
+    /// which brake held it.
+    #[test]
+    fn credit_demote_holds_while_its_own_switch_confirmation_is_up() {
+        let ev = CreditEvidence {
+            switch_dialog_pending: true,
+            ..credit_evidence()
+        };
+        assert_eq!(
+            decide_credit_action(&ev),
+            CreditAction::AlertOnly {
+                corroborated: true,
+                reason: "a model-switch confirmation is already on the pane",
+            }
+        );
     }
 
     /// A receipt, when the notifier prints one, so a delivery claim can point

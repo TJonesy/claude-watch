@@ -645,6 +645,7 @@ condition lasts, so a naive detector re-injects every poll. Five brakes:
 | --- | --- | --- |
 | `min_failures` | 2 | Demoting on a single sighting. Floored at 1, so it cannot be configured into "fire on sight". |
 | `settle_seconds` | 60 | A second `/model` typed into the picker the first one opened. |
+| switch-dialog check | — | Injecting `/model` while an unanswered switch confirmation is on the pane — it would type into the dialog. |
 | `retry_seconds` | 300 | Re-firing on the next poll. |
 | `max_attempts` | 2 | Re-firing forever. The budget resets only when the exhaustion stops being observed — never on a timer. |
 | pending-dialog check | — | Injecting into a login modal the reauth path opened, which would cancel that flow. |
@@ -697,11 +698,61 @@ an idle session long after the demotion worked; if only the pane closed the
 window, a budget spent this week would still be spent when the *next*
 exhaustion arrives, and the path would refuse to act on it.
 
-**Known limit, stated plainly:** the `/model <id>` injection is assumed to
-apply the model directly rather than open a picker that then needs answering.
-`settle_seconds` and the attempt budget bound the cost if a given Claude Code
-build disagrees, and the failures stopping is what the daemon treats as "it
-worked".
+### Typing `/model` is only half of it
+
+That assumption — that `/model <id>` applies the model directly — was wrong,
+and it made the whole path a no-op the first time it fired for real
+(2026-09-20). Claude Code answers the command with a confirmation and *waits*:
+
+```
+Switch model?
+Your next response will be slower and use more tokens
+
+This conversation is cached for the current model. Switching
+to <model> means the full history gets re-read on your next message.
+
+❯ 1. Yes, switch to <model>
+  2. No, go back
+```
+
+The daemon typed the command, wrote "injected" to the log, pushed "demoted" —
+and the session sat on the exhausted model behind an unanswered dialog until a
+human pressed a key. Every brake worked; the action was simply incomplete.
+
+So answering the dialog is part of the demotion (`answer_switch_dialog`,
+default on). After the injection the daemon waits `switch_dialog_wait_secs`
+for the confirmation to appear, answers it, and waits the same budget again
+for it to go away.
+
+**It never presses a key on a guess.** `tmux::model_switch_answer_keys` is the
+only thing that produces a keystroke for this dialog, and it produces *none*
+unless the frame in hand shows the dialog **and** says which row is selected:
+
+| Frame | Keys |
+| --- | --- |
+| cursor on "Yes, switch to …" | `Enter` |
+| cursor on "No, go back" | `Up`, then `Enter` |
+| dialog visible, cursor unreadable | nothing |
+| no dialog (idle prompt, a live question, anything else) | nothing |
+
+No digit is ever sent: `Enter` at a pane that has moved on is a no-op, whereas
+a `1` lands in the conversation as text. That asymmetry decides every
+ambiguous case here — an unanswered dialog is visible, alerted on and retried;
+a keystroke typed into a live session cannot be taken back.
+
+**The notification reports the outcome, not the intention.** A confirmation
+still standing when the budget runs out is reported as a *failed* demotion in
+both channels ("could NOT demote … the confirmation is UNANSWERED on the
+pane"), the `credit_demote_injected` event carries
+`switch_confirmation: pending` and `switched: false`, and the daemon keeps
+trying to answer it on later cycles (one answer sequence per cycle, latch
+expiring after ten minutes) — while the demotion path itself holds, because a
+second `/model` typed at an open dialog goes into the dialog. When a later
+cycle does clear it, that lands as its own claude-event.
+
+Set `answer_switch_dialog = false` to go back to typing the command and
+leaving the dialog to a human; the notification then says the switch is
+unconfirmed, because it is.
 
 ## Tests
 
