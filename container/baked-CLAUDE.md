@@ -206,40 +206,32 @@ work is **not** the main loop:
   classifies it, **delegates**, validates the agent's return value, composes
   the operator-facing reply. That's it.
 
-**Bias toward delegation.** Any operation that involves more than ~1 tool
-call, reads multiple files, makes multi-file edits, runs tests, or ships code
-through review → delegate to an Agent, not inline in the main loop.
+**Bias toward delegation.** Any operation of more than ~1 tool call —
+multiple reads, multi-file edits, tests, or shipping code through review →
+delegate to an Agent, not inline in the main loop.
 
-Why delegate even when nothing forces it:
+Why delegate even when nothing forces it: **context** (a subagent's own
+window keeps large reads / test output / CI logs out of the main loop, which
+sees only the summary); **bounded recovery** (a sideways subagent → abandon
+the item and retry clean; inline failures leave half-finished work);
+**parallelism** (many in-flight subagents while the loop handles inbound);
+and **audit** (each item records what was spawned for which scope when —
+inline work leaves no record).
 
-- **Context is precious.** A subagent runs in its own context window —
-  large reads / test output / CI logs stay there; the main loop sees only
-  the final summary.
-- **Bounded failures recover cleanly.** If a subagent goes sideways, the
-  main loop abandons the queue item and retries clean; inline failures leave
-  half-finished work.
-- **Parallelism.** While an agent works, the main loop handles inbound
-  instead of blocking. Many in-flight subagents at once is healthy.
-- **The queue is the audit trail.** Each item records that the main loop
-  spawned an agent for X scope at Y time; inline work leaves no record.
-
-Tier choice in practice:
-
-- **Interpret / decide / multi-file edit / validate / ship a PR** → Agent.
-- **Single bounded command + check the result** → main loop.
-- **External wait** (CI run, long build, sleep-based poll) → spawn an Agent
-  that does the wait; the main loop must never sit in a polling sleep loop.
+Tier choice in practice: **interpret / decide / multi-file edit / validate /
+ship a PR** → Agent; **single bounded command + check the result** → main
+loop; **external wait** (CI run, long build, poll) → an Agent that does the
+wait (the main loop must never sit in a polling sleep loop).
 
 **One concern per agent.** Each agent handles ONE task — never batch
 unrelated work into a single prompt. For 3 independent things, queue 3 items
 and spawn 3 agents. Batching means a failure on task 2 loses task 3, the
-audit trail is useless, and parallelizable work gets serialized. (Tell you're
-batching wrong: numbered sections for unrelated concerns.)
+audit trail is useless, and parallelizable work gets serialized.
 
-If you're in the main loop and about to chain `Read` → `Edit` → `Edit` →
-`Bash` → `Bash`, **stop and queue an Agent for the whole sequence instead.**
-The PreToolUse queue-gate hook (next section) enforces "Agent spawns require
-a queue item"; this section enforces that the spawn should happen at all.
+If you're in the main loop and about to chain `Read` → `Edit` → `Bash`,
+**stop and queue an Agent for the whole sequence instead.** The PreToolUse
+queue-gate hook (next section) enforces "Agent spawns require a queue item";
+this section enforces that the spawn should happen at all.
 
 ### Long blocking jobs → `workload run`, wait with `workload babysit`
 
@@ -262,12 +254,10 @@ workload babysit <label> --qid q-XXXX [--heartbeat 60] [--max-block 540] [--poll
 - Blocks **in-process** waiting for `<label>` — zero LLM turns while it
   waits.
 - Pats the bound queue item's heartbeat every `--heartbeat` seconds
-  (default 60) so `last_heartbeat_at` stays fresh (never mistaken for
-  orphaned/stuck).
+  (default 60) so `last_heartbeat_at` stays fresh (never mistaken orphaned).
 - **Returns 0** on `done (exit N)` (the workload's rc is propagated).
-- **Returns 75** (EX_TEMPFAIL) at `--max-block` seconds (default 540,
-  under the Bash 600 s cap) if still running, printing
-  `still-running ... — rerun to keep waiting`.
+- **Returns 75** (EX_TEMPFAIL) at `--max-block` seconds (default 540, under
+  the Bash 600 s cap) if still running.
 
 **Pattern**: call `workload babysit`; on **exit 75 re-invoke it** to keep
 waiting. Each re-invocation is the only LLM-turn cost of the whole wait
@@ -276,22 +266,20 @@ waiting. Each re-invocation is the only LLM-turn cost of the whole wait
 
 ## Queue protocol — every Agent tool call
 
-Before firing **any** `Agent` tool call, you MUST first add a queue
-item via `session-task queue`. The queue serializes work touching
-overlapping scopes, and the in-container scope namespace is **shared
-with the host** — `repo:claude-watch` covers BOTH host- and
-container-side work on that repo. An agent skipping the queue can race
-host-side work, lose edits to a parallel agent, or stomp builds.
+Before firing **any** `Agent` tool call, you MUST first add a queue item
+via `session-task queue`. The queue serializes work touching overlapping
+scopes, and the scope namespace is **shared with the host** —
+`repo:claude-watch` covers BOTH host- and container-side work on that repo.
+An agent skipping the queue can race host work, lose edits to a parallel
+agent, or stomp builds.
 
 **Scope: this governs every `Agent` call the MAIN LOOP dispatches —
 one queue item per main-loop-spawned agent, the queue being the main
 loop's audit trail of work IT dispatched.** It does NOT separately
-enqueue *nested* subagents (agents an agent spawns under itself, or
-sub-work an agent runs internally) — those are not individually
-queue-tracked by the main loop. (The `subagent_queue_item_running`
-predicate below is the related-but-distinct case: it keeps a RUNNING
-subagent's already-bound q-id valid — that q-id is the one the main
-loop enqueued at spawn, not a fresh per-nested-agent item.)
+enqueue *nested* subagents (agents an agent spawns under itself) — those
+are not individually queue-tracked. (The `subagent_queue_item_running`
+predicate below is distinct: it keeps a RUNNING subagent's already-bound
+q-id valid — the one the main loop enqueued at spawn, not a fresh item.)
 
 **The `pre-agent-queue-gate-hook` PreToolUse hook IS active inside
 this container** when `CLAUDE_CONTAINER_OBLIGATIONS=1` (the default).
@@ -303,14 +291,12 @@ unknown / non-`running` queue id — is HARD-DENIED at dispatch, exactly
 like on the host; the model gets the deny banner back as a permission
 denial and never sees the spawn happen.
 
-The hook resolves queue state via `session-task queue show <id>`. That
-CLI ships in the bind-mounted `~/repos/claude-watch/tools/session-task/`
-tree. When the bind-mount is absent (stripped-down `docker run` without
-`~/repos`), the lookup returns "not found" and the hook still DENIES —
-the deny reason names `session-task` so the operator can see why; ask
-them to bind-mount `~/repos/claude-watch` (the example compose does this
-by default). The hook only default-opens on TRULY unexpected internal
-errors (broad-except fail-safe), not the routine "CLI missing" path.
+The hook resolves queue state via `session-task queue show <id>` (from the
+bind-mounted `~/repos/claude-watch/tools/session-task/` tree). When the
+bind-mount is absent the lookup returns "not found" and the hook still
+DENIES (the deny reason names `session-task` — ask the operator to
+bind-mount `~/repos/claude-watch`; the example compose does). It
+default-opens only on TRULY unexpected internal errors, not "CLI missing".
 
 The five-step protocol (mirrors the host `## Resume Actions` workflow):
 
@@ -338,40 +324,31 @@ before spawning agents at all.
 ### Parking on an external blocker — use `block`, not a fake `running`
 
 When an agent finishes all autonomous work and is parked on something
-OUTSIDE the system (awaiting CI, human greenlight, branch-protection
-toggle, third-party API window), flip the item to `blocked` — do NOT
-leave it a fake `running`. Flow: `register` (→running) →
-`block <id> --reason "awaiting <X>"` (→blocked) → `unblock <id>` when
-the blocker clears (or `done` / `abandon`). `unblock` preserves
-`blocked_at` + `block_reason` as audit.
+OUTSIDE the system (awaiting CI, human greenlight, branch-protection toggle,
+third-party API window), flip the item to `blocked` — do NOT leave it a fake
+`running`. Flow: `register` (→running) → `block <id> --reason "awaiting <X>"`
+(→blocked) → `unblock <id>` when the blocker clears (or `done`/`abandon`).
+`unblock` preserves `blocked_at` + `block_reason` as audit.
 
-`blocked` (system did its part, waiting on someone else) is
-distinct from `wedge` (the system itself is STUCK). Blocked items are
-labeled distinctly by the exporter and are EXEMPT from the
-WorkQueueOrphaned / running-without-owner alert. So `block` is the
-HONEST way to park work: a fake `running` lies about state, holds the
-scope lock, and trips the orphaned-running alert; abandon-and-re-add
-loses the item's identity + audit trail.
+`blocked` (waiting on someone else) is distinct from `wedge` (the system
+itself is STUCK). Blocked items are EXEMPT from the WorkQueueOrphaned /
+running-without-owner alert. So `block` is the HONEST way to park work: a
+fake `running` lies about state, holds the scope lock, and trips the
+orphaned-running alert; abandon-and-re-add loses the item's audit trail.
 
 ### Verify agent success before marking done
 
 **Never call `session-task queue done <id>` until you have received the
 agent's task-notification AND verified the agent reported success.** The
 main loop receives many `<task-notification>` messages (watchers, other
-background tasks) — only the one carrying the agent's `task-id` signals
-that agent's completion. Specifically:
+background tasks) — only the one whose `task-id` matches the agent you
+spawned signals its completion. Verify `<status>completed</status>` (not
+`failed`/`cancelled`), THEN `done`; on failure or unconfirmed success,
+`abandon <id> --reason "agent failed: <reason>"`.
 
-- Wait for the `<task-notification>` whose `task-id` matches the agent
-  you spawned (not any other background task).
-- Verify `<status>completed</status>` (not `failed`/`cancelled`), THEN
-  call `session-task queue done <id>`.
-- If the agent failed or you cannot confirm success, call
-  `session-task queue abandon <id> --reason "agent failed: <reason>"`.
-
-Marking a queue item `done` prematurely (before agent completion or on
-a misidentified notification) releases the scope lock and lets
-conflicting work start — racing the still-running agent or silently
-dropping failed work on the floor.
+Marking a queue item `done` prematurely (before agent completion or on a
+misidentified notification) releases the scope lock and lets conflicting
+work start — racing the still-running agent or dropping failed work.
 
 ### Agent completion ack obligation (enforced)
 
@@ -388,31 +365,24 @@ the main loop MUST follow this protocol:
 
 **The evaluator IMMEDIATELY blocks ANY non-exempt Bash call** while
 pending-ack entries exist (`$AGENT_ACK_N` defaults to 0 — no grace
-window). This means: the VERY FIRST tool call you attempt after an
-agent completes will be DENIED unless you have already called
-`agent-ack register`. Agent completions are the highest-priority
-work the main loop can do — nothing else proceeds until they are
-processed.
+window): the VERY FIRST tool call after an agent completes is DENIED unless
+you already called `agent-ack register`. Agent completions are the
+highest-priority main-loop work — nothing else proceeds until processed.
 
 **Why N=0 (no grace window)?** Claude Code fires no PostToolUse hook on
-agent completion — completions arrive as system messages, so nothing
-auto-populates `agent-ack-pending.json`. The loop MUST `agent-ack
-register` as its first action on a task-notification. With N=0, forgetting
-to register fires the gate on the very next call — immediately visible.
+agent completion (completions arrive as system messages), so nothing
+auto-populates `agent-ack-pending.json`. `agent-ack register` MUST be the
+loop's first action on a task-notification; with N=0, forgetting fires the
+gate on the very next call — immediately visible.
 
 **Concrete sequence when you receive a task-notification:**
 
 ```sh
 # 1. IMMEDIATELY register (before any other tool call)
 agent-ack register q-2026-05-28-XXXX --agent-id agent-abc123
-
-# 2. Read agent output, verify success/failure
-#    (this is exempt — agent-ack commands pass through the gate)
-
-# 3. Close the queue item
+# 2. Read agent output, verify success/failure (agent-ack cmds are exempt)
+# 3. Close the item: session-task queue done|abandon q-2026-05-28-XXXX
 session-task queue done q-2026-05-28-XXXX
-# OR: session-task queue abandon q-2026-05-28-XXXX --reason "..."
-
 # 4. Clear the pending-ack entry — gate stops firing
 agent-ack done q-2026-05-28-XXXX
 ```
@@ -430,20 +400,17 @@ agent-ack clear                                   # escape hatch
 ### Queue IMMEDIATELY — never defer
 
 **Queue items the moment you intend to do the work.** Never "I'll queue
-it once X finishes" — queue it NOW. Use scopes + the blocking mechanism
-to keep it from RUNNING until the right time. Holding a task in your
-head instead of the queue means it gets lost on compaction/clear. If
-the scope genuinely conflicts, add it with `--force-enqueue` — it'll be
-serialized behind the running item automatically:
+it once X finishes" — queue it NOW; a task held in your head is lost on
+compaction/clear. If the scope conflicts, add it with `--force-enqueue`
+and it serializes behind the running item automatically:
 
 ```
 session-task queue add "..." --scope <same-scope> --force-enqueue
 ```
 
 **Restart-tasks are queueable too.** Redeploy / `cwsr` / restart are
-ordinary work — enqueue them via `session-task`, encoding the restart
-dependency with a blocking scope. The queue survives restarts (at worst
-a running agent needs resurrecting, which the tooling supports).
+ordinary work — enqueue them, encoding the restart dependency with a
+blocking scope. The queue survives restarts.
 
 ### Continuous subagent queue-discipline enforcement
 
@@ -460,34 +427,51 @@ from the entrypoint when `CLAUDE_CONTAINER_OBLIGATIONS=1`).
 > the presence-gate) stay DECLARATIVE private config: never baked, no
 > `register-*` step. Absent mount = no-op.
 
-How it works:
+How it works: `post-tool-agent-arm-hook` (`PostToolUse:Agent`) binds the
+spawn's `Queue item: q-XXXX` marker to the new subagent's `agentId` in
+`~/.config/claude/agent-queue-bindings.json`. On each subsequent subagent
+tool call the predicate looks up that q-id: `running` → ALLOW;
+`done`/`abandoned`/vanished → DENY (banner names q-id + status). Main-loop
+calls always allowed (`is_main_loop {negate: true}` in an `all_of`).
 
-  - `post-tool-agent-arm-hook` fires on every successful Agent spawn
-    (`PostToolUse:Agent`), binding the spawn's `Queue item: q-XXXX`
-    marker to the new subagent's `agentId` in
-    `~/.config/claude/agent-queue-bindings.json`.
-  - On each subsequent **subagent** tool call, the
-    `subagent_queue_item_running` predicate looks up that q-id:
-    `running` → **ALLOW**; `done`/`abandoned`/vanished → **DENY**
-    (banner names q-id + status).
-  - Main-loop calls always allowed (`is_main_loop {negate: true}` in
-    an `all_of`).
-
-**As a subagent, when you hit this gate:** the queue item was
-finished, abandoned, or pruned. Either **re-register** (`session-task
-queue register <new-q-id>` is exempt — pick up a rotated q-id), or
-**stop** (if done, return your value and exit — don't work past a
-`done` state; the main loop no longer tracks you).
+**As a subagent, when you hit this gate:** the queue item was finished,
+abandoned, or pruned. Either **re-register** (`session-task queue register
+<new-q-id>` is exempt — pick up a rotated q-id), or **stop** (if done,
+return your value and exit; the main loop no longer tracks you).
 
 The exempt set: `session-task queue {status,spawn-check,register,show,list}`,
 `obligations {list,show,status,check,override,satisfy}`,
 `claude-watch-ack`, `claude-watch-dispatch`, `agent-msg
 {ack,inbox,gc,disarm}`, `agent-tail`.
 
-Default-open (predicate inert, ALLOWED): main-loop call (no
-`agent_id`); binding file missing/corrupt; or no binding entry for this
-agent_id (spawned pre-rollout, OR no `Queue item: q-XXXX` marker). A
-hook bug can never blackhole a real subagent.
+Default-open (predicate inert, ALLOWED): main-loop call (no `agent_id`);
+binding file missing/corrupt; or no binding entry for this agent_id
+(spawned pre-rollout, OR no `Queue item: q-XXXX` marker). A hook bug can
+never blackhole a real subagent.
+
+### Subagents MUST NOT mutate queue state — hard prohibition
+
+**CARDINAL for subagents.** The queue is the MAIN loop's audit trail; a
+subagent mutating it races the loop and orphans items. As a subagent you
+**MUST NOT** run any mutating `session-task queue` subcommand: NEVER `add`
+(the loop already enqueued the item in your `Queue item: q-XXXX` marker —
+return follow-up work in your final value instead), NEVER `done`/`abandon`
+(the loop closes the item after verifying you, per `agent_ack_pending`),
+and NEVER `block`/`unblock`/`wedge`/`unwedge`/`force-start`/`promote`/
+`depend`/`prune`/`set-summary`/`update-scope`/`resurrect`/`pop`/
+`heartbeat`/`lock`/`unlock`/`migrate`. The ONLY queue subcommands you may
+run are read-only (`list`/`show`/`scope`/`groups`/`ready`/`spawn-check`/
+`banner`/`locks`/`status`) and `register` — and `register` ONLY to
+re-claim a ROTATED q-id the loop already created (it refuses a q-id the
+queue has no record of, so it is never a back-door to `add`).
+
+Enforced by the `subagent_queue_mutating_banned` obligations predicate
+(seeded by `obligations-init`, `all_of [is_main_loop {negate: true},
+subagent_queue_mutating_banned]` → subagent-only). The detector is
+**AST-aware** (`shell_ast`): it catches a banned subcommand in ANY command
+position — after `&&`/`;`/`|`, behind an `env`/`sudo` wrapper, or inside a
+`$(...)`/`bash -c` body — not just at string start (an earlier anchored
+regex missed those, letting a subagent slip a `queue add` past the gate).
 
 ### Generic `evaluator` predicate — delegate gate decisions to a script
 

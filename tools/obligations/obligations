@@ -610,20 +610,64 @@ SUBAGENT_BANNED_QUEUE_SUBCOMMANDS = frozenset({
 
 # Anchored matcher for `session-task queue <subcmd>`, tolerating a leading
 # path prefix (e.g. /usr/local/bin/) and arbitrary inter-token whitespace.
+# Used ONLY as the FAIL-CLOSED fallback when the AST parser is unavailable or
+# raises (see _session_task_queue_subcommands). The anchor is exactly why it
+# is not the primary path: it catches `session-task queue add` ONLY at the
+# very start of the string, so it MISSED every compound / wrapped / substituted
+# invocation (`cd /x && session-task queue add`, `env FOO=1 session-task queue
+# add`, `true; session-task queue add`, `OUT=$(session-task queue add)`) -- the
+# precise bypass that let a subagent create+mutate queue items despite this gate.
 _SESSION_TASK_QUEUE_SUBCMD_RE = re.compile(
     r"^\s*(?:\S*/)?session-task\s+queue\s+([a-z][a-z-]*)\b"
 )
 
 
-def _session_task_queue_subcommand(command_string):
-    """Return the `session-task queue <subcmd>` subcommand name (str) for
-    a Bash command, or None if it is not a `session-task queue ...`
-    invocation. Shared by the universal-floor subagent carve-out and the
-    subagent_queue_mutating_banned predicate so they parse identically."""
+def _session_task_queue_subcommands(command_string):
+    """Set of `session-task queue <subcmd>` subcommand tokens a Bash command
+    actually RUNS, across ALL command-position contexts (top-level segments
+    after `&&` / `;` / `|`, behind env-assignments / wrappers, and inside
+    `$(...)` / backtick / `sh -c` bodies).
+
+    AST-aware via ``shell_ast.subcommands_after`` -- the SAME structural model
+    the sibling ``no_backgrounded_watcher`` / privilege-escalation gates use --
+    so a `session-task queue add` anywhere in a compound command is caught,
+    while a mention inside a quoted arg / heredoc body (data, not a command)
+    is correctly ignored.
+
+    FAILS CLOSED to the anchored ``_SESSION_TASK_QUEUE_SUBCMD_RE`` when the AST
+    module is unavailable or the command is unparseable -- preserving at least
+    the pre-existing leading-position catch rather than silently allowing.
+
+    Shared by the universal-floor subagent carve-out and the
+    subagent_queue_mutating_banned predicate so they classify identically.
+    Returns an empty set when the command runs no `session-task queue` at all.
+    """
     if not command_string:
-        return None
+        return set()
+    if _shell_ast is not None:
+        try:
+            subs = _shell_ast.subcommands_after(
+                command_string, "session-task queue")
+            # Drop the "" marker (phrase present with no trailing subcommand).
+            return {s for s in subs if s}
+        except _shell_ast.ShellParseError:
+            pass  # fall through to fail-closed anchored regex
+        except Exception:  # noqa: BLE001 -- never let a helper bug gate
+            pass
     m = _SESSION_TASK_QUEUE_SUBCMD_RE.search(command_string)
-    return m.group(1) if m else None
+    return {m.group(1)} if m else set()
+
+
+def _session_task_queue_banned_subcommand(command_string):
+    """Return ONE mutating `session-task queue` subcommand this command runs
+    (member of SUBAGENT_BANNED_QUEUE_SUBCOMMANDS), or None if it runs none.
+
+    AST-aware (see _session_task_queue_subcommands): catches a banned
+    subcommand in ANY command-position context, not just at string start.
+    Deterministic pick (sorted) so the deny message is stable."""
+    hits = _session_task_queue_subcommands(command_string) \
+        & SUBAGENT_BANNED_QUEUE_SUBCOMMANDS
+    return sorted(hits)[0] if hits else None
 
 
 # MUTATING `session-task queue` subcommands the MAIN loop must not run while a
@@ -2767,15 +2811,20 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
             cmd = command_string or ""
             if not cmd.strip():
                 return (True, "empty command (allow)")
-            # Parse the `session-task queue <subcmd>` subcommand via the
-            # shared helper (tolerates a leading path prefix + arbitrary
-            # inter-token whitespace). Reuses the SAME parse + banned-set the
-            # universal-floor subagent carve-out uses, so the two can never
-            # disagree about what counts as "mutating".
-            subcmd = _session_task_queue_subcommand(cmd)
+            # Detect a MUTATING `session-task queue <subcmd>` via the shared
+            # AST-aware helper. This catches the subcommand in ANY command
+            # position -- after `&&` / `;` / `|`, behind an env-assignment or
+            # wrapper, or inside a `$(...)` / `sh -c` body -- not merely at the
+            # start of the string. The old anchored-regex path missed all of
+            # those compound shapes, which is exactly how a subagent slipped a
+            # `session-task queue add` past this gate. Reuses the SAME parse +
+            # banned-set the universal-floor subagent carve-out uses, so the
+            # two can never disagree about what counts as "mutating".
+            subcmd = _session_task_queue_banned_subcommand(cmd)
             if subcmd is None:
                 return (True,
-                        "not a `session-task queue <subcmd>` command (allow)")
+                        "no MUTATING `session-task queue <subcmd>` invoked "
+                        "(allow)")
             if subcmd in SUBAGENT_BANNED_QUEUE_SUBCOMMANDS:
                 return (False,
                         f"subagents may not run the MUTATING queue subcommand "
@@ -3531,8 +3580,13 @@ def _universal_recovery_exempt_match(tool_name, command_string,
                 return (True, epat)
     if (matched and tool_name == "Bash"
             and _is_subagent_context(agent_id, agent_type)):
-        subcmd = _session_task_queue_subcommand(command_string)
-        if subcmd in SUBAGENT_BANNED_QUEUE_SUBCOMMANDS:
+        # AST-aware: a mutating subcommand in ANY command position (after
+        # `&&`/`;`, behind a wrapper, inside `$(...)`) carves the floor. The
+        # old anchored regex only saw a leading `session-task queue add`, so
+        # `cd /x && session-task queue add` short-circuited on the floor and
+        # never reached the per-row deny -- the core bypass this fixes.
+        if _session_task_queue_subcommands(
+                command_string) & SUBAGENT_BANNED_QUEUE_SUBCOMMANDS:
             # Subagent + mutating queue subcommand: do NOT let the floor
             # short-circuit; fall through to per-obligation evaluation so
             # subagent_queue_mutating_banned can DENY. (The main loop keeps
@@ -3549,8 +3603,12 @@ def _universal_recovery_exempt_match(tool_name, command_string,
         if tool_name == "Agent":
             return (False, None)
         if tool_name == "Bash":
-            subcmd = _session_task_queue_subcommand(command_string)
-            if subcmd in MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS:
+            # AST-aware (mirrors the subagent carve-out above): catch a gated
+            # dispatch subcommand in any command position, not just at string
+            # start, so a compound `... && session-task queue add` cannot slip
+            # past the drain gate either.
+            if _session_task_queue_subcommands(
+                    command_string) & MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS:
                 return (False, None)
     return (matched, which)
 
