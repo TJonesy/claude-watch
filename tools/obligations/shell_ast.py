@@ -836,6 +836,69 @@ def command_invokes(cmd: str, targets) -> bool:
     return any(name_matches(n, s) for n in names for s in specs)
 
 
+def subcommands_after(cmd: str, head_phrase, _depth: int = 0) -> set:
+    """Set of the SUBCOMMAND words that immediately follow a multi-word
+    command ``head_phrase`` (e.g. ``"session-task queue"``) across every
+    command-POSITION context: each top-level segment head AND every
+    ``$(...)`` / backtick / process-substitution / ``sh -c`` body.
+
+    This is the AST answer to "what ``session-task queue <SUBCMD>`` is this
+    command actually RUNNING?" -- the question a raw
+    ``^\\s*session-task\\s+queue\\s+(\\w+)`` regex CANNOT answer once the
+    invocation is NOT at the very start of the string. The anchored regex
+    misses every compound / wrapped / substituted shape::
+
+        cd /x && session-task queue add ...     # after a `&&`
+        env FOO=1 session-task queue done ...    # behind an env-assignment
+        true; session-task queue abandon ...     # after a `;`
+        OUT=$(session-task queue add ...)         # inside a command sub
+
+    all of which RUN the subcommand. This helper walks the SAME structural
+    model ``invocation_names`` walks, so it catches all of them, while an
+    occurrence inside a quoted argument or heredoc body (data, never a
+    command head) is correctly ignored -- e.g.
+    ``echo 'session-task queue add'`` yields ``set()``.
+
+    ``head_phrase`` is a whitespace-separated phrase whose FIRST token is
+    matched by BASENAME (so ``/usr/local/bin/session-task queue add`` still
+    matches the phrase ``"session-task queue"``) and whose remaining tokens
+    are matched literally against the following stripped words. The returned
+    set holds the raw next word after the phrase for each matching context
+    (empty when the phrase is the whole segment with no trailing word).
+
+    Raises ``ShellParseError`` on parse failure so the caller FAILS CLOSED
+    (an unparseable command is exactly where a hidden mutation would live).
+    """
+    if _depth > _MAX_INVOCATION_DEPTH:
+        raise ShellParseError('command nesting too deep')
+    phrase_tokens = [t for t in str(head_phrase or "").split() if t]
+    if not phrase_tokens:
+        return set()
+    parsed = parse(cmd)
+    out: set = set()
+    for seg in parsed.segments:
+        words = _strip_command_prefix(seg.words)
+        # First phrase token matches by basename; the rest literally.
+        if len(words) >= len(phrase_tokens):
+            first_ok = os.path.basename(words[0]) == phrase_tokens[0]
+            rest_ok = words[1:len(phrase_tokens)] == phrase_tokens[1:]
+            if first_ok and rest_ok:
+                if len(words) > len(phrase_tokens):
+                    out.add(words[len(phrase_tokens)])
+                else:
+                    out.add("")  # phrase present but no subcommand word
+        # Recurse into every command-substitution / procsub / `-c` body so
+        # a mutation hidden in ``$(...)`` or ``bash -c '...'`` is caught too.
+        for word in seg.words:
+            for inner in _substitution_bodies(word):
+                out |= subcommands_after(inner, head_phrase, _depth + 1)
+            for inner in _procsub_bodies(word):
+                out |= subcommands_after(inner, head_phrase, _depth + 1)
+        for inner in _dash_c_bodies(seg.words):
+            out |= subcommands_after(inner, head_phrase, _depth + 1)
+    return out
+
+
 def name_matches(name: str, spec: str) -> bool:
     """Does a command-head BASENAME match a name spec?
 
@@ -1617,6 +1680,35 @@ def _run_tests() -> int:
         ok("command_invokes unparseable raises", False, "no exception")
     except ShellParseError:
         ok("command_invokes unparseable raises", True)
+
+    # --- subcommands_after (the AST queue-subcommand detector) ---
+    def subs(c):
+        return subcommands_after(c, "session-task queue")
+    ok("queue add at string start -> {add}",
+       subs("session-task queue add x") == {"add"})
+    ok("queue add after && -> {add} (regex-missed shape)",
+       subs("cd /tmp && session-task queue add x") == {"add"})
+    ok("queue done behind env-assign -> {done}",
+       subs("env FOO=1 session-task queue done q-1") == {"done"})
+    ok("queue abandon after ; -> {abandon}",
+       subs("true; session-task queue abandon q-1 --reason y") == {"abandon"})
+    ok("queue add inside $() -> {add}",
+       subs("OUT=$(session-task queue add x)") == {"add"})
+    ok("queue done inside bash -c -> {done}",
+       subs('bash -c "session-task queue done q-1"') == {"done"})
+    ok("path-prefixed session-task -> basename match",
+       subs("/usr/local/bin/session-task queue register q-1") == {"register"})
+    ok("multiple queue invocations -> union",
+       subs("session-task queue add a && session-task queue register q-1")
+       == {"add", "register"})
+    ok("queue add in single-quoted arg -> not a command",
+       subs("echo 'session-task queue add'") == set())
+    ok("queue add echoed as data -> not a command",
+       subs("echo session-task queue add") == set())
+    ok("bare `session-task queue` (no subcmd) -> {''}",
+       subs("session-task queue") == {""})
+    ok("empty head_phrase -> empty set",
+       subcommands_after("session-task queue add x", "") == set())
 
     passed = sum(1 for _, c, _ in cases if c)
     for name, cond, detail in cases:
