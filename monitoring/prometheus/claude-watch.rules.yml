@@ -302,7 +302,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "claude-watch daemon is down (state file unreadable)"
+          summary: "claude-watch daemon is down or state file unreadable"
           description: >-
             claude_watch_up == 0 -- claude-watch's state.json is unreadable or
             the daemon is not running.
