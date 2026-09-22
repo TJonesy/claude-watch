@@ -1,0 +1,171 @@
+# promtool unit tests for the daemon + event-bus groups of
+# claude-watch.rules.yml (`claude-watch-events`, `claude-watch-daemon`).
+#
+# Run the whole directory through the repo's own gate:
+#
+#     make test-prometheus-rules
+#
+# or a single suite directly:
+#
+#     promtool test rules monitoring/prometheus/tests/daemon_events_test.yml
+#
+# `rule_files` below is resolved RELATIVE TO THIS FILE, not to the working
+# directory. See work_queue_test.yml's header for why every alert here gets a
+# POSITIVE assertion as well as a silent one: `promtool test rules` exits 0 on
+# a suite that loaded zero rules, so a suite made only of `exp_alerts: []`
+# expectations passes vacuously and proves nothing.
+
+rule_files:
+  - ../claude-watch.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --------------------------------------------------------------------
+  # ClaudeEventsBacklogStale -- the oldest unconsumed event has aged out,
+  # which is the signal of a wedged main loop or a dead watcher.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "oldest unconsumed event past 10m fires ClaudeEventsBacklogStale"
+    input_series:
+      - series: 'claude_events_age_seconds{job="claude-events",instance="claude-events-exporter:9103"}'
+        values: '700+60x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ClaudeEventsBacklogStale
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ClaudeEventsBacklogStale
+        exp_alerts:
+          - exp_labels:
+              alertname: ClaudeEventsBacklogStale
+              job: claude-events
+              instance: claude-events-exporter:9103
+              severity: warning
+            exp_annotations:
+              summary: "claude-events backlog is going stale"
+              description: "Oldest unconsumed claude-event is >10m old. Suggests a wedged main loop or a dead claude-event-watch watcher."
+
+  - interval: 1m
+    name: "a drained event bus keeps ClaudeEventsBacklogStale silent"
+    input_series:
+      - series: 'claude_events_age_seconds{job="claude-events",instance="claude-events-exporter:9103"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ClaudeEventsBacklogStale
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # ClaudeWatchDown -- severity CRITICAL. The daemon publishes
+  # claude_watch_up 0 when its state file is unreadable or it is not
+  # running at all.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "claude_watch_up pinned at 0 fires ClaudeWatchDown (critical)"
+    input_series:
+      - series: 'claude_watch_up{job="node",instance="host.docker.internal:9100"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ClaudeWatchDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ClaudeWatchDown
+        exp_alerts:
+          - exp_labels:
+              alertname: ClaudeWatchDown
+              job: node
+              instance: host.docker.internal:9100
+              severity: critical
+            exp_annotations:
+              summary: "claude-watch daemon is down or state file unreadable"
+              description: "claude_watch_up == 0 -- claude-watch's state.json is unreadable or the daemon is not running."
+
+  - interval: 1m
+    name: "a healthy daemon keeps ClaudeWatchDown silent"
+    input_series:
+      - series: 'claude_watch_up{job="node",instance="host.docker.internal:9100"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ClaudeWatchDown
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # ClaudeWatchersMissing -- ANY enabled watcher missing, not a quorum.
+  # One missing watcher is enough; that is the whole point of the rule.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "a single missing watcher fires ClaudeWatchersMissing"
+    input_series:
+      - series: 'claude_watchers_missing{job="node",instance="host.docker.internal:9100"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ClaudeWatchersMissing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ClaudeWatchersMissing
+        exp_alerts:
+          - exp_labels:
+              alertname: ClaudeWatchersMissing
+              job: node
+              instance: host.docker.internal:9100
+              severity: warning
+            exp_annotations:
+              summary: "1 claude-watch watcher(s) missing"
+              description: "claude_watchers_missing > 0 -- one or more enabled watchers have gone missing. The daemon's watcher_down interrupt handles this in-tree; this is the external mirror."
+
+  - interval: 1m
+    name: "zero missing watchers keeps ClaudeWatchersMissing silent"
+    input_series:
+      - series: 'claude_watchers_missing{job="node",instance="host.docker.internal:9100"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ClaudeWatchersMissing
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # ClaudeMainLoopAckStale -- severity CRITICAL. The expr is time()-based,
+  # so the input series is pinned to the unix epoch promtool starts its
+  # test clock at (0) and staleness reads straight off eval_time.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "frozen ack timestamp fires ClaudeMainLoopAckStale (critical)"
+    input_series:
+      # Last-ack timestamp frozen at t=0 while the clock advances, so
+      # staleness == eval_time. Crosses 900s at 15m, +5m `for` -> 20m.
+      - series: 'claude_mainloop_last_ack_timestamp_seconds{job="node",instance="host.docker.internal:9100"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: ClaudeMainLoopAckStale
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: ClaudeMainLoopAckStale
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: ClaudeMainLoopAckStale
+        exp_alerts:
+          - exp_labels:
+              alertname: ClaudeMainLoopAckStale
+              job: node
+              instance: host.docker.internal:9100
+              severity: critical
+            exp_annotations:
+              summary: "claude main loop has not acked an event in >15m"
+              description: "No claude-event has been acked in >15m, through at least two keepalive windows. The main loop is likely wedged."
+
+  - interval: 1m
+    name: "a loop acking every minute never fires ClaudeMainLoopAckStale"
+    input_series:
+      # Timestamp advances in step with the clock (60s per minute), so
+      # staleness stays flat at 0 and the rule never crosses 900s.
+      - series: 'claude_mainloop_last_ack_timestamp_seconds{job="node",instance="host.docker.internal:9100"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: ClaudeMainLoopAckStale
+        exp_alerts: []

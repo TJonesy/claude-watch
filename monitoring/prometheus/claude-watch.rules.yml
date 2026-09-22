@@ -16,7 +16,12 @@
 #     rule_files:
 #       - /etc/prometheus/rules/claude-watch.rules.yml
 # then mount this path (or a CW_REPO_DIR-relative bind) into the container.
-# Validate with `promtool check rules monitoring/prometheus/claude-watch.rules.yml`.
+# Validate a change with `make test-prometheus-rules` (or
+# `scripts/check-prometheus-rules.sh`), which runs `promtool check rules` AND
+# the assertion suites in monitoring/prometheus/tests/. Every alert and
+# recording rule below must be named by at least one suite -- the gate fails
+# on an untested rule, because a rules change that breaks a consumer has to
+# fail on the pull request that makes it.
 #
 # ## Two-stage orphan escalation ladder (Andrew, #4038/#4039)
 #

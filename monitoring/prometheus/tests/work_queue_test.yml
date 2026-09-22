@@ -1,0 +1,406 @@
+# promtool unit tests for the work-queue groups of claude-watch.rules.yml
+# (`claude-watch-work-queue.recording` and `claude-watch-work-queue`).
+#
+# Run the whole directory through the repo's own gate:
+#
+#     make test-prometheus-rules
+#
+# or a single suite directly:
+#
+#     promtool test rules monitoring/prometheus/tests/work_queue_test.yml
+#
+# `rule_files` below is resolved RELATIVE TO THIS FILE, not to the working
+# directory, so the suite runs identically from a checkout, from CI, and from
+# inside a promtool container that mounts monitoring/prometheus.
+#
+# WHY EVERY ALERT HERE HAS A POSITIVE ASSERTION
+#
+# `promtool test rules` reports SUCCESS on a suite that loaded ZERO rules. A
+# `rule_files:` entry matching nothing is not an error -- promtool prints
+# "WARNING: no file match pattern ..." and then exits 0, at which point every
+# `exp_alerts: []` expectation holds trivially. A suite built only from
+# negative assertions therefore cannot fail and proves nothing.
+#
+# So each alert gets BOTH a firing case with concrete labels and annotations
+# AND a silent case. Break the rules path and the positives go red on the
+# first case. scripts/check-prometheus-rules.sh adds the outer guards (the
+# rule file must load a non-zero number of rules, every suite's rule_files
+# must resolve, and the "no file match pattern" warning is treated as fatal
+# even when promtool exits 0).
+
+rule_files:
+  - ../claude-watch.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --------------------------------------------------------------------
+  # Recording group `claude-watch-work-queue.recording` -- asserted BY
+  # VALUE, which is the strongest available proof the group really loaded.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "orphan/owned/never-spawned counts are recorded from has_live_owner"
+    input_series:
+      # Two orphans (one never-spawned with agent_id="", one died-after-spawn)
+      # and one healthy owned item. A blocked item is present to prove the
+      # status="running" filter holds.
+      - series: 'worktask_queue_item_has_live_owner{id="q-a",status="running",agent_id="",job="work-queue"}'
+        values: '0+0x20'
+      - series: 'worktask_queue_item_has_live_owner{id="q-b",status="running",agent_id="agt-9",job="work-queue"}'
+        values: '0+0x20'
+      - series: 'worktask_queue_item_has_live_owner{id="q-c",status="running",agent_id="agt-7",job="work-queue"}'
+        values: '1+0x20'
+      - series: 'worktask_queue_item_has_live_owner{id="q-d",status="blocked",agent_id="",job="work-queue"}'
+        values: '0+0x20'
+    promql_expr_test:
+      - eval_time: 10m
+        expr: worktask:queue_items_orphaned:count
+        exp_samples:
+          - labels: 'worktask:queue_items_orphaned:count'
+            value: 2
+      - eval_time: 10m
+        expr: worktask:queue_items_owned:count
+        exp_samples:
+          - labels: 'worktask:queue_items_owned:count'
+            value: 1
+      - eval_time: 10m
+        expr: worktask:queue_items_orphaned_never_spawned:count
+        exp_samples:
+          - labels: 'worktask:queue_items_orphaned_never_spawned:count'
+            value: 1
+
+  - interval: 1m
+    name: "recording rules fall back to 0 when nothing is running"
+    input_series:
+      - series: 'worktask_queue_item_has_live_owner{id="q-e",status="blocked",agent_id="",job="work-queue"}'
+        values: '0+0x20'
+    promql_expr_test:
+      - eval_time: 10m
+        expr: worktask:queue_items_orphaned:count
+        exp_samples:
+          # `or vector(0)` still carries the recording rule's own __name__,
+          # so the fallback sample is NOT label-less.
+          - labels: 'worktask:queue_items_orphaned:count'
+            value: 0
+      - eval_time: 10m
+        expr: worktask:queue_items_owned:count
+        exp_samples:
+          - labels: 'worktask:queue_items_owned:count'
+            value: 0
+
+  # --------------------------------------------------------------------
+  # WorkQueueOrphaned -- Stage 2 of the escalation ladder. Timing is part
+  # of the contract: it must fire at 5m, an order of magnitude behind the
+  # Stage-1 queue-orphaned claude-event, so a `for:` change shows up here.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "an owner-less running item fires WorkQueueOrphaned after 5m"
+    input_series:
+      - series: 'worktask_queue_item_has_live_owner{id="q-f",summary="stranded",status="running",agent_id="",job="work-queue"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: WorkQueueOrphaned
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: WorkQueueOrphaned
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueOrphaned
+              id: q-f
+              summary: stranded
+              status: running
+              # agent_id is deliberately absent: the never-spawned case has
+              # agent_id="" and Prometheus drops empty labels from the alert.
+              job: work-queue
+              severity: warning
+              stage: escalation
+            exp_annotations:
+              summary: "Work-queue item q-f is running but orphaned"
+              description: "Running queue item q-f (stranded) has no live agent owner (agent \"\"; empty = never-spawned, set = died-after-spawn) and remained so long after the Stage-1 queue-orphaned claude-event should have prompted the main loop. Re-register + re-spawn the work, or abandon the item."
+
+  - interval: 1m
+    name: "blocked items never fire WorkQueueOrphaned"
+    input_series:
+      - series: 'worktask_queue_item_has_live_owner{id="q-g",summary="parked",status="blocked",agent_id="",job="work-queue"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WorkQueueOrphaned
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a live owner keeps WorkQueueOrphaned silent"
+    input_series:
+      - series: 'worktask_queue_item_has_live_owner{id="q-g2",summary="healthy",status="running",agent_id="agt-3",job="work-queue"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WorkQueueOrphaned
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # WorkQueueOwnerUnknown -- "nobody can be named for this item", which is
+  # NOT the same as "a known owner died" (WorkQueueOrphaned). The gauge
+  # has no heartbeat-staleness precondition on purpose, so a happily
+  # heartbeating item that belongs to nobody still surfaces.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "an unattributable running item fires WorkQueueOwnerUnknown"
+    input_series:
+      - series: 'worktask_queue_item_owner_unknown_age_seconds{id="q-u",summary="unowned",job="work-queue"}'
+        values: '1200+0x40'
+    alert_rule_test:
+      # expr crosses at once (1200 > 600); the 10m `for` is the whole delay.
+      - eval_time: 5m
+        alertname: WorkQueueOwnerUnknown
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: WorkQueueOwnerUnknown
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueOwnerUnknown
+              id: q-u
+              summary: unowned
+              job: work-queue
+              severity: warning
+            exp_annotations:
+              summary: "Work-queue item q-u has no assigned agent"
+              description: "Running queue item q-u (unowned) has been running for 20m 0s with NO attributable owner -- no active-agents record, no register-time agent_id stamp, no arm-hook binding. This is \"owner unknown\", not \"orphaned\": nobody can be named for the work, rather than a known owner having died. Either an agent was never spawned for it, or an agent resumed onto this (rotated) id and its owner stamp was never retrofitted. Remedy: stamp the real owner with `session-task queue assign q-u --agent <agent_id>`, spawn the missing agent, or abandon the item."
+
+  - interval: 1m
+    name: "a freshly registered unattributed item stays under the 10m threshold"
+    input_series:
+      - series: 'worktask_queue_item_owner_unknown_age_seconds{id="q-u2",summary="new",job="work-queue"}'
+        values: '60+0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueOwnerUnknown
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # WorkQueueStuckSoft -- long runtime AND no fresh progress signal. Each
+  # `unless on(id)` clause subtracts a class of item that is demonstrably
+  # still working: a workload touching its progress heartbeat, or an agent
+  # still writing its JSONL transcript. Both windows are 900s.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "a workload with stale progress trips WorkQueueStuckSoft"
+    input_series:
+      - series: 'worktask_queue_items_running_elapsed_seconds{id="q-4",summary="early",job="work-queue"}'
+        values: '2000+60x60'
+      - series: 'worktask_queue_item_progress_age_seconds{id="q-4",summary="early",workload_label="early",job="work-queue"}'
+        values: '1000+60x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueStuckSoft
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueStuckSoft
+              id: q-4
+              summary: early
+              job: work-queue
+              severity: warning
+            exp_annotations:
+              summary: "Work-queue item q-4 appears stuck"
+              description: "Running queue item q-4 (early) has been running >15m with no fresh progress signal. Healthy long-running workloads (fresh progress heartbeat) and healthy long-running agents (fresh JSONL transcript) are excluded via the `unless on(id)` joins."
+
+  - interval: 1m
+    name: "a fresh progress heartbeat keeps WorkQueueStuckSoft silent"
+    input_series:
+      - series: 'worktask_queue_items_running_elapsed_seconds{id="q-5",summary="fresh",job="work-queue"}'
+        values: '2000+60x60'
+      - series: 'worktask_queue_item_progress_age_seconds{id="q-5",summary="fresh",workload_label="fresh",job="work-queue"}'
+        values: '15+0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueStuckSoft
+        exp_alerts: []
+
+  - interval: 1m
+    # An AGENT parked in one long tool call: no progress heartbeat (agents
+    # never get one), but its transcript is fresh, so it is demonstrably
+    # alive and must stay silent. Without this clause every agent-owned
+    # item alerted purely for running longer than the runtime floor.
+    name: "an agent with a fresh JSONL transcript does NOT trip WorkQueueStuckSoft"
+    input_series:
+      - series: 'worktask_queue_items_running_elapsed_seconds{id="q-6",summary="live agent",job="work-queue"}'
+        values: '2000+60x60'
+      - series: 'worktask_queue_item_agent_jsonl_age_seconds{id="q-6",summary="live agent",job="work-queue"}'
+        values: '30+0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueStuckSoft
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: WorkQueueStuckSoft
+        exp_alerts: []
+
+  - interval: 1m
+    # Same agent shape, but the transcript has aged past the 900s window
+    # (the in-flight-tool-call grace): it must still fire. The grace is
+    # bounded on purpose, so an agent killed mid-call surfaces, just later.
+    name: "an agent with a STALE JSONL transcript DOES trip WorkQueueStuckSoft"
+    input_series:
+      - series: 'worktask_queue_items_running_elapsed_seconds{id="q-7",summary="dead agent",job="work-queue"}'
+        values: '2000+60x60'
+      - series: 'worktask_queue_item_agent_jsonl_age_seconds{id="q-7",summary="dead agent",job="work-queue"}'
+        values: '1000+60x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueStuckSoft
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueStuckSoft
+              id: q-7
+              summary: dead agent
+              job: work-queue
+              severity: warning
+            exp_annotations:
+              summary: "Work-queue item q-7 appears stuck"
+              description: "Running queue item q-7 (dead agent) has been running >15m with no fresh progress signal. Healthy long-running workloads (fresh progress heartbeat) and healthy long-running agents (fresh JSONL transcript) are excluded via the `unless on(id)` joins."
+
+  - interval: 1m
+    # Neither a progress series nor a transcript series exists (never
+    # spawned / transcript missing): ABSENT is not FRESH, so both `unless`
+    # clauses miss and the alert fires.
+    name: "an item with neither progress nor JSONL series still trips WorkQueueStuckSoft"
+    input_series:
+      - series: 'worktask_queue_items_running_elapsed_seconds{id="q-8",summary="ghost",job="work-queue"}'
+        values: '2000+60x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueStuckSoft
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueStuckSoft
+              id: q-8
+              summary: ghost
+              job: work-queue
+              severity: warning
+            exp_annotations:
+              summary: "Work-queue item q-8 appears stuck"
+              description: "Running queue item q-8 (ghost) has been running >15m with no fresh progress signal. Healthy long-running workloads (fresh progress heartbeat) and healthy long-running agents (fresh JSONL transcript) are excluded via the `unless on(id)` joins."
+
+  - interval: 1m
+    # A fresh workload heartbeat must keep excluding the item even when a
+    # STALE transcript series exists for the same id -- clause 1 alone is
+    # enough, the two clauses are independent subtractions.
+    name: "a fresh progress heartbeat still excludes even with a stale JSONL series"
+    input_series:
+      - series: 'worktask_queue_items_running_elapsed_seconds{id="q-9",summary="mixed",job="work-queue"}'
+        values: '2000+60x60'
+      - series: 'worktask_queue_item_progress_age_seconds{id="q-9",summary="mixed",workload_label="mixed",job="work-queue"}'
+        values: '15+0x60'
+      - series: 'worktask_queue_item_agent_jsonl_age_seconds{id="q-9",summary="mixed",job="work-queue"}'
+        values: '1000+60x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WorkQueueStuckSoft
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # WorkQueueReadyStuck -- a pending, ready-to-spawn group head nobody
+  # claimed. The exporter only emits ready_age for items that are already
+  # unlocked with no dependency blockers, so the gauge is the "genuinely
+  # waiting" set and the rule only adds the 30m patience threshold.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "a ready item unclaimed for 30m fires WorkQueueReadyStuck"
+    input_series:
+      - series: 'worktask_queue_item_ready_age_seconds{id="q-h",summary="waiting",job="work-queue"}'
+        values: '60+60x60'
+    alert_rule_test:
+      # At 20m ready_age is 1260s -- still under the 1800s threshold.
+      - eval_time: 20m
+        alertname: WorkQueueReadyStuck
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: WorkQueueReadyStuck
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueReadyStuck
+              id: q-h
+              summary: waiting
+              job: work-queue
+              severity: warning
+            exp_annotations:
+              summary: "Ready work-queue item q-h is unclaimed"
+              description: "Pending, ready (group-head, unlocked, no dep blockers) queue item q-h (waiting) has waited >30m for the main loop to spawn it."
+
+  # --------------------------------------------------------------------
+  # AgentStateFileMissing -- the exporter publishes the mtime of the
+  # active-agents state file, and 0 means "absent", which also BLINDS
+  # WorkQueueOrphaned. Alert so the blindness itself is visible.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "agent state file absent (mtime 0) for >10m fires AgentStateFileMissing"
+    input_series:
+      - series: 'worktask_queue_agent_state_last_modified{job="work-queue",instance="work-queue-exporter:9099"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AgentStateFileMissing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AgentStateFileMissing
+        exp_alerts:
+          - exp_labels:
+              alertname: AgentStateFileMissing
+              job: work-queue
+              instance: work-queue-exporter:9099
+              severity: warning
+            exp_annotations:
+              summary: "claude-watch active-agents state file missing"
+              description: "worktask_queue_agent_state_last_modified has been 0 for >10m -- claude-watch is not publishing active-agents.json, so owner liveness (WorkQueueOrphaned) is blind. Check the active-agents cron / daemon."
+
+  - interval: 1m
+    name: "a real mtime keeps AgentStateFileMissing silent"
+    input_series:
+      - series: 'worktask_queue_agent_state_last_modified{job="work-queue",instance="work-queue-exporter:9099"}'
+        values: '1787114043+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AgentStateFileMissing
+        exp_alerts: []
+
+  # --------------------------------------------------------------------
+  # WorkQueueOwnerInputMissing -- the exporter cannot READ one of the two
+  # owner-attribution files (usually a missing bind mount). This alert has
+  # to carry the alarm, because with BOTH inputs unreadable the exporter
+  # deliberately goes SILENT on has_live_owner rather than page the whole
+  # queue as orphaned -- a deployment fault wearing an incident's clothes.
+  # --------------------------------------------------------------------
+  - interval: 1m
+    name: "an unreadable owner input fires WorkQueueOwnerInputMissing, naming the input"
+    input_series:
+      - series: 'worktask_queue_owner_input_available{input="agent_state",job="work-queue",instance="work-queue-exporter:9099"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WorkQueueOwnerInputMissing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WorkQueueOwnerInputMissing
+        exp_alerts:
+          - exp_labels:
+              alertname: WorkQueueOwnerInputMissing
+              input: agent_state
+              job: work-queue
+              instance: work-queue-exporter:9099
+              severity: warning
+            exp_annotations:
+              summary: "work-queue-exporter cannot read owner input agent_state"
+              description: "worktask_queue_owner_input_available{input=\"agent_state\"} has been 0 for >10m -- the work-queue-exporter cannot read that owner-attribution file (missing, unreadable, or malformed). Owner attribution is degraded; if BOTH inputs read 0 the exporter suppresses has_live_owner entirely and WorkQueueOrphaned is blind. Check the exporter's bind mounts / AGENT_STATE_JSON / AGENT_QUEUE_BINDINGS_JSON, and its log for the path it named."
+
+  - interval: 1m
+    name: "both owner inputs readable keeps WorkQueueOwnerInputMissing silent"
+    input_series:
+      - series: 'worktask_queue_owner_input_available{input="agent_state",job="work-queue"}'
+        values: '1+0x30'
+      - series: 'worktask_queue_owner_input_available{input="agent_queue_bindings",job="work-queue"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WorkQueueOwnerInputMissing
+        exp_alerts: []
