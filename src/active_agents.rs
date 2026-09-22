@@ -164,9 +164,26 @@ pub fn dir_newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// Default JSONL-mtime "alive" window. An agent transcript that hasn't
 /// been touched in this many seconds is considered no-longer-running.
 /// Subagents typically write to JSONL on every tool call AND on every
-/// model turn — 120s is comfortable headroom for a long thinking pass
-/// without false-positive death.
-pub const DEFAULT_AGENT_ALIVE_MAX_AGE_SECS: u64 = 120;
+/// model turn, so a quiet transcript usually does mean a dead agent —
+/// but "usually" is not "always". A single slow tool round-trip that is
+/// NOT a foreground shell wait (a CDP `evaluate_script`, a `WebFetch`, an
+/// MCP call, a long model turn digesting a large tool result) writes
+/// nothing to the transcript for its whole duration while the agent is
+/// very much alive, and does NOT necessarily end the transcript on a
+/// pending `tool_use` frame (so the `DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS`
+/// in-flight extension below does not always catch it).
+///
+/// Measured false positive this widening exists to stop (2026-09-22): a
+/// live agent blocked ~2 min inside a slow CDP tool call had its
+/// transcript age past the old 120s window; `alive` flipped to false and
+/// the orphan detector emitted `queue-orphaned` "transcript stale …
+/// (died after spawn)" against a demonstrably working agent. 300s (5 min)
+/// is comfortable headroom for a single slow non-shell tool call or a
+/// long thinking pass, while a GENUINELY dead agent (the self-clear /
+/// died-after-spawn case) is still surfaced — just one detector tick
+/// later. Foreground shell waits are covered separately, and more
+/// generously, by the pending-`tool_use` extension below.
+pub const DEFAULT_AGENT_ALIVE_MAX_AGE_SECS: u64 = 300;
 
 /// Extended "alive" window for an agent whose transcript ENDS on an
 /// un-answered `tool_use` — i.e. it is parked INSIDE a tool call right

@@ -453,7 +453,20 @@ where
                 // path would false-positive here).
                 continue;
             }
-            AgentLiveness::Dead { agent_id, age_secs, .. } => {
+            AgentLiveness::Dead { agent_id, age_secs, in_flight_tool_use } => {
+                // Parked inside a long-running tool call → alive-in-spirit;
+                // NEVER a soft orphan either. Mirrors the load-bearing
+                // exclusion in `compute_hard_gate_orphans`: an agent that is
+                // INSIDE a pending `tool_use` (a build, an encode, a
+                // `until <cond>; do sleep; done` wait) writes nothing for the
+                // whole call and looks maximally dead by transcript mtime
+                // while being maximally alive. Skip both the orphan and the
+                // stuck check (like the `Alive` arm) — a live agent needn't
+                // pat the queue heartbeat, so the stale-heartbeat stuck path
+                // would false-positive here too.
+                if in_flight_tool_use {
+                    continue;
+                }
                 // Grace for a JUST-registered / just-resumed item: a `Dead`
                 // verdict can come from a STALE active-agents snapshot that
                 // predates the resume. The q-bad6 incident: an agent was
