@@ -382,3 +382,45 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
           make test-hooks
+
+  prometheus-rules:
+    name: Prometheus Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # promtool ships inside the Prometheus release tarball. Pinned, because
+      # promtool's unit-test semantics are version-dependent and a floating
+      # "latest" would let the gate's meaning drift under the suites without
+      # a commit. Only the one binary is kept.
+      - name: Install promtool
+        env:
+          PROM_VERSION: 3.11.2
+        run: |
+          set -euo pipefail
+          tarball="prometheus-${PROM_VERSION}.linux-amd64"
+          curl -fsSL -o /tmp/prom.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${tarball}.tar.gz"
+          tar -xzf /tmp/prom.tar.gz -C /tmp "${tarball}/promtool"
+          sudo install -m 0755 "/tmp/${tarball}/promtool" /usr/local/bin/promtool
+          promtool --version
+        timeout-minutes: 5
+
+      # Syntax + THE ASSERTIONS for monitoring/prometheus/claude-watch.rules.yml.
+      # This repo owns that file, so a retuned threshold or a reworded
+      # annotation has to fail HERE, on the pull request that changes it —
+      # not later, as a red build in a deployment repo that has no commit of
+      # its own to blame.
+      #
+      # PROMTOOL_MODE=native asserts the binary installed above is the one
+      # used. The script refuses to run rather than skipping if it is absent:
+      # a skipped check reporting green is the failure mode this job exists
+      # to remove. It also carries the non-vacuity guards — `promtool test
+      # rules` exits 0 on a suite that loaded ZERO rules, so the rule count,
+      # the rule_files resolution and the per-rule test coverage are all
+      # asserted explicitly.
+      - name: Check rules and RUN THE ASSERTIONS
+        env:
+          PROMTOOL_MODE: native
+        run: make test-prometheus-rules
+        timeout-minutes: 5

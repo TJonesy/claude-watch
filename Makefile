@@ -82,7 +82,7 @@
 # Tests — repo-wide gates + installers
 .PHONY: test-doc-links test-claude-md-size test-install-hooks
 .PHONY: test-install-host-skills test-install-host-cron test-install-links
-.PHONY: test-ci-apt-install test-make-help
+.PHONY: test-ci-apt-install test-make-help test-prometheus-rules
 # Build + install / deploy — Linux host
 .PHONY: build install install-skills install-cron deploy-systemd deploy
 # Container image + compose stack (workbot)
@@ -633,6 +633,19 @@ test-ci-apt-install: ## Tests for the bounded/retrying CI apt installer
 # two deprecated aliases on an explicit allowlist. Read-only; builds nothing.
 test-make-help: ## Gate: `make help` indexes every public target
 	scripts/tests/make-help.test
+
+# Gate: monitoring/prometheus/claude-watch.rules.yml is checked BY THE REPO
+# THAT OWNS IT. Runs `promtool check rules` (syntax + a positive rule count)
+# and `promtool test rules` over every suite in monitoring/prometheus/tests/,
+# so a retuned threshold or a reworded annotation fails on the pull request
+# that changes it rather than in whatever downstream deployment loads the
+# file. Note that `promtool test rules` EXITS 0 on a suite that loaded zero
+# rules, so the script also asserts the rule count, that every suite's
+# rule_files resolve, and that every rule is named by a suite. Uses promtool
+# from PATH if present, else the pinned prom/prometheus image; it never
+# silently skips.
+test-prometheus-rules: ## Gate: Prometheus rule syntax + assertions (promtool)
+	scripts/check-prometheus-rules.sh
 
 ##@ Build + install — Linux host
 

@@ -4,8 +4,34 @@ Version-controlled Prometheus **recording + alert rules** for claude-watch's
 own metrics. Ships here (#4039) so every deployment reuses ONE source of
 truth instead of forking a drifting copy.
 
-- **`claude-watch.rules.yml`** — the rule groups. Validate with
-  `promtool check rules monitoring/prometheus/claude-watch.rules.yml`.
+- **`claude-watch.rules.yml`** — the rule groups.
+- **`tests/`** — promtool unit tests for those groups.
+
+## Validating a change
+
+```sh
+make test-prometheus-rules      # or: scripts/check-prometheus-rules.sh
+```
+
+That runs `promtool check rules` **and** `promtool test rules` over every
+suite in `tests/`, and it is a required job in this repo's CI. The rules are
+consumed by whatever Prometheus deployment loads them, so a retuned threshold
+or a reworded annotation has to fail on the pull request that changes it —
+not later, as a red build in a deployment repo with no commit of its own to
+blame. The gate uses `promtool` from `PATH` if there is one, otherwise a
+pinned `prom/prometheus` container; it never silently skips.
+
+**`promtool test rules` exits 0 on a suite that loaded ZERO rules.** An
+unmatched `rule_files:` entry only prints `WARNING: no file match pattern`
+and then reports SUCCESS, at which point every `exp_alerts: []` expectation
+holds trivially. So the script asserts the rule *count*, that every suite's
+`rule_files` resolve, that no suite log carries that warning, and that every
+alert and recording rule in the file is named by at least one suite — never
+the exit code alone. A new rule with no test fails the build.
+
+Each suite's `rule_files:` is written relative to the suite itself
+(`../claude-watch.rules.yml`), which is how promtool resolves it, so the
+suites run unchanged from a checkout, from CI, and from inside a container.
 
 ## Why the rules live here (not only in the local stack)
 
@@ -223,7 +249,7 @@ Alerts: `WorkQueueOrphaned`, `WorkQueueOwnerUnknown`, `WorkQueueStuckSoft`,
 `WorkQueueReadyStuck`,
 `AgentStateFileMissing`, `WorkQueueOwnerInputMissing`,
 `ClaudeEventsBacklogStale`, `ClaudeWatchDown`, `ClaudeWatchersMissing`,
-`ClaudeMainLoopHeartbeatStale`.
+`ClaudeMainLoopAckStale`.
 
 Metric provenance:
 - `worktask_queue_*` → `exporters/work-queue-exporter/work_queue_exporter.py`
