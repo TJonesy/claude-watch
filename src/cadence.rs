@@ -69,12 +69,22 @@
 
 use std::time::{Duration, Instant};
 
-/// Tick interval for the `keepalive` probe. 300 seconds (5 min).
+/// Tick interval for the `keepalive` probe. 210 seconds (3.5 min).
 ///
 /// This is a *ceiling on how often a keepalive can be emitted*, not a
 /// schedule: the daemon suppresses the emission unless the last ack is at
 /// least this old, so an actively-acking loop never sees one.
-pub const KEEPALIVE_INTERVAL_SECS: u64 = 300;
+///
+/// Sized to keep an IDLE loop's prompt cache warm. The Anthropic prompt
+/// cache TTL is ~5 min (300s); a keepalive that lands after the TTL pays a
+/// full cache-miss re-read on every idle turn. The *effective* turn-to-turn
+/// cadence is this interval plus the daemon loop granularity (~10s) plus the
+/// `claude-event-watch` debounce (~30s) ≈ 250s, comfortably under the 300s
+/// TTL. (Previously 300s, which — combined with the timer-advance-on-suppress
+/// bug fixed in `due` / `record_keepalive_emitted` — produced an effective
+/// cadence of ~2× ≈ 10 min, so ~half of idle keepalive turns missed the
+/// cache. See analyze-session-spend, 2026-09.)
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 210;
 
 /// Interval between `memory-reminder` events. 30 minutes.
 pub const MEMORY_REMINDER_INTERVAL_SECS: u64 = 1800;
@@ -199,6 +209,22 @@ impl CadenceTracker {
     /// pass does not try to "catch up" by firing repeatedly — at most one
     /// event of each kind per call. That is the desired behaviour: these
     /// are cadence signals, not a billing meter.
+    ///
+    /// ## Keepalive: due != advance
+    ///
+    /// The keepalive timer is NOT advanced here. Whether a due keepalive is
+    /// actually EMITTED is a separate, I/O-dependent decision the daemon makes
+    /// from the last-ack age (see `crate::policy::last_ack_timestamp_age`): a
+    /// due tick whose acks are still flowing is SUPPRESSED, not emitted. If
+    /// `due` advanced the timer on every due pass (as it once did), a
+    /// suppressed tick would still reset the clock, so the NEXT emit could
+    /// only happen a full interval later — doubling the effective cadence
+    /// (~2× the configured interval) and letting ~half of idle keepalive
+    /// turns land after the prompt-cache TTL. The daemon therefore calls
+    /// [`CadenceTracker::record_keepalive_emitted`] only when it actually
+    /// emits, keeping the timer measured from real emissions. The
+    /// memory-reminder timer has no suppression gate, so it is still advanced
+    /// inline on its due pass.
     pub fn due(&mut self, now: Instant) -> CadenceDue {
         let keepalive_due = match self.last_keepalive {
             None => true,
@@ -208,9 +234,10 @@ impl CadenceTracker {
             None => true,
             Some(last) => now.duration_since(last) >= self.memory_interval,
         };
-        if keepalive_due {
-            self.last_keepalive = Some(now);
-        }
+        // NOTE: the keepalive timer is intentionally NOT advanced here — see
+        // the doc comment above. The daemon calls `record_keepalive_emitted`
+        // when (and only when) it actually emits. The memory-reminder timer
+        // has no emission gate, so advance it inline.
         if memory_due {
             self.last_memory = Some(now);
         }
@@ -218,6 +245,18 @@ impl CadenceTracker {
             keepalive: keepalive_due,
             memory_reminder: memory_due,
         }
+    }
+
+    /// Record that a `keepalive` event was actually EMITTED at `now`,
+    /// advancing the keepalive timer.
+    ///
+    /// Paired with [`CadenceTracker::due`], which reports keepalive-due but
+    /// does NOT advance the timer (the emission is gated on last-ack age in
+    /// the daemon). Call this only on a real emit; a due-but-suppressed tick
+    /// must leave the timer untouched so the next due pass re-reports
+    /// promptly rather than a full interval later.
+    pub fn record_keepalive_emitted(&mut self, now: Instant) {
+        self.last_keepalive = Some(now);
     }
 }
 
@@ -230,6 +269,22 @@ impl Default for CadenceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Model the daemon's loop pass with keepalive emission UNCONDITIONAL
+    /// (as if the ack gate always let it through): call `due` and, when
+    /// keepalive is reported due, record the emit. `due` no longer advances
+    /// the keepalive timer itself (the advance is gated on a real emit in the
+    /// daemon — see `due`'s doc comment and `record_keepalive_emitted`), so a
+    /// test that wants the classic "keepalive fires every interval" behaviour
+    /// must model the record. This keeps the reminder-focused tests' intent
+    /// (their `is_empty()` assertions) exactly as before the split.
+    fn tick(t: &mut CadenceTracker, at: Instant) -> CadenceDue {
+        let d = t.due(at);
+        if d.keepalive {
+            t.record_keepalive_emitted(at);
+        }
+        d
+    }
 
     #[test]
     fn first_call_fires_both() {
@@ -245,7 +300,7 @@ mod tests {
     fn immediate_second_call_fires_neither() {
         let mut t = CadenceTracker::new();
         let start = Instant::now();
-        let _ = t.due(start);
+        let _ = tick(&mut t, start);
         // Same instant again: nothing has elapsed.
         let due = t.due(start);
         assert!(!due.keepalive);
@@ -260,10 +315,10 @@ mod tests {
             Duration::from_secs(900),
         );
         let start = Instant::now();
-        let _ = t.due(start); // arm both
+        let _ = tick(&mut t, start); // arm both
 
         // 60s later: keepalive due, reminder not.
-        let due = t.due(start + Duration::from_secs(60));
+        let due = tick(&mut t, start + Duration::from_secs(60));
         assert!(due.keepalive);
         assert!(!due.memory_reminder);
 
@@ -280,10 +335,10 @@ mod tests {
             Duration::from_secs(900),
         );
         let start = Instant::now();
-        let _ = t.due(start); // arm both
+        let _ = tick(&mut t, start); // arm both
 
         // Just before 15min: reminder not yet due.
-        let due = t.due(start + Duration::from_secs(899));
+        let due = tick(&mut t, start + Duration::from_secs(899));
         assert!(!due.memory_reminder);
 
         // At 15min: reminder due. (Keepalive fired at 899 in the call
@@ -300,14 +355,14 @@ mod tests {
             Duration::from_secs(900),
         );
         let start = Instant::now();
-        let _ = t.due(start);
+        let _ = tick(&mut t, start);
 
         // Fire keepalive several times across the reminder window; the
         // reminder must only fire once it crosses 900s, regardless of how
         // many keepalives fired in between.
         let mut reminder_fires = 0;
         for sec in (60..=900).step_by(60) {
-            let due = t.due(start + Duration::from_secs(sec));
+            let due = tick(&mut t, start + Duration::from_secs(sec));
             if due.memory_reminder {
                 reminder_fires += 1;
             }
@@ -324,16 +379,60 @@ mod tests {
             Duration::from_secs(900),
         );
         let start = Instant::now();
-        let _ = t.due(start);
+        let _ = tick(&mut t, start);
 
         // Jump 10 minutes ahead in a single call.
-        let due = t.due(start + Duration::from_secs(600));
+        let due = tick(&mut t, start + Duration::from_secs(600));
         assert!(due.keepalive);
         assert!(!due.memory_reminder); // 600 < 900
 
         // Immediately again — nothing replays.
         let due = t.due(start + Duration::from_secs(600));
         assert!(due.is_empty());
+    }
+
+    #[test]
+    fn suppressed_keepalive_does_not_advance_the_timer() {
+        // REGRESSION (analyze-session-spend, 2026-09): `due` used to advance
+        // the keepalive timer on EVERY due pass, including one the daemon then
+        // SUPPRESSED because acks were still flowing. A suppressed tick would
+        // burn the clock, so the next real emit could only land a full
+        // interval later — DOUBLING the effective cadence (~2× the configured
+        // interval) and pushing ~half of idle keepalive turns past the
+        // prompt-cache TTL. The split (due reports; record advances) fixes it:
+        // a due-but-suppressed tick must leave the timer untouched.
+        let interval = Duration::from_secs(210);
+        let mut t = CadenceTracker::with_intervals(interval, Duration::from_secs(1800));
+        let start = Instant::now();
+
+        // Startup emit at t=0.
+        let d = t.due(start);
+        assert!(d.keepalive);
+        t.record_keepalive_emitted(start);
+
+        // t=210: due again — but the daemon SUPPRESSES (acks flowing), so it
+        // does NOT record. The timer must stay at 0.
+        let d = t.due(start + interval);
+        assert!(d.keepalive, "interval elapsed => reported due");
+        // (no record_keepalive_emitted: suppressed)
+
+        // A short loop-granularity later the acks have gone quiet, so the next
+        // pass emits. With the OLD bug the timer would have advanced to 210 on
+        // the suppressed pass and this pass (t=220) would NOT be due; the fix
+        // keeps it due so the emit lands promptly — NOT a full interval later.
+        let d = t.due(start + interval + Duration::from_secs(10));
+        assert!(
+            d.keepalive,
+            "a suppressed tick must not consume the timer — next pass still due"
+        );
+        t.record_keepalive_emitted(start + interval + Duration::from_secs(10));
+
+        // And after a real emit the timer IS measured from it: not due again
+        // until one interval past t=220.
+        let d = t.due(start + interval + Duration::from_secs(10 + 209));
+        assert!(!d.keepalive, "measured from the real emit at t=220");
+        let d = t.due(start + interval + Duration::from_secs(10 + 210));
+        assert!(d.keepalive, "due one full interval after the real emit");
     }
 
     #[test]
@@ -346,13 +445,13 @@ mod tests {
         let memory = Duration::from_secs(1800);
         let mut t = CadenceTracker::with_intervals(keepalive, memory);
         let start = Instant::now();
-        let due = t.due(start);
+        let due = tick(&mut t, start);
         assert!(!due.is_empty(), "startup fires both (documented behaviour)");
 
         // Seven reloads spread over the next ~50 seconds, unchanged intervals.
         for n in 1..=7 {
             t.apply_intervals(keepalive, memory);
-            let due = t.due(start + Duration::from_secs(n * 7));
+            let due = tick(&mut t, start + Duration::from_secs(n * 7));
             assert!(
                 due.is_empty(),
                 "reload at +{}s must not re-arm the timers",
@@ -372,14 +471,14 @@ mod tests {
         let mut t =
             CadenceTracker::with_intervals(Duration::from_secs(300), Duration::from_secs(1800));
         let start = Instant::now();
-        let _ = t.due(start); // arm both
+        let _ = tick(&mut t, start); // arm both
 
         // 600s in, the operator shortens the reminder to 5min. The new
         // interval has ALREADY elapsed relative to the preserved last-fire,
         // so the reminder is due on the next pass — but only once, and it is
         // the interval change (not the reload) that made it due.
         t.apply_intervals(Duration::from_secs(300), Duration::from_secs(300));
-        let due = t.due(start + Duration::from_secs(600));
+        let due = tick(&mut t, start + Duration::from_secs(600));
         assert!(due.memory_reminder, "shortened interval already elapsed");
 
         // Immediately after, nothing replays.
@@ -387,7 +486,7 @@ mod tests {
         assert!(due.is_empty());
 
         // Next fire is one NEW interval after that emission.
-        let due = t.due(start + Duration::from_secs(600 + 299));
+        let due = tick(&mut t, start + Duration::from_secs(600 + 299));
         assert!(!due.memory_reminder);
         let due = t.due(start + Duration::from_secs(600 + 300));
         assert!(due.memory_reminder);
@@ -398,13 +497,13 @@ mod tests {
         let mut t =
             CadenceTracker::with_intervals(Duration::from_secs(300), Duration::from_secs(900));
         let start = Instant::now();
-        let _ = t.due(start);
+        let _ = tick(&mut t, start);
 
         // Operator lengthens the reminder to 30min.
         t.apply_intervals(Duration::from_secs(300), Duration::from_secs(1800));
 
         // The OLD interval boundary passes with no emission...
-        let due = t.due(start + Duration::from_secs(900));
+        let due = tick(&mut t, start + Duration::from_secs(900));
         assert!(!due.memory_reminder, "old 15min boundary must not fire");
         // ...and the new one fires, measured from the preserved last-fire.
         let due = t.due(start + Duration::from_secs(1800));
