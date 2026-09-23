@@ -754,6 +754,33 @@ Set `answer_switch_dialog = false` to go back to typing the command and
 leaving the dialog to a human; the notification then says the switch is
 unconfirmed, because it is.
 
+### The same dialog, reached through `claude-watch inject`
+
+The daemon is not the only thing that types `/model`. A loop switching its
+*own* model runs `claude-watch inject --slash-command --submit "/model <id>"`,
+and until 2026-09-22 that returned `submitted` the moment the payload left the
+prompt line — with the confirmation still standing, and the session stuck on it
+until a human pressed a key.
+
+`inject` now watches the pane after a slash-command submit (10s for `/model`,
+ending as soon as the dialog shows or the switch applies; 3s for other slash
+commands; `--menu-wait SECS` overrides, `0` disables) for a `❯`-selected
+numbered menu with no live prompt line below it (`src/inject_menu.rs`):
+
+| Menu | Without `--answer` | With `--answer N` |
+| --- | --- | --- |
+| the `/model` confirmation, payload was `/model …` | select "Yes, switch to …", Enter | row `N` |
+| anything else (`/login`, `/mcp`, a picker, a permission prompt) | **reported, untouched**, exit 0 | row `N` |
+
+Rows are reached with `Up`/`Down`, one at a time, each move verified on a fresh
+capture of the SAME menu before the next key; `Enter` only once the cursor is
+on the target; never a digit. The menu must then close, or the answer is
+reported as failed (exit 5, status `menu_answer_failed`). A row the menu does
+not have presses nothing. `--no-auto-answer` reports even the `/model`
+confirmation. `--json` carries a `menu` object with the options, the selected
+row and what was done. Unknown menus exit 0 because `self-login` and
+`self-mcp-reconnect` open menus on purpose and drive them themselves.
+
 ## Tests
 
 ```

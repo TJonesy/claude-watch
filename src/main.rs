@@ -31,6 +31,7 @@ mod event_bus;
 mod hook_fire;
 mod inject_dispatch;
 mod inject_lock;
+mod inject_menu;
 mod inject_probe;
 mod logging;
 mod metrics;
@@ -280,6 +281,16 @@ enum Commands {
     ///   4  REFUSED: after typing, the prompt line held more than our
     ///      payload. The payload was retracted and nothing was submitted.
     ///      Retry when the line is clear.
+    ///   5  the submit landed and opened a menu, and an answer to it
+    ///      (`--answer N`, or the automatic `/model` confirmation) was
+    ///      attempted but did not land — the menu is still waiting.
+    ///
+    /// MENUS: after submitting a slash command (or any payload, with
+    /// `--answer`), the pane is watched briefly for a `❯`-selected numbered
+    /// menu. An allowlisted one (the `/model` switch confirmation) or the
+    /// one `--answer` names is answered; any other is left alone and
+    /// REPORTED (stderr, and the `menu` field of `--json`) with exit 0, since
+    /// callers like `/login` and `/mcp` open menus on purpose.
     Inject {
         /// Text to type (and, unless --no-submit, submit).
         #[arg(long, value_name = "TEXT")]
@@ -320,6 +331,28 @@ enum Commands {
         /// binary against a script that still passes this flag.
         #[arg(long)]
         no_cancel: bool,
+
+        /// Answer the selection menu the submit opens by choosing option N
+        /// (the number shown in the menu). The cursor is moved there with
+        /// verified Up/Down presses and confirmed with Enter; a digit is
+        /// never typed. Without this flag only allowlisted menus are
+        /// answered (today: the `/model` "Switch model?" confirmation, when
+        /// the payload is a `/model` command); any other menu is reported
+        /// and left alone.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=99))]
+        answer: Option<u32>,
+
+        /// How long to watch the pane for a menu after submitting. Defaults
+        /// to 10s for `/model` (ends early once the dialog shows or the
+        /// switch applies) and 3s for other slash commands; regular text is
+        /// only watched when `--answer` is given. `0` disables the watch.
+        #[arg(long, value_name = "SECS")]
+        menu_wait: Option<u64>,
+
+        /// Report allowlisted menus (the `/model` confirmation) instead of
+        /// answering them.
+        #[arg(long)]
+        no_auto_answer: bool,
 
         /// Emit machine-readable JSON outcome on stdout.
         #[arg(long)]
@@ -1847,12 +1880,14 @@ async fn resolve_inject_pane(flag: Option<&str>) -> String {
 ///       after the verify window (submission likely did NOT land)
 ///   4 = REFUSED because the prompt line held more than our payload after
 ///       typing. The payload was retracted; nothing was submitted.
+///   5 = the submit opened a menu and the attempted answer did not land.
 async fn run_inject(
     text: &str,
     pane_flag: Option<&str>,
     no_submit: bool,
     slash_command: bool,
     escape: bool,
+    menu_policy: &inject_menu::MenuPolicy,
     json: bool,
 ) -> i32 {
     // Wire the FleetView focus-to-main key sequence into the tmux module's
@@ -1881,12 +1916,38 @@ async fn run_inject(
 
     let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, escape).await;
 
-    let (code, status) = match outcome {
+    let (mut code, mut status) = match outcome {
         tmux::InjectOutcome::Typed => (0, "typed"),
         tmux::InjectOutcome::Submitted => (0, "submitted"),
         tmux::InjectOutcome::SubmitUnverified => (3, "submit_unverified"),
         tmux::InjectOutcome::PromptDirty => (4, "prompt_dirty"),
     };
+
+    // A submitted slash command can open a menu (`/model` asks "Switch
+    // model?") and wait. Deal with it while still holding the inject lock, so
+    // no other injector types into the menu meanwhile. Runs after an
+    // unverified submit too: Enter WAS pressed, and a menu replacing the input
+    // box is one reason the verify could not read the prompt line.
+    let menu = if matches!(
+        outcome,
+        tmux::InjectOutcome::Submitted | tmux::InjectOutcome::SubmitUnverified
+    ) {
+        inject_menu::settle_menu(&pane, text, menu_policy).await
+    } else {
+        inject_menu::MenuOutcome::None
+    };
+    match &menu {
+        inject_menu::MenuOutcome::Answered { .. } if code == 3 => {
+            // The menu closing on our answer proves the submit landed.
+            code = 0;
+            status = "submitted";
+        }
+        inject_menu::MenuOutcome::AnswerFailed { .. } => {
+            code = 5;
+            status = "menu_answer_failed";
+        }
+        _ => {}
+    }
 
     // `submitted` reports what ACTUALLY happened, not what was asked for. It
     // used to echo the `--no-submit` request flag, so a REFUSED inject
@@ -1904,15 +1965,49 @@ async fn run_inject(
 
     if json {
         println!(
-            "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{},\"escape\":{}}}",
-            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
-            status,
-            submitted,
-            slash_command,
-            escape
+            "{}",
+            serde_json::json!({
+                "pane": pane,
+                "status": status,
+                "submitted": submitted,
+                "slash_command": slash_command,
+                "escape": escape,
+                "menu": menu.to_json(),
+            })
         );
-    } else if code == 0 {
-        eprintln!("[claude-watch inject] {} on pane {}", status, pane);
+    } else if code == 0 || code == 5 {
+        if code == 0 {
+            eprintln!("[claude-watch inject] {} on pane {}", status, pane);
+        }
+        match &menu {
+            inject_menu::MenuOutcome::None => {}
+            inject_menu::MenuOutcome::Answered { menu, answer, auto } => eprintln!(
+                "[claude-watch inject] menu {} answered with option {}{}",
+                menu.summary(),
+                answer,
+                if *auto { " (allowlisted auto-answer)" } else { "" }
+            ),
+            inject_menu::MenuOutcome::Unanswered { menu } => eprintln!(
+                "[claude-watch inject] NOTE: the submit opened a menu that was NOT answered \
+                 (not allowlisted, no --answer): {}. It is waiting on pane {}; re-run with \
+                 --answer N to choose, or answer it by hand.",
+                menu.summary(),
+                pane
+            ),
+            inject_menu::MenuOutcome::AnswerFailed {
+                menu,
+                answer,
+                reason,
+                ..
+            } => eprintln!(
+                "[claude-watch inject] MENU NOT ANSWERED on pane {}: option {} of {}: {}. \
+                 The menu is still waiting.",
+                pane,
+                answer,
+                menu.summary(),
+                reason
+            ),
+        }
     } else if code == 4 {
         eprintln!(
             "[claude-watch inject] REFUSED on pane {}: after typing, the prompt line held more \
@@ -2230,10 +2325,26 @@ async fn main() {
             // Deprecated no-op: non-cancelling is the default now. Bound and
             // dropped on purpose so an older caller still passing it parses.
             no_cancel: _,
+            answer,
+            menu_wait,
+            no_auto_answer,
             json,
         }) => {
-            let code =
-                run_inject(&submit, pane.as_deref(), no_submit, slash_command, escape, json).await;
+            let menu_policy = inject_menu::MenuPolicy {
+                answer,
+                wait_secs: menu_wait,
+                auto_answer: !no_auto_answer,
+            };
+            let code = run_inject(
+                &submit,
+                pane.as_deref(),
+                no_submit,
+                slash_command,
+                escape,
+                &menu_policy,
+                json,
+            )
+            .await;
             if code != 0 {
                 std::process::exit(code);
             }
