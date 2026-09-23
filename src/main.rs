@@ -1478,6 +1478,13 @@ async fn run_daemon() {
                         priority: "low",
                         data: event_bus::keepalive_data(quiet_secs, last_ack_age),
                     });
+                    // Advance the keepalive timer ONLY on a real emit. `due`
+                    // deliberately does not, so a due-but-suppressed tick
+                    // (acks still flowing) leaves the clock alone and the next
+                    // idle window emits promptly rather than a full interval
+                    // later — which is what doubled the effective cadence and
+                    // let idle keepalive turns miss the prompt cache.
+                    cadence_tracker.record_keepalive_emitted(now);
                 }
             }
             if due.memory_reminder {
