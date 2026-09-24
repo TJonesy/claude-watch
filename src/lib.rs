@@ -18,6 +18,7 @@ pub mod respawn;
 pub mod session_event;
 pub mod status;
 pub mod task_watch;
+pub mod thinking_verbs;
 pub mod tmux;
 pub mod watcher;
 pub mod workload;
