@@ -47,6 +47,7 @@ mod state;
 mod status;
 mod task_filters;
 mod task_watch;
+mod thinking_verbs;
 mod tmux;
 mod token_usage;
 mod watcher;

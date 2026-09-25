@@ -215,6 +215,36 @@ pub(crate) fn is_agent_roster_row(line: &str) -> bool {
 /// screenshot showed the "fresh session" resume prompt fire mid-session on
 /// exactly this line, because neither the completion-tail phrasing nor the
 /// "monitors" counter word were recognized as active-work markers).
+/// Pure: does any line in `pane_text` contain one of `verbs` as a whole
+/// word? Sibling check to `pane_shows_active_ui`'s fixed marker list, fed by
+/// `thinking_verbs::discovered_thinking_verbs()` — Claude Code's own spinner
+/// vocabulary, discovered from the local binary rather than hardcoded, so a
+/// new verb (like the "Coalescing" regression this guards against) is
+/// recognized automatically without a claude-watch code change.
+pub(crate) fn pane_shows_a_discovered_thinking_verb(pane_text: &str, verbs: &[String]) -> bool {
+    pane_text
+        .lines()
+        .any(|line| verbs.iter().any(|verb| line_contains_word(line, verb)))
+}
+
+fn line_contains_word(line: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(word) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !line.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let after = abs + word.len();
+        let after_ok = after >= line.len() || !line.as_bytes()[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
     let thinking_re =
         Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
@@ -1242,11 +1272,13 @@ async fn get_claude_status_inner(
             // hardening below).
             let version_info = get_version_info_for_pane(&pane).await;
 
+            let discovered_verbs = crate::thinking_verbs::discovered_thinking_verbs().await;
             let status = ClaudeStatus {
                 pane,
                 tokens: parsed.tokens.unwrap_or(0),
                 bashes: parsed.bashes.unwrap_or(0),
-                active_ui: pane_shows_active_ui(&capture),
+                active_ui: pane_shows_active_ui(&capture)
+                    || pane_shows_a_discovered_thinking_verb(&capture, discovered_verbs),
                 compact_remaining: parsed.compact_remaining,
                 version: version_info.running,
                 latest: version_info.installed,
@@ -2187,6 +2219,43 @@ pub(crate) fn resolve_monitor_arming_grace_secs() -> f64 {
 mod tests {
     use super::*;
     use crate::config::TmuxConfig;
+
+    // -------------------------------------------------------------------
+    // pane_shows_a_discovered_thinking_verb — the dynamic sibling of
+    // pane_shows_active_ui's fixed marker list, fed by verbs discovered
+    // from the local Claude Code binary (see thinking_verbs.rs) instead of
+    // hardcoded phrases.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn discovered_verb_matches_a_live_spinner_line() {
+        let verbs = vec!["Coalescing".to_string(), "Percolating".to_string()];
+        assert!(pane_shows_a_discovered_thinking_verb(
+            "· Coalescing…\n❯ ",
+            &verbs
+        ));
+    }
+
+    #[test]
+    fn discovered_verb_requires_a_whole_word_match() {
+        let verbs = vec!["Doing".to_string()];
+        // "Undoing" contains "Doing" as a substring but is not the verb.
+        assert!(!pane_shows_a_discovered_thinking_verb("Undoing work…", &verbs));
+    }
+
+    #[test]
+    fn discovered_verb_no_match_on_unrelated_pane() {
+        let verbs = vec!["Coalescing".to_string()];
+        assert!(!pane_shows_a_discovered_thinking_verb(
+            "❯ \n-- INSERT -- 50000 tokens",
+            &verbs
+        ));
+    }
+
+    #[test]
+    fn discovered_verb_empty_list_never_matches() {
+        assert!(!pane_shows_a_discovered_thinking_verb("Coalescing…", &[]));
+    }
 
     // -------------------------------------------------------------------
     // prefer_configured_pane — the config-branch decision behind the
