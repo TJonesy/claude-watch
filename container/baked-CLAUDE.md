@@ -1160,27 +1160,25 @@ If eichi returns no results or all `[distant]` scores, THEN fall back to grep
 
 ### How to invoke
 
-**From inside the container** (web API — the CLI venv is host-only):
+**Primary: `eichi` CLI via `host-bash`** (or on a host shell directly; venv
+is host-only); never bare-curl by default unless confirmed unreachable:
+
+```sh
+# host-bash run_command (or on the host directly):
+eichi query "alerting tier design decisions" -k 5  # --added-since 7d
+eichi stats        # last-indexed timestamp / corpus size
+eichi ls           # what's indexed
+```
+
+**Fallback only (web API)**: CLI confirmed unreachable and
+`eichi-search` compose container running (browser UI at `:8001/`):
 
 ```sh
 curl -s "http://eichi-search:8000/api/search?q=alerting+tiers&k=5" | jq .
 ```
 
-(The `eichi-search` compose container also serves a browser UI at
-`http://localhost:8001/` as a fallback.)
-
-Query params: `q` (required), `k` (top-K, default 20), `source`
-(filter tag), `added_since` (duration: `1d`, `7d`, `30d`), `retrieval`
-(`hybrid`|`vector`|`bm25`).
-
-**From the host** (via `host-bash`, if the CLI venv is bootstrapped):
-
-```sh
-# host-bash run_command:
-eichi query "alerting tier design decisions" -k 5   # also: --added-since 7d, --sort added
-eichi stats        # last-indexed timestamp / corpus size
-eichi ls           # what's indexed
-```
+Params: `q` (required), `k` (top-K, default 20), `source` (filter tag),
+`added_since` (`1d`/`7d`/`30d`), `retrieval` (`hybrid`|`vector`|`bm25`).
 
 ### Interpreting results
 
