@@ -199,23 +199,34 @@
 //                        pane is ten rows tall and a data URI is megabytes, so
 //                        what verbose owes the reader here is what it is and
 //                        how big. The single-item modal renders the image.
-//   per-line clip        400 chars, or 2000 wrapped, becomes
-//                        MAX_LINE_CHARS_VERBOSE.
+//   per-line clip        400 chars, or 2000 wrapped, becomes the VERBOSE CAP
+//                        (see below — the reader picks it).
 //
 // IT IS NOT UNBOUNDED, because a firehose is not a feature. Four live streams
 // can each produce hundreds of lines a minute, and the browser has to lay every
 // one of them out:
 //
-//   * MAX_LINE_CHARS_VERBOSE (4000) caps a single line at roughly a screenful
-//     of wrapped text — past that, reading has become searching, and the
-//     single-item modal is the place for the complete payload.
+//   * THE VERBOSE CAP caps a single line. It DEFAULTS to 8000 characters —
+//     roughly two screenfuls of wrapped text — and the `cap` pill offers
+//     4K / 8K / 16K / 32K, because how much of a payload is worth reading in a
+//     ten-row pane depends on what the panes are full of and that is the
+//     reader's call, not ours ("make max output length for verbose mode
+//     configurable. double current value as default"; 4000 was the previous
+//     fixed value and is kept on the ladder). The choice persists per viewer
+//     like every other setting in this header.
 //   * MAX_PANE_CHARS caps the TEXT one pane retains, evicting from the head
 //     like the line-count bound does. The count bound alone stops bounding
-//     memory the moment a line can be ten times its normal size.
+//     memory the moment a line can be ten times its normal size. It is NOT
+//     raised by a bigger per-line cap: choosing 32K buys longer lines by
+//     retaining fewer of them, which keeps the memory bound where it was.
 //
 // RETROACTIVE ONLY AS FAR AS THE RECORDS GO. Lines are stored clipped at the
-// verbose width, so switching verbose on immediately widens every retained line
-// that a narrower setting had cut. What it cannot recover is what the formatter
+// CURRENTLY CHOSEN verbose width, so switching verbose on immediately widens
+// every retained line that a narrower setting had cut. RAISING THE CAP is the
+// one thing that is not retroactive, and deliberately: storing every line at
+// the largest cap on offer would make every viewer pay the memory of an option
+// they did not choose. A bigger cap applies to the lines that arrive after it,
+// and a smaller one takes effect at once because rendering clips again. What it cannot recover is what the formatter
 // never kept: outside verbose mode a multi-line record is reduced to its first
 // line when it ARRIVES. So verbose shows full detail for the lines that arrive
 // after it, and the pill's title says as much. The alternative — retaining
@@ -239,41 +250,60 @@
 // unavailable the mode works exactly as it did before it remembered anything.
 //
 // ---------------------------------------------------------------------------
-// PER-PANE FOOTER BAR — WHOSE AGENT IS THIS, AND WHAT IS IT COSTING
+// PER-PANE METRICS — WHOSE AGENT IS THIS, AND WHAT IS IT COSTING
 // ---------------------------------------------------------------------------
-// Each pane carries a footer strip under its stream: the model that is running
-// the item, its tool-call count, its context size, output tokens, last tool and
-// age. This mode is a whole-window takeover, so the queue rows that normally
-// carry those numbers are not on screen — without the strip, the reader can see
-// what an agent is DOING and nothing about what it is costing.
+// Every pane reports the model that is running the item, its tool-call count,
+// its context size, output tokens, last tool and age. This mode is a
+// whole-window takeover, so the queue rows that normally carry those numbers
+// are not on screen — without them, the reader can see what an agent is DOING
+// and nothing about what it is costing.
+//
+// THEY LIVE ON THE PANE'S TITLE LINE, NOT ON A ROW OF THEIR OWN. They started
+// as a footer strip under the stream, and a strip is a whole row of chrome per
+// pane — with five or six panes open that is five or six rows the logs do not
+// get (reported from botchat: "move the footer line in multitail up to the
+// title line (maybe right aligned for legibility). so left side is task title,
+// right side is calls/ctx/runtime/model"). The header already had a row and
+// spare width on it, so the title and the metrics share one: title flush left,
+// metrics flush right.
+//
+// The mechanism is the one the timestamp placement already uses a few hundred
+// lines down — in a flex row, make the thing that should fill the space the
+// ONLY flexible item and everything after it lands against the far edge. Here
+// the title is that item inside `.mt-pane-titlebar`, so the metrics need no
+// `margin-left: auto`, no absolute positioning and no second alignment idiom.
+// The title keeps a floor width and ellipsises; the metrics clip from their
+// own right, shedding the two cells that already know how to give way.
 //
 // EVERY FIELD IS READ, NEVER DERIVED. The values come off the pane's own queue
 // row (`.model-tag`, `.agent-stats`) as the strings the SERVER already
 // formatted for the row cell and the header popover (app.py
-// `_shape_agent_stat`), so a footer and a row can never disagree about a count,
+// `_shape_agent_stat`), so a pane and a row can never disagree about a count,
 // and nothing here re-implements a formatter. refresh.js rebuilds those rows
-// every 5s and the footer repaints on the reconcile tick, so the numbers move
+// every 5s and the metrics repaint on the reconcile tick, so the numbers move
 // on their own.
 //
 // A field with no value is ABSENT, not zeroed. The server's formatters use `?`
-// and `–` for "not known", and a footer cell is skipped for those exactly as it
-// is for an empty string: a confident wrong context size is worse than a
-// shorter strip. Whole classes of pane legitimately have nothing to show —
-// a workload or hostjob pane runs no model and has no agent counters, so its
-// footer carries the workload/hostjob LABEL (which the pane header does not
-// show) and stops there; an agent pane whose stats snapshot has not caught up
-// yet shows only the model, then fills in. A footer with nothing at all in it
-// is hidden outright rather than left as an empty bar.
+// and `–` for "not known", and a cell is skipped for those exactly as it is
+// for an empty string: a confident wrong context size is worse than a shorter
+// line. Whole classes of pane legitimately have nothing to show — a workload
+// or hostjob pane runs no model and has no agent counters, so it carries the
+// workload/hostjob LABEL (which the rest of the header does not show) and
+// stops there; an agent pane whose stats snapshot has not caught up yet shows
+// only the model, then fills in. Metrics with nothing at all in them are
+// hidden outright, and because they sit inside the title line that costs the
+// pane no space at all rather than leaving an empty bar.
 //
 // The model is whatever the row says — never a pinned id. An alias like `opus`
 // tracks whichever model is newest, so hardcoding one here would go stale
 // silently and lie about what actually ran.
 //
-// Space: the strip is one line of 0.62rem text, and --mt-pane-min grew by its
-// height so it comes out of the WINDOW budget (more scrolling past ~5 panes),
-// never out of the ~10 log lines a pane is meant to show. Below 560px the
-// output-token and last-tool cells drop out first — the phone keeps model,
-// calls, ctx and age.
+// Space: --mt-pane-min came back DOWN by the strip's height when the strip
+// went away, so the reclaimed row goes to the window budget (one more pane
+// before the stack scrolls) rather than being quietly kept. Below 560px the
+// header wraps and the title line is the second row — the metrics ride along
+// on it, still right-aligned, and the output-token and last-tool cells drop
+// out so what is left (model, calls, ctx, age) fits beside a readable title.
 //
 // ---------------------------------------------------------------------------
 // A PANE WHOSE JOB FINISHES WHILE THE MODE IS OPEN
@@ -336,6 +366,7 @@
   const tsBtn = document.getElementById('multitail-ts');
   const retainBtn = document.getElementById('multitail-retain');
   const verboseBtn = document.getElementById('multitail-verbose');
+  const vcapBtn = document.getElementById('multitail-vcap');
 
   // Rows the server marked as having a tailable log, in render order.
   const ROW_SELECTOR = '.item[data-live-log-mode]';
@@ -364,11 +395,37 @@
   // bound — see the header comment.
   const MAX_LINE_CHARS = 400;
   const MAX_LINE_CHARS_WRAPPED = 2000;
-  // VERBOSE mode's per-line ceiling. Verbose exists to stop eliding, but "no
-  // limit" is not a limit: one 2MB tool result would be the pane, the tab's
-  // memory and a layout pass. 4000 visible characters is roughly a full screen
-  // of wrapped text, which is where reading stops and searching starts.
-  const MAX_LINE_CHARS_VERBOSE = 4000;
+  // VERBOSE mode's per-line ceiling, and the one bound in this module the
+  // READER sets. Verbose exists to stop eliding, but "no limit" is not a
+  // limit: one 2MB tool result would be the pane, the tab's memory and a
+  // layout pass. What the right number is, though, is not ours to know — it
+  // depends on what the panes are full of, which is why it is a choice
+  // (botchat: "make max output length for verbose mode configurable. double
+  // current value as default").
+  //
+  // The default is 8000, twice the 4000 this shipped with, which is what was
+  // asked for. The rest of the ladder brackets it by doubling in both
+  // directions: 4000 is the old behaviour kept as a real choice rather than
+  // deleted, and 32000 is about eight screenfuls of wrapped text — past that
+  // reading has certainly become searching and the single-item log view has
+  // the complete payload anyway.
+  //
+  // Raising it does NOT raise what a pane retains in total: MAX_PANE_CHARS is
+  // unchanged, so a 32K cap on a firehose buys longer lines by keeping fewer
+  // of them. That is the right trade for a reader who went looking for one
+  // long payload, and it keeps the memory bound where it was.
+  const VERBOSE_CAP_OPTIONS = [
+    { key: '4k', chars: 4000, label: 'cap 4K', aria: '4,000 characters' },
+    { key: '8k', chars: 8000, label: 'cap 8K', aria: '8,000 characters' },
+    { key: '16k', chars: 16000, label: 'cap 16K', aria: '16,000 characters' },
+    { key: '32k', chars: 32000, label: 'cap 32K', aria: '32,000 characters' },
+  ];
+  const VERBOSE_CAP_BY_KEY = {};
+  for (const opt of VERBOSE_CAP_OPTIONS) VERBOSE_CAP_BY_KEY[opt.key] = opt;
+  // Stated here rather than implied by array position, and templates/index.html
+  // renders the pill with this same key — test_multitail.py pins the two
+  // together, exactly as it does for the retention default.
+  const DEFAULT_VERBOSE_CAP_KEY = '8k';
   // Hard ceiling on the TEXT one pane retains, across however many lines that
   // is. MAX_LINES_PER_PANE alone bounds the line COUNT, and in verbose mode a
   // line can be ten times its normal size, so the count bound stops bounding
@@ -423,6 +480,7 @@
   const WRAP_STORAGE_KEY = 'qsite_mt_wrap';
   const TS_STORAGE_KEY = 'qsite_mt_ts';
   const VERBOSE_STORAGE_KEY = 'qsite_mt_verbose';
+  const VERBOSE_CAP_STORAGE_KEY = 'qsite_mt_vcap';
 
   let open = false;
   let reconcileTimer = null;
@@ -493,6 +551,18 @@
     writeStored(RETENTION_STORAGE_KEY, key);
   }
 
+  // Same shape as the retention reader, and for the same reason: an
+  // unrecognised stored key — an older build's spelling, a hand edit — is the
+  // DEFAULT, never a number coerced out of a string.
+  function readStoredVerboseCap() {
+    const v = readStored(VERBOSE_CAP_STORAGE_KEY);
+    return (v && VERBOSE_CAP_BY_KEY[v]) ? v : DEFAULT_VERBOSE_CAP_KEY;
+  }
+
+  function storeVerboseCap(key) {
+    writeStored(VERBOSE_CAP_STORAGE_KEY, key);
+  }
+
   let retentionKey = readStoredRetention();
   // The three display toggles. A FRESH viewer gets the old defaults — wrap
   // off, timestamps off, verbose off — because off is the behaviour that
@@ -502,6 +572,20 @@
   let wrapOn = readStoredFlag(WRAP_STORAGE_KEY, false);
   let tsOn = readStoredFlag(TS_STORAGE_KEY, false);
   let verboseOn = readStoredFlag(VERBOSE_STORAGE_KEY, false);
+  let verboseCapKey = readStoredVerboseCap();
+
+  function verboseCapOption() {
+    return VERBOSE_CAP_BY_KEY[verboseCapKey] ||
+      VERBOSE_CAP_BY_KEY[DEFAULT_VERBOSE_CAP_KEY];
+  }
+
+  // The chosen verbose ceiling in characters. Read even while verbose is OFF,
+  // because it is also the STORAGE bound below: a line has to be retained at
+  // the widest width any setting can ask for, or turning verbose on would
+  // widen nothing.
+  function verboseCapChars() {
+    return verboseCapOption().chars;
+  }
 
   function retentionOption() {
     return RETENTION_BY_KEY[retentionKey] || RETENTION_BY_KEY[DEFAULT_RETENTION_KEY];
@@ -523,16 +607,16 @@
       qid: row.getAttribute('data-queue-id') || '',
       mode: (row.getAttribute('data-live-log-mode') || '').toLowerCase(),
       summary: row.getAttribute('data-queue-summary') || '',
-      foot: rowFooterInfo(row),
+      meta: rowMetaInfo(row),
     };
   }
 
-  // Values for the pane footer, read off the rendered row. `.agent-stats` and
-  // `.model-tag` live in the row's HEAD — the one part of a card compact
-  // density never elides — and both are rebuilt by refresh.js every 5s, which
-  // is what keeps the footer live. Missing element or missing attribute means
-  // missing value, and a missing value is simply not rendered.
-  function rowFooterInfo(row) {
+  // Values for the pane's title-line metrics, read off the rendered row.
+  // `.agent-stats` and `.model-tag` live in the row's HEAD — the one part of a
+  // card compact density never elides — and both are rebuilt by refresh.js
+  // every 5s, which is what keeps the numbers live. Missing element or missing
+  // attribute means missing value, and a missing value is simply not rendered.
+  function rowMetaInfo(row) {
     const head = row.querySelector('.item-head') || row;
     const model = head.querySelector('.model-tag');
     const stats = head.querySelector('.agent-stats');
@@ -553,8 +637,8 @@
 
   // The server's formatters print `?` for a counter it could not read and `–`
   // for an absent one. Neither is a value, so neither gets a cell — see the
-  // header comment on why a footer says less rather than guessing.
-  function footValue(v) {
+  // header comment on why a pane says less rather than guessing.
+  function metaValue(v) {
     const s = String(v === undefined || v === null ? '' : v).trim();
     if (!s || s === '?' || s === '–' || s === '-') return '';
     return s;
@@ -611,7 +695,7 @@
   // The per-line ceiling under the CURRENT display settings. Verbose wins over
   // wrap: it is the setting that says "stop eliding".
   function lineCharLimit() {
-    if (verboseOn) return MAX_LINE_CHARS_VERBOSE;
+    if (verboseOn) return verboseCapChars();
     return wrapOn ? MAX_LINE_CHARS_WRAPPED : MAX_LINE_CHARS;
   }
 
@@ -914,20 +998,21 @@
     pane.noTsEl.hidden = !(tsOn && !paneHasSourceTimestamps(pane));
   }
 
-  // Repaint one pane's footer from `foot` (a rowFooterInfo shape). Cells are
-  // appended in a fixed order and only for values that exist; the whole strip
-  // is hidden when nothing does, so a workload pane with no label and an agent
-  // pane with no snapshot both get no empty bar. textContent only.
-  function paintPaneFooter(pane, foot) {
-    const bar = pane.footEl;
+  // Repaint one pane's title-line metrics from `meta` (a rowMetaInfo shape).
+  // Cells are appended in a fixed order and only for values that exist; the
+  // whole group is hidden when nothing does, so a workload pane with no label
+  // and an agent pane with no snapshot both leave the title line to the title.
+  // textContent only.
+  function paintPaneMeta(pane, meta) {
+    const bar = pane.metaEl;
     if (!bar) return;
     while (bar.firstChild) bar.removeChild(bar.firstChild);
-    const f = foot || {};
+    const f = meta || {};
     let cells = 0;
 
-    const model = footValue(f.model);
+    const model = metaValue(f.model);
     if (model) {
-      const chip = el('span', 'mt-foot-model', model);
+      const chip = el('span', 'mt-meta-model', model);
       // The row's own title is already `model: <raw id>`; pass it through
       // rather than composing a second wording for the same fact.
       if (f.modelTitle) chip.title = f.modelTitle;
@@ -939,9 +1024,9 @@
     // and checking after turns the formatter's `–` ("not known") into a cell
     // reading just `out`, which is a placeholder wearing a unit.
     const add = (cls, raw, decorate, title) => {
-      const value = footValue(raw);
+      const value = metaValue(raw);
       if (!value) return;
-      const cell = el('span', 'mt-foot-cell ' + cls,
+      const cell = el('span', 'mt-meta-cell ' + cls,
         decorate ? decorate(value) : value);
       if (title) cell.title = title;
       bar.appendChild(cell);
@@ -949,20 +1034,20 @@
     };
     // `calls_text` / `ctx_text` / `out_text` / `age_text` are the server's
     // strings; the unit words are ours and match the header popover's columns.
-    add('mt-foot-calls', f.calls, (v) => v + ' calls',
+    add('mt-meta-calls', f.calls, (v) => v + ' calls',
       'Tool calls this agent has made');
-    add('mt-foot-ctx', f.ctx, (v) => v + ' ctx',
+    add('mt-meta-ctx', f.ctx, (v) => v + ' ctx',
       'Context size (tokens) at the agent\'s last transcript write');
-    add('mt-foot-out', f.out, (v) => v + ' out',
+    add('mt-meta-out', f.out, (v) => v + ' out',
       'Output tokens this agent has produced');
-    add('mt-foot-age', f.age, null,
+    add('mt-meta-age', f.age, null,
       'Age since this agent\'s first transcript entry');
-    add('mt-foot-tool', f.lastTool, (v) => 'last ' + v,
+    add('mt-meta-tool', f.lastTool, (v) => 'last ' + v,
       'The last tool this agent invoked');
     // A workload / hostjob pane runs no model and has no agent counters; its
-    // label is the one thing it can truthfully add, and the pane header does
-    // not carry it.
-    add('mt-foot-label', f.label, null,
+    // label is the one thing it can truthfully add, and the rest of the pane
+    // header does not carry it.
+    add('mt-meta-label', f.label, null,
       'The workload / hostjob label being tailed');
 
     bar.hidden = cells === 0;
@@ -981,7 +1066,23 @@
     const head = el('header', 'mt-pane-head');
     head.appendChild(el('span', 'mt-pane-badge mt-badge-' + info.mode, modeBadgeText(info.mode)));
     head.appendChild(el('code', 'mt-pane-id', info.qid));
-    head.appendChild(el('span', 'mt-pane-summary', info.summary));
+    // THE TITLE LINE: title left, metrics right, one row for both. The title
+    // is the only flexible item in this little flex row, so it takes every
+    // pixel the metrics do not and the metrics end up against the far edge
+    // without an alignment rule of their own — the same trick the timestamp
+    // cell uses inside a log row. Wrapping the pair in one element is what
+    // keeps them TOGETHER when the header wraps on a phone: the wrap moves one
+    // box, and the title does not end up on a line the metrics left behind.
+    const titlebar = el('div', 'mt-pane-titlebar');
+    const summary = el('span', 'mt-pane-summary', info.summary);
+    titlebar.appendChild(summary);
+    // Metrics: whose agent this is and what it is costing. Filled from the row
+    // below, hidden while there is nothing true to put in it — and hidden here
+    // costs the pane nothing, because the row belongs to the title either way.
+    const meta = el('div', 'mt-pane-meta');
+    meta.hidden = true;
+    titlebar.appendChild(meta);
+    head.appendChild(titlebar);
     const noTs = el('span', 'mt-pane-nots', 'no ts');
     noTs.title =
       'This log is plain text and carries no per-line timestamps. ' +
@@ -1002,12 +1103,6 @@
     stream.tabIndex = 0;
     wrap.appendChild(stream);
 
-    // Footer strip: whose agent this is and what it is costing. Filled from
-    // the row below, hidden while there is nothing true to put in it.
-    const foot = el('footer', 'mt-pane-foot');
-    foot.hidden = true;
-    wrap.appendChild(foot);
-
     const pane = {
       qid: info.qid,
       mode: info.mode,
@@ -1015,7 +1110,7 @@
       streamEl: stream,
       statusEl: status,
       noTsEl: noTs,
-      footEl: foot,
+      metaEl: meta,
       es: null,
       streaming: false,   // holds a connection right now
       terminal: false,    // stream reported a real end; never reconnect
@@ -1073,7 +1168,7 @@
     });
 
     syncPaneTsMarker(pane);
-    paintPaneFooter(pane, info.foot);
+    paintPaneMeta(pane, info.meta);
     return pane;
   }
 
@@ -1128,7 +1223,7 @@
       // lines that arrive after it, not retroactively. Retaining every raw
       // payload against a toggle that may never be pressed is a memory
       // multiplier on four live streams; the pill's title says so.
-      text: clipStore(fmt.text, MAX_LINE_CHARS_VERBOSE),
+      text: clipStore(fmt.text, verboseCapChars()),
       cls: fmt.cls || '',
       ts: fmt.ts || '',
     };
@@ -1512,7 +1607,7 @@
       // agent-stats cell) since the last tick, so re-read it. An ENDED pane is
       // not in `rows` at all, so its footer keeps the last values it had —
       // which is the honest answer for an agent that has returned.
-      paintPaneFooter(existing, info.foot);
+      paintPaneMeta(existing, info.meta);
     }
     // A pane whose row stopped being eligible (finished, abandoned, moved out
     // of the running section) is marked ENDED, never removed — see the header
@@ -1545,7 +1640,34 @@
     overlay.classList.toggle('mt-wrap', wrapOn);
     overlay.classList.toggle('mt-show-ts', tsOn);
     overlay.classList.toggle('mt-verbose', verboseOn);
+    syncVerboseCapButton();
     syncRetainButton();
+  }
+
+  // The verbose CAP pill. It is shown only while verbose is ON, because the
+  // cap is verbose mode's ceiling and does nothing at all with verbose off —
+  // the same judgment the `no ts` marker makes about explaining a column that
+  // is not there. Pressing `v` reveals it right beside the pill just pressed,
+  // which is where a reader who wants more output is already looking.
+  //
+  // A VALUE, not a toggle, so no aria-pressed: the label is the state, and the
+  // accessible name spells out what that state means rather than leaving
+  // `cap 16K` to be guessed at.
+  function syncVerboseCapButton() {
+    if (!vcapBtn) return;
+    const opt = verboseCapOption();
+    vcapBtn.hidden = !verboseOn;
+    vcapBtn.textContent = opt.label;
+    vcapBtn.setAttribute('data-verbose-cap', opt.key);
+    vcapBtn.setAttribute(
+      'aria-label',
+      'Verbose mode shows at most ' + opt.aria +
+      ' of a single line. Activate to change (x).');
+    vcapBtn.title =
+      'How much of one line verbose mode shows before clipping it (x). ' +
+      'Cycles ' + VERBOSE_CAP_OPTIONS.map((o) => o.label).join(' → ') +
+      '. Raising it applies to lines received from now on; lowering it ' +
+      'applies at once. Your choice is remembered in this browser.';
   }
 
   // The retention pill shows a VALUE, so it is not an aria-pressed toggle: the
@@ -1583,6 +1705,31 @@
       sweepEndedPanes(seen);
       paintCount();
     }
+  }
+
+  // Lowering the cap takes effect on what is already on screen (rendering
+  // clips again); raising it widens the lines that arrive after, because the
+  // stored text was bounded at the cap in force when it arrived. Either way
+  // the panes are re-projected, so the change is visible immediately rather
+  // than on the next line.
+  function setVerboseCap(key) {
+    const next = VERBOSE_CAP_BY_KEY[key] ? key : DEFAULT_VERBOSE_CAP_KEY;
+    if (next !== verboseCapKey) {
+      verboseCapKey = next;
+      storeVerboseCap(next);
+      syncVerboseCapButton();
+      rerenderAllPanes();
+      return;
+    }
+    syncVerboseCapButton();
+  }
+
+  function cycleVerboseCap() {
+    let idx = 0;
+    for (let i = 0; i < VERBOSE_CAP_OPTIONS.length; i++) {
+      if (VERBOSE_CAP_OPTIONS[i].key === verboseCapKey) { idx = i; break; }
+    }
+    setVerboseCap(VERBOSE_CAP_OPTIONS[(idx + 1) % VERBOSE_CAP_OPTIONS.length].key);
   }
 
   function cycleRetention() {
@@ -1688,6 +1835,9 @@
   if (verboseBtn) {
     verboseBtn.addEventListener('click', (ev) => { ev.preventDefault(); toggleVerbose(); });
   }
+  if (vcapBtn) {
+    vcapBtn.addEventListener('click', (ev) => { ev.preventDefault(); cycleVerboseCap(); });
+  }
   // Every pill is server-rendered in its DEFAULT state, so a stored choice has
   // to be reflected before the mode is ever opened — otherwise the header says
   // `wrap` is off while the panes wrap. The overlay is hidden until then, so
@@ -1760,6 +1910,17 @@
       toggleVerbose();
       return;
     }
+    // `x` cycles the VERBOSE CAP — "ma(x) output". Gated on verbose being on,
+    // the same condition that decides whether its pill is visible: a key that
+    // silently changes a setting whose control is not on screen is a key that
+    // looks broken. Free on this site, and Ctrl/Cmd+X is returned above
+    // untouched so cut still works.
+    if (ev.key === 'x' || ev.key === 'X') {
+      if (!open || !verboseOn || otherDialogOpen()) return;
+      ev.preventDefault();
+      cycleVerboseCap();
+      return;
+    }
     // `c` cycles the ended-pane retention. Also mode-local, also a free key
     // (nothing on the site binds it), and Ctrl/Cmd+C is returned above
     // untouched so copying selected log text still works.
@@ -1806,6 +1967,13 @@
     isTimestamps: () => tsOn,
     isVerbose: () => verboseOn,
     lineCharLimit,
+    setVerboseCap,
+    cycleVerboseCap,
+    verboseCap: () => verboseCapKey,
+    verboseCapChars,
+    VERBOSE_CAP_OPTIONS,
+    DEFAULT_VERBOSE_CAP_KEY,
+    VERBOSE_CAP_STORAGE_KEY,
     setRetention,
     cycleRetention,
     sweepEndedPanes,
@@ -1824,7 +1992,6 @@
     MAX_LINES_PER_PANE,
     MAX_LINE_CHARS,
     MAX_LINE_CHARS_WRAPPED,
-    MAX_LINE_CHARS_VERBOSE,
     MAX_PANE_CHARS,
     NEAR_BOTTOM_PX,
     NEAR_BOTTOM_PX_WRAPPED,
