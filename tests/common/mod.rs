@@ -530,7 +530,50 @@ resume_prompt = "resume"
         let _ = Command::new("tmux")
             .args(["send-keys", "-t", &self.tmux_pane, "Enter"])
             .output();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        self.await_pane_line(text);
+    }
+
+    /// Block (briefly) until the pane actually RENDERS the content just sent,
+    /// instead of assuming a fixed sleep was long enough.
+    ///
+    /// This is the tests' precondition, not their subject: every pane-driven
+    /// assertion downstream ("the daemon saw the wedge banner", "the daemon saw
+    /// a shell prompt") is only meaningful once the pane shows the text. A blind
+    /// sleep makes that precondition a race against the pane's shell starting
+    /// up and draining its input — and when it loses, the failure surfaces
+    /// hundreds of milliseconds later as the SUBJECT failing ("recovery did not
+    /// fire") on a machine where the pane simply had not painted yet. Waiting on
+    /// the observable state turns a probabilistic wrong answer into either a
+    /// pass or an honest, locatable one.
+    ///
+    /// Matches on a full trimmed LINE rather than a substring, because the pane
+    /// also echoes the `printf '...'` command that produced the output — a
+    /// substring match would be satisfied by the echo while the output itself
+    /// was still pending. Bounded: after the budget it returns anyway and the
+    /// caller's own assertions decide, so this can never hang a suite. Content
+    /// that cannot appear as its own line (it wraps, or it is empty after
+    /// trimming) just costs the budget once, which is why the loop is polled in
+    /// small steps and exits early on a hit.
+    fn await_pane_line(&self, text: &str) {
+        let needle = text.lines().next().unwrap_or(text).trim_end();
+        if needle.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+        loop {
+            if self
+                .capture_pane()
+                .lines()
+                .any(|l| l.trim_end() == needle)
+            {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Send raw tmux keys to the test pane.
@@ -744,6 +787,54 @@ impl Drop for TestEnv {
 }
 
 /// Result from running the daemon.
+/// Everything an e2e failure needs in one string: what the daemon logged, what
+/// it decided, and what the pane it was reading actually contained.
+///
+/// A bare "the thing did not happen" assertion is only useful when it can be
+/// reproduced; these tests drive a real tmux pane and a real daemon process, so
+/// a failure that happens ONLY on another machine (a CI runner) is otherwise
+/// undiagnosable — you get "expected a self-clear, got none" and no way to tell
+/// whether the daemon started, whether it saw the wedge, or whether the spawn
+/// failed. Print this in the assertion message instead of guessing later.
+pub fn daemon_diagnostics(env: &TestEnv, run: &DaemonRun) -> String {
+    let entries = env.read_log_entries();
+    let events: Vec<String> = entries
+        .iter()
+        .map(|e| e["event"].as_str().unwrap_or("?").to_string())
+        .collect();
+    let mock_bin: Vec<String> = fs::read_dir(&env.mock_bin_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "\n--- daemon diagnostics ---\n\
+         exit_code: {:?}\n\
+         jsonl events: {:?}\n\
+         legacy log:\n{}\n\
+         daemon stdout ({} bytes):\n{}\n\
+         daemon stderr ({} bytes):\n{}\n\
+         state.json:\n{}\n\
+         mock bin dir ({}): {:?}\n\
+         pane {:?} content:\n{:?}\n\
+         --- end diagnostics ---",
+        run.exit_code,
+        events,
+        env.read_legacy_log(),
+        run.stdout.len(),
+        run.stdout,
+        run.stderr.len(),
+        run.stderr,
+        fs::read_to_string(&env.state_file).unwrap_or_else(|e| format!("<unreadable: {e}>")),
+        env.mock_bin_dir.display(),
+        mock_bin,
+        env.tmux_pane,
+        env.capture_pane(),
+    )
+}
+
 pub struct DaemonRun {
     pub stdout: String,
     pub stderr: String,
