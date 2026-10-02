@@ -57,6 +57,8 @@ State: `~/.config/session/queue.json` (fcntl.flock-protected).
 ```
 session-task queue add "..." --scope <s> [--summary "..."] [--priority N]
                                           # 1 = highest priority; default 5
+              [--chat URL] [--issue URL[=label]] [--link URL[=label]]
+                                          # structured links (see session-task README)
 session-task queue list [--ready] [--running] [--blocked]
 session-task queue show <id>
 session-task queue scope <id>             # show effective scope
@@ -70,6 +72,9 @@ session-task queue abandon <id> [--reason R] [--confirmed-dead [--force]]
 session-task queue release <id> [--reason R] [--force]  # quarantine -> abandoned
 session-task queue promote <id>           # raise priority (lower the number) to group head
 session-task queue set-summary <id> "..."
+session-task queue links <id> [--set-chat URL] [--add-issue URL[=label]]
+                              [--add-link URL[=label]] [--remove URL]
+                                          # chat room / issues / related links
 session-task queue prune                  # drop completed/abandoned
 session-task queue banner                 # one-line top-of-resume hint
 session-task queue migrate                # one-shot v1→v2 migration

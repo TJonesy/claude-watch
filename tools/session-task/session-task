@@ -24,7 +24,8 @@ Usage:
 
     session-task queue add "desc" --scope file:~/foo --scope repo:bar \\
         [--summary "~10 word headline"] [--priority N] [--context JSON] \\
-        [--created-by WHO] [--depends-on q-AAA,q-BBB]
+        [--created-by WHO] [--depends-on q-AAA,q-BBB] \\
+        [--chat URL] [--issue URL[=label] ...] [--link URL[=label] ...]
         # --priority: 1 = highest priority, lower number = higher
         # precedence; default 5.
     session-task queue list [--ready] [--all] [--group g-X] [--json]
@@ -72,10 +73,18 @@ Usage:
     session-task queue set-summary <id> "text"   # edit one-line summary
     session-task queue update <id> [--description TEXT | --desc-file FILE]
                                    [--summary TEXT] [--scope TOK ...] [--force]
+                                   [--chat URL] [--issue URL[=label] ...]
+                                   [--link URL[=label] ...]
                                    # edit a NOT-YET-SPAWNED item's task spec in
                                    # place (description/summary/scope) instead
                                    # of abandon+re-add; refuses if a LIVE agent
-                                   # is bound (override with --force)
+                                   # is bound (override with --force); links-
+                                   # only updates skip that guard
+    session-task queue links <id> [--set-chat URL] [--add-issue URL[=label]]
+                                  [--add-link URL[=label]] [--remove URL]
+                                  [--json]
+                                   # show/edit chat room, issues and related
+                                   # links; any status, no pingme
     session-task queue set-block-reason <id> --reason TEXT  # update the
                                                  # block_reason on an already-
                                                  # blocked item, in place
@@ -162,6 +171,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2606,6 +2616,214 @@ def _item_summary(item):
     return s if s else DEFAULT_SUMMARY
 
 
+# ---------------------------------------------------------------------------
+# Structured links on a queue item: `item["links"]`.
+#
+#   {"chat": "<url>" | None,
+#    "issues":  [{"url": ..., "label": str | None}],
+#    "related": [{"url": ..., "label": str | None, "kind": str | None}]}
+#
+# Optional on disk: items without links (every item written before this
+# field existed) simply lack the key, and `_item_links` reads them as the
+# empty shape. Read paths (`queue list --json`, `queue show`) always emit
+# the normalized dict, so consumers never have to special-case its absence.
+# ---------------------------------------------------------------------------
+
+LINK_URL_MAX_LEN = 2048
+LINK_LABEL_MAX_LEN = 200
+
+# First match wins. `kind` is a free-text hint for renderers; an
+# unrecognised URL simply carries kind=None.
+_LINK_KIND_PATTERNS = [
+    (re.compile(r"/-/merge_requests/\d+"), "mr"),
+    (re.compile(r"/pulls?/\d+"), "pr"),
+    (re.compile(r"/actions/runs/\d+|/-/(?:pipelines|jobs)/\d+"), "ci"),
+    (re.compile(r"/(?:-/)?issues/\d+"), "issue"),
+]
+_LINK_KIND_HOST_HINTS = [
+    ("terrakube", "terrakube"),
+    ("grafana", "dashboard"),
+]
+
+
+def _empty_links():
+    return {"chat": None, "issues": [], "related": []}
+
+
+def _validate_link_url(url):
+    """Return the stripped URL, or raise ValueError unless it is http(s)."""
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("link URL must be non-empty")
+    if len(url) > LINK_URL_MAX_LEN:
+        raise ValueError(f"link URL longer than {LINK_URL_MAX_LEN} chars")
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        raise ValueError(f"link URL contains whitespace/control chars: {url!r}")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"link URL must be an absolute http(s) URL: {url!r}")
+    return url
+
+
+def _infer_link_kind(url):
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path or ""
+    for pat, kind in _LINK_KIND_PATTERNS:
+        if pat.search(path):
+            return kind
+    host = (parsed.hostname or "").lower()
+    for needle, kind in _LINK_KIND_HOST_HINTS:
+        if needle in host:
+            return kind
+    return None
+
+
+def _parse_link_arg(raw):
+    """Parse a `URL[=label]` CLI value into (url, label|None).
+
+    The label separator is the first `=` before any `?` / `#`, so a query
+    string or fragment containing `=` is never split. Such URLs take their
+    label after whitespace instead: `'https://x/?a=b my label'`.
+    Raises ValueError on a non-http(s) URL.
+    """
+    raw = (raw or "").strip()
+    cut = len(raw)
+    for ch in "?#":
+        i = raw.find(ch)
+        if i != -1:
+            cut = min(cut, i)
+    eq = raw.find("=", 0, cut)
+    if eq != -1:
+        url, label = raw[:eq], raw[eq + 1:]
+    else:
+        parts = raw.split(None, 1)
+        url = parts[0] if parts else ""
+        label = parts[1] if len(parts) > 1 else None
+    label = (label or "").strip() or None
+    if label is not None and len(label) > LINK_LABEL_MAX_LEN:
+        raise ValueError(f"link label longer than {LINK_LABEL_MAX_LEN} chars")
+    return _validate_link_url(url), label
+
+
+def _normalize_link_entry(entry, with_kind):
+    """Coerce one stored issues/related entry to the canonical dict, or None.
+
+    Tolerates hand-edited stores: a bare string is read as a URL, and an
+    entry whose URL fails validation is dropped rather than crashing a read.
+    """
+    if isinstance(entry, str):
+        entry = {"url": entry}
+    if not isinstance(entry, dict):
+        return None
+    try:
+        url = _validate_link_url(entry.get("url"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    label = entry.get("label")
+    label = label.strip() if isinstance(label, str) and label.strip() else None
+    out = {"url": url, "label": label}
+    if with_kind:
+        kind = entry.get("kind")
+        kind = kind.strip() if isinstance(kind, str) and kind.strip() else None
+        out["kind"] = kind or _infer_link_kind(url)
+    return out
+
+
+def _item_links(item):
+    """The item's links in canonical shape (empty shape when absent)."""
+    raw = item.get("links")
+    out = _empty_links()
+    if not isinstance(raw, dict):
+        return out
+    chat = raw.get("chat")
+    if isinstance(chat, str):
+        try:
+            out["chat"] = _validate_link_url(chat)
+        except ValueError:
+            pass
+    for key, with_kind in (("issues", False), ("related", True)):
+        seen = set()
+        for e in raw.get(key) or []:
+            n = _normalize_link_entry(e, with_kind)
+            if n is None or n["url"] in seen:
+                continue
+            seen.add(n["url"])
+            out[key].append(n)
+    return out
+
+
+def _links_is_empty(links):
+    return not links["chat"] and not links["issues"] and not links["related"]
+
+
+def _upsert_link(entries, url, label, kind=None, with_kind=False):
+    """Add url to entries, or relabel it in place if already present."""
+    for e in entries:
+        if e["url"] == url:
+            if label is not None:
+                e["label"] = label
+            return
+    new = {"url": url, "label": label}
+    if with_kind:
+        new["kind"] = kind or _infer_link_kind(url)
+    entries.append(new)
+
+
+def _apply_link_edits(item, chat=None, issues=(), related=(), remove=()):
+    """Apply link edits to item in place. Returns (old, new) canonical dicts.
+
+    `chat` replaces the chat link; `issues` / `related` are (url, label)
+    pairs added (or relabelled) idempotently; `remove` drops a URL from
+    every slot it appears in. Removals run first, so `--remove X --add-link
+    X=new` re-adds X. An item left with no links loses the key entirely,
+    restoring the legacy on-disk shape.
+    """
+    old = _item_links(item)
+    new = json.loads(json.dumps(old))
+    for url in remove:
+        if new["chat"] == url:
+            new["chat"] = None
+        new["issues"] = [e for e in new["issues"] if e["url"] != url]
+        new["related"] = [e for e in new["related"] if e["url"] != url]
+    if chat is not None:
+        new["chat"] = chat
+    for url, label in issues:
+        _upsert_link(new["issues"], url, label)
+    for url, label in related:
+        _upsert_link(new["related"], url, label, with_kind=True)
+    if new != old:
+        if _links_is_empty(new):
+            item.pop("links", None)
+        else:
+            item["links"] = new
+    return old, new
+
+
+def _parse_link_args_or_exit(chat=None, issues=None, related=None,
+                             remove=None):
+    """Validate CLI link flags up front (before taking the queue lock).
+
+    Returns (chat_url|None, [(url,label)], [(url,label)], [url]); exits 1
+    with an ERROR line on the first invalid value.
+    """
+    try:
+        chat_url = _validate_link_url(chat) if chat is not None else None
+        issue_pairs = [_parse_link_arg(v) for v in (issues or [])]
+        related_pairs = [_parse_link_arg(v) for v in (related or [])]
+        remove_urls = [_validate_link_url(v) for v in (remove or [])]
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    return chat_url, issue_pairs, related_pairs, remove_urls
+
+
+def _with_links(item):
+    """Shallow copy of item with `links` normalized, for JSON read paths."""
+    out = dict(item)
+    out["links"] = _item_links(item)
+    return out
+
+
 def _elapsed_minutes(started_at_iso):
     """Return integer minutes elapsed since an ISO-8601 timestamp, or None."""
     sec = _elapsed_seconds(started_at_iso)
@@ -3653,6 +3871,30 @@ def _write_force_start_bundle(target_id, target_summary, raw_reason,
         return None
 
 
+def _add_link_flag_args(parser):
+    """--chat / --issue / --link, shared by `queue add` and `queue update`."""
+    parser.add_argument(
+        "--chat", metavar="URL",
+        help="The item's main chat room/thread URL (http/https).",
+    )
+    parser.add_argument(
+        "--issue", action="append", default=[], metavar="URL[=label]",
+        help=(
+            "Related issue URL, optionally `=label`. Repeatable. The label "
+            "splits at the first `=` before any `?`/`#`; for a URL whose "
+            "query contains `=`, separate the label with a space instead."
+        ),
+    )
+    parser.add_argument(
+        "--link", action="append", default=[], metavar="URL[=label]",
+        help=(
+            "Any other related URL (PR/MR, CI run, Terrakube run, dashboard, "
+            "...), optionally `=label`. Repeatable; kind is inferred from "
+            "the URL. See `queue links` to remove one."
+        ),
+    )
+
+
 def cmd_queue_add(args):
     # Resolve free text FIRST (before validation/lock) so a bad file/stdin
     # never mutates the queue. See _resolve_free_text.
@@ -3666,6 +3908,11 @@ def cmd_queue_add(args):
     if not scope_raw:
         print("ERROR: at least one --scope required (e.g. --scope '*')", file=sys.stderr)
         sys.exit(1)
+    link_chat, link_issues, link_related, _ = _parse_link_args_or_exit(
+        chat=getattr(args, "chat", None),
+        issues=getattr(args, "issue", None),
+        related=getattr(args, "link", None),
+    )
     # Split each --scope value on commas so callers can pass either
     #   --scope foo --scope bar
     # or
@@ -3951,6 +4198,8 @@ def cmd_queue_add(args):
         }
         if context is not None:
             item["context"] = context
+        _apply_link_edits(item, chat=link_chat, issues=link_issues,
+                          related=link_related)
         items.append(item)
 
         _recompute_group_heads(items)
@@ -4026,6 +4275,7 @@ def cmd_queue_add(args):
             "scope": scope,
             "running_scope_conflicts": running_conflict_info,
             "spawn_instruction": spawn_instruction,
+            "links": _item_links(item),
         }, indent=2))
     else:
         print(f"added: {new_id}")
@@ -4384,7 +4634,7 @@ def cmd_queue_list(args):
     items.sort(key=lambda it: (it.get("group_id", ""), _sort_key(it)))
 
     if args.json:
-        print(json.dumps(items, indent=2))
+        print(json.dumps([_with_links(it) for it in items], indent=2))
         return
 
     if not items:
@@ -4438,6 +4688,13 @@ def cmd_queue_list(args):
         )
         print(f"  summary: {summary}")
         print(f"  desc   : {desc}")
+        links = _item_links(it)
+        if links["chat"]:
+            print(f"  chat   : {links['chat']}")
+        if links["issues"]:
+            print(f"  issues : {' '.join(e['url'] for e in links['issues'])}")
+        if links["related"]:
+            print(f"  links  : {len(links['related'])} (queue links {it['id']})")
         # Surface the wedge / block reason inline so `queue list` is the
         # one-stop diagnosis surface -- no need to drill into `queue show`
         # for the most common operator question ("why is this stuck?").
@@ -4469,7 +4726,7 @@ def cmd_queue_show(args):
     for it in items:
         if it["id"] == args.id:
             ready = _item_is_ready(items, it, locked_scopes=locked_scopes)
-            out = dict(it)
+            out = _with_links(it)
             out["ready_now"] = ready
             out["group_scope"] = _group_scope(items, it["group_id"])
             out["lock_blockers"] = _locked_tokens_blocking_item(it, locked_scopes)
@@ -5402,6 +5659,10 @@ def cmd_queue_resurrect(args):
         # bearing tools.
         if isinstance(old_live.get("context"), dict):
             new_item["context"] = dict(old_live["context"])
+        # Same work, same chat room / issues / PRs.
+        old_links = _item_links(old_live)
+        if not _links_is_empty(old_links):
+            new_item["links"] = old_links
 
         items.append(new_item)
 
@@ -7417,6 +7678,92 @@ def cmd_queue_set_summary(args):
     print(f"  new: {new_summary}")
 
 
+def _print_links(links):
+    print(f"  chat   : {links['chat'] or '(none)'}")
+    if not links["issues"]:
+        print("  issues : (none)")
+    for e in links["issues"]:
+        print(f"  issue  : {e['url']}" + (f"  [{e['label']}]" if e["label"] else ""))
+    if not links["related"]:
+        print("  links  : (none)")
+    for e in links["related"]:
+        tag = ", ".join(dict.fromkeys(
+            x for x in (e.get("kind"), e["label"]) if x))
+        print(f"  link   : {e['url']}" + (f"  [{tag}]" if tag else ""))
+
+
+def cmd_queue_links(args):
+    """Show or edit an item's links: chat room, issues, related URLs.
+
+    With no edit flags, prints the item's links. Otherwise a pure metadata
+    edit mirroring `set-summary`: no pingme, no claude-event, any status
+    (a PR link is often only known once the item is running, blocked, or
+    even done), and no live-agent guard. Records `links_updated_at`.
+
+      --set-chat URL        replace the chat link
+      --add-issue URL[=label]   add an issue (repeatable; relabels if present)
+      --add-link URL[=label]    add a related link (repeatable; kind inferred)
+      --remove URL          drop URL from chat/issues/links (repeatable)
+
+    Removals apply before additions. Only http(s) URLs are accepted.
+    """
+    edit = (
+        args.set_chat is not None or args.add_issue or args.add_link
+        or args.remove
+    )
+    chat, issues, related, remove = _parse_link_args_or_exit(
+        chat=args.set_chat, issues=args.add_issue, related=args.add_link,
+        remove=args.remove,
+    )
+    fh, data = _queue_open_locked("rw" if edit else "r")
+    try:
+        target = next(
+            (it for it in data["items"] if it.get("id") == args.id), None
+        )
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if not edit:
+            _queue_unlock_readonly(fh)
+            old = new = _item_links(target)
+        else:
+            old, new = _apply_link_edits(
+                target, chat=chat, issues=issues, related=related,
+                remove=remove,
+            )
+            if new == old:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+            else:
+                target["links_updated_at"] = _fmt_ts()
+                _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    changed = new != old
+    missing = [u for u in remove
+               if u != old["chat"]
+               and all(e["url"] != u for e in old["issues"] + old["related"])]
+    for u in missing:
+        print(f"warning: {u} is not linked on {args.id}", file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"id": args.id, "changed": changed, "links": new},
+                         indent=2))
+        return
+    if edit:
+        print(f"links {'updated' if changed else 'unchanged'}: {args.id}")
+    else:
+        print(f"links: {args.id}")
+    _print_links(new)
+
+
 def cmd_queue_update(args):
     """Edit a NOT-YET-SPAWNED item's task spec (description/summary/scope) in place.
 
@@ -7461,11 +7808,21 @@ def cmd_queue_update(args):
         reprioritize). Records `spec_updated_at` for audit. The updated
         description/summary WILL appear in the next register/done/abandon
         pingme for this item.
+      * --chat / --issue / --link edit the item's links (see `queue links`):
+        --chat replaces, --issue / --link add. Links are not task spec, so a
+        links-only update skips the live-agent guard and records
+        `links_updated_at` instead of `spec_updated_at`.
     """
     have_desc = getattr(args, "description", None) is not None
     have_desc_file = getattr(args, "desc_file", None) is not None
     have_summary = getattr(args, "summary", None) is not None
     have_scope = bool(getattr(args, "scope", None))
+    have_links = (
+        getattr(args, "chat", None) is not None
+        or bool(getattr(args, "issue", None))
+        or bool(getattr(args, "link", None))
+    )
+    have_spec = have_desc or have_desc_file or have_summary or have_scope
 
     if have_desc and have_desc_file:
         print(
@@ -7473,13 +7830,18 @@ def cmd_queue_update(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    if not (have_desc or have_desc_file or have_summary or have_scope):
+    if not (have_spec or have_links):
         print(
             "ERROR: nothing to update; pass at least one of "
-            "--description/--desc-file/--summary/--scope",
+            "--description/--desc-file/--summary/--scope/--chat/--issue/--link",
             file=sys.stderr,
         )
         sys.exit(1)
+    link_chat, link_issues, link_related, _ = _parse_link_args_or_exit(
+        chat=getattr(args, "chat", None),
+        issues=getattr(args, "issue", None),
+        related=getattr(args, "link", None),
+    )
 
     # Resolve the new description text up front (before taking the lock).
     new_description = None
@@ -7560,8 +7922,8 @@ def cmd_queue_update(args):
             fh.close()
             sys.exit(1)
 
-        # GUARD: a LIVE spawned agent means the edit is futile.
-        live_agent = _live_agent_for_queue(args.id)
+        # GUARD: a LIVE spawned agent means a spec edit is futile.
+        live_agent = _live_agent_for_queue(args.id) if have_spec else None
         if live_agent and not getattr(args, "force", False):
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
@@ -7619,6 +7981,13 @@ def cmd_queue_update(args):
             if new_scope != old_scope:
                 changes["scope"] = {"old": old_scope, "new": new_scope}
                 target["scope"] = new_scope
+        if have_links:
+            old_links, new_links = _apply_link_edits(
+                target, chat=link_chat, issues=link_issues,
+                related=link_related,
+            )
+            if new_links != old_links:
+                changes["links"] = {"old": old_links, "new": new_links}
 
         if not changes:
             # All requested edits were identical to current values.
@@ -7627,7 +7996,10 @@ def cmd_queue_update(args):
             print(f"no-op: {args.id} already matches the requested spec")
             return
 
-        target["spec_updated_at"] = _fmt_ts()
+        if set(changes) - {"links"}:
+            target["spec_updated_at"] = _fmt_ts()
+        if "links" in changes:
+            target["links_updated_at"] = _fmt_ts()
         if new_scope is not None:
             # Scope changed -> readiness ordering may shift; recompute heads.
             _recompute_group_heads(items)
@@ -7656,11 +8028,14 @@ def cmd_queue_update(args):
                          indent=2))
         return
     print(f"updated: {args.id}")
-    for field in ("description", "summary", "scope"):
+    for field in ("description", "summary", "scope", "links"):
         if field in changes:
+            old_v, new_v = changes[field]["old"], changes[field]["new"]
+            if field == "links":
+                old_v, new_v = json.dumps(old_v), json.dumps(new_v)
             print(f"  {field}:")
-            print(f"    old: {changes[field]['old']}")
-            print(f"    new: {changes[field]['new']}")
+            print(f"    old: {old_v}")
+            print(f"    new: {new_v}")
     if live_agent:
         print(f"  (--force applied over live agent {live_agent})")
 
@@ -9082,6 +9457,7 @@ def build_parser():
             "on <id>. Comma-separated values and repeated flags both work."
         ),
     )
+    _add_link_flag_args(q_add)
     q_add.add_argument("--json", action="store_true")
     q_add.add_argument(
         "--force-enqueue",
@@ -9672,7 +10048,29 @@ def build_parser():
             "the agent will re-read the item or you are about to abandon it."
         ),
     )
+    _add_link_flag_args(q_update)
     q_update.add_argument("--json", action="store_true")
+
+    q_links = qsub.add_parser(
+        "links",
+        help=(
+            "Show or edit an item's links (chat room, issues, related URLs). "
+            "Pure metadata edit like set-summary: any status, no pingme."
+        ),
+    )
+    q_links.add_argument("id")
+    q_links.add_argument("--set-chat", metavar="URL",
+                         help="Replace the chat room/thread URL.")
+    q_links.add_argument("--add-issue", action="append", default=[],
+                         metavar="URL[=label]",
+                         help="Add (or relabel) an issue. Repeatable.")
+    q_links.add_argument("--add-link", action="append", default=[],
+                         metavar="URL[=label]",
+                         help="Add (or relabel) a related link. Repeatable.")
+    q_links.add_argument("--remove", action="append", default=[],
+                         metavar="URL",
+                         help="Remove URL from chat/issues/links. Repeatable.")
+    q_links.add_argument("--json", action="store_true")
 
     q_setbr = qsub.add_parser(
         "set-block-reason",
@@ -9911,6 +10309,7 @@ def main():
             "reprioritize": cmd_queue_reprioritize,
             "set-summary": cmd_queue_set_summary,
             "update": cmd_queue_update,
+            "links": cmd_queue_links,
             "set-block-reason": cmd_queue_set_block_reason,
             "update-scope": cmd_queue_update_scope,
             "depend": cmd_queue_depend,
