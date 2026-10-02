@@ -131,6 +131,29 @@
   {%- macro model_tag(it) -%}
     {%- if it.model_label %}<span class="model-tag" title="model: {{ it.model or it.model_label }}">{{ it.model_label }}</span>{% endif -%}
   {%- endmacro -%}
+  {#- ---------- ITEM LINKS MACROS ----------
+      it.links comes from app.py _shape_links(): http(s)-only URLs plus a
+      server-computed `text`. The row (Chat + Issues) stays visible in compact
+      density; the related-links disclosure folds like Prompt. Every anchor
+      opens in a new tab with rel=noopener.
+
+      MUST stay in step with linksRow() / linksList() in static/refresh.js —
+      the 5s morphdom merge replaces this markup with the JS version. -#}
+  {%- macro item_links_row(it) -%}
+    {%- set L = it.links -%}
+    {%- if L and (L.chat or L.issues) %}<div class="item-links">
+      {%- if L.chat %}<a class="qlink chat-link" href="{{ L.chat }}" target="_blank" rel="noopener noreferrer" title="{{ L.chat }}">Chat</a>{% endif -%}
+      {%- if L.issues %}<span class="links-issues"><span class="links-label">Issues</span>
+        {%- for e in L.issues %}<a class="qlink issue-link" href="{{ e.url }}" target="_blank" rel="noopener noreferrer" title="{{ e.url }}">{{ e.text }}</a>{% endfor -%}
+      </span>{% endif -%}
+    </div>{% endif -%}
+  {%- endmacro -%}
+  {%- macro item_links_list(it) -%}
+    {%- set L = it.links -%}
+    {%- if L and L.related %}<details class="prompt-toggle links-toggle"><summary class="prompt-summary">Links ({{ L.related|length }})</summary><ul class="link-list">
+      {%- for e in L.related %}<li>{% if e.kind %}<span class="link-kind">{{ e.kind }}</span>{% endif %}<a class="qlink related-link" href="{{ e.url }}" target="_blank" rel="noopener noreferrer" title="{{ e.url }}">{{ e.text }}</a></li>{% endfor -%}
+    </ul></details>{% endif -%}
+  {%- endmacro -%}
   {#- ---------- STALE-BUILD BANNER (botchat #4947) ----------
       This page updates itself by polling /api/queue and morphing the result
       in, so an open tab NEVER reloads and keeps running the HTML/JS/CSS it
@@ -439,6 +462,7 @@
               title="Stop this running item">stop</button>
           </header>
           <p class="summary">{{ it.summary }}</p>
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.started_at_iso %}data-local-time-iso="{{ it.started_at_iso }}" data-local-time-title-only{% endif %}
@@ -462,10 +486,11 @@
               {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
             </div>
           {% endif %}
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
           {# ---------- NESTED SUBAGENT TREE ----------
@@ -536,6 +561,7 @@
           </header>
           <p class="summary">{{ it.summary }}</p>
           {% if it.wedged_reason %}<p class="description abandon-reason"><strong>wedge:</strong> {{ it.wedged_reason }}</p>{% endif %}
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.wedged_at_iso %}data-local-time-iso="{{ it.wedged_at_iso }}" data-local-time-title-only{% endif %}
@@ -554,10 +580,11 @@
               {{ exit_cmd('session-task queue abandon ' ~ it.id ~ ' --reason "..."', 'give up — quarantines the item (scope stays held) unless you pass --confirmed-dead') }}
             </ul>
           </div>
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -599,6 +626,7 @@
           <p class="summary">{{ it.summary }}</p>
           {% if it.quarantine_reason %}<p class="description abandon-reason"><strong>quarantine:</strong> {{ it.quarantine_reason }}</p>{% endif %}
           <p class="description scope-held"><strong>scope still held.</strong> No agent is working this item, and no peer can spawn into its scope until the quarantine ends.</p>
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.quarantined_at_iso %}data-local-time-iso="{{ it.quarantined_at_iso }}" data-local-time-title-only{% endif %}
@@ -620,10 +648,11 @@
               {{ exit_cmd('session-task queue release ' ~ it.id ~ ' --reason "..."', 'you assert the process is gone — terminal, frees the scope') }}
             </ul>
           </div>
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -720,6 +749,7 @@
               </ul>
             </div>
           {% endif %}
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.created_at_iso %}data-local-time-iso="{{ it.created_at_iso }}" data-local-time-title-only{% endif %}
@@ -731,10 +761,11 @@
               {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
             </div>
           {% endif %}
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -790,7 +821,8 @@
             {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
-          {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason }}</p>{% endif %}
+          {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason|linkify }}</p>{% endif %}
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.blocked_at_iso %}data-local-time-iso="{{ it.blocked_at_iso }}" data-local-time-title-only{% endif %}
@@ -802,10 +834,11 @@
               {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
             </div>
           {% endif %}
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -849,6 +882,7 @@
             {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.created_at_iso %}data-local-time-iso="{{ it.created_at_iso }}" data-local-time-title-only{% endif %}
@@ -860,10 +894,11 @@
               {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
             </div>
           {% endif %}
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -903,16 +938,18 @@
             {% endif %}
           </header>
           <p class="summary">{{ it.summary }}</p>
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.completed_at_iso %}data-local-time-iso="{{ it.completed_at_iso }}" data-local-time-title-only{% endif %}
               title="{{ it.completed_at_iso }}">completed <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -960,16 +997,18 @@
              sight — botchat #939. The .abandon-reason class also keeps it out
              of the compact-density elision; see style.css. #}
           {% if it.abandon_reason %}<p class="description abandon-reason"><strong>reason:</strong> {{ it.abandon_reason }}</p>{% endif %}
+          {{ item_links_row(it) }}
           <div class="age">
             <span
               {% if it.abandoned_at_iso %}data-local-time-iso="{{ it.abandoned_at_iso }}" data-local-time-title-only{% endif %}
               title="{{ it.abandoned_at_iso }}">{% if it.is_errored_hostjob %}errored{% else %}abandoned{% endif %} <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
+          {{ item_links_list(it) }}
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>

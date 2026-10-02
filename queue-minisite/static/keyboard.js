@@ -209,7 +209,10 @@
       moveUp();
     } else if (ev.key === 'Enter') {
       // Only intercept Enter when we have a selection — otherwise let
-      // any focused button/link handle it normally.
+      // any focused button/link handle it normally. A focused item link
+      // (.qlink) always keeps its Enter.
+      const focused = document.activeElement;
+      if (focused && focused.closest && focused.closest('a.qlink')) return;
       if (selectedQueueId) {
         ev.preventDefault();
         openSelected();
