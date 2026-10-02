@@ -81,6 +81,41 @@ of liveness). Accepted on `running` / `wedged` / `blocked`; refused on
 `pending` (nothing was spawned, so an owner would be invented) and on
 `done` / `abandoned` / `quarantined` (the item is over).
 
+### Links (`--chat` / `--issue` / `--link`, `queue links`)
+
+An item can carry structured links: one **chat** URL (the Matrix room,
+Slack thread, ... where the work is discussed), related **issues**, and
+**related** links (PRs/MRs, CI runs, Terrakube runs, dashboards, ...).
+
+```bash
+session-task queue add "..." --scope repo:foo --summary "..." \
+    --chat 'https://chat.example/#/room/!abc:example.org' \
+    --issue 'https://git.example/org/foo/issues/12=flaky deploy' \
+    --link https://git.example/org/foo/pulls/34
+session-task queue links q-2026-05-01-XXXX                    # show
+session-task queue links q-2026-05-01-XXXX --add-link URL --remove OLD-URL
+```
+
+* Only absolute `http(s)` URLs are accepted. `URL=label` splits at the first
+  `=` before any `?` / `#`; a URL whose query or fragment contains `=` takes
+  its label after a space (`'https://x/?a=b my label'`).
+* `--issue` / `--link` / `--add-*` add or relabel (dedup by URL); `--chat` /
+  `--set-chat` replace; `--remove URL` drops a URL wherever it appears.
+* Related links get a `kind` inferred from the URL (`pr`, `mr`, `ci`,
+  `issue`, `terrakube`, `dashboard`), or `null`.
+* `queue links` is a pure metadata edit like `set-summary`: any status
+  (done included), no pingme, no live-agent guard. `queue update` accepts the
+  same `--chat/--issue/--link` flags; a links-only update skips its
+  live-agent guard but is still refused on done/abandoned items.
+* Stored as `links: {chat, issues: [{url, label}], related: [{url, label,
+  kind}]}`, written only when non-empty. `queue list --json`, `queue show`
+  and `queue add --json` always emit the normalized `links` object, so
+  items written before this field existed read as
+  `{"chat": null, "issues": [], "related": []}`.
+* `resurrect` carries links to the new item. Like `set-summary`, `links` is
+  in the subagent-banned mutation set: subagents report URLs to the main
+  loop, which records them.
+
 **Note on `--force-enqueue`**: dual purpose as of 2026-05-19 (rev 2):
 
   * **Bypass for the workload-scope hard-fail**. `queue add` REFUSES (exit 3,

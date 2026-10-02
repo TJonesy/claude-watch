@@ -605,7 +605,7 @@ NO_PENDING_WATCHER_OUTPUTS_EXEMPT_PATTERNS = [
 SUBAGENT_BANNED_QUEUE_SUBCOMMANDS = frozenset({
     "add", "done", "abandon", "resurrect", "pop", "heartbeat", "wedge",
     "unwedge", "block", "unblock", "force-start", "promote", "set-summary",
-    "update-scope", "depend", "prune", "lock", "unlock", "migrate",
+    "links", "update-scope", "depend", "prune", "lock", "unlock", "migrate",
 })
 
 # Anchored matcher for `session-task queue <subcmd>`, tolerating a leading
@@ -720,7 +720,7 @@ SHELL_SUBST_HEREDOC_HINT = (
 # it is absent from the subagent set.
 MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS = frozenset({
     "add", "done", "abandon", "resurrect", "pop", "wedge", "unwedge",
-    "block", "unblock", "force-start", "promote", "set-summary",
+    "block", "unblock", "force-start", "promote", "set-summary", "links",
     "update-scope", "reprioritize", "depend", "prune", "lock", "unlock",
     "migrate",
 })
@@ -2830,7 +2830,8 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
         #
         # Banned (mutating) subcommands: add, done, abandon, resurrect, pop,
         # heartbeat, wedge, unwedge, block, unblock, force-start, promote,
-        # set-summary, update-scope, depend, prune, lock, unlock, migrate.
+        # set-summary, links, update-scope, depend, prune, lock, unlock,
+        # migrate.
         #
         # Default-open contract: non-Bash tool, empty command, parse failure,
         # or any unexpected exception => ALLOW. A predicate bug must never
