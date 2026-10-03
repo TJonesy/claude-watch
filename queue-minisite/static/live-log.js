@@ -2204,6 +2204,8 @@
     if (ev.target.closest('.drag-handle')) return;
     if (ev.target.closest('#log-modal')) return;
     if (ev.target.closest('summary')) return;
+    // Item links (.qlink) open their own tab, never the card's modal.
+    if (ev.target.closest('a.qlink')) return;
     // A subagent node lives INSIDE a .log-clickable running card, so it must
     // be checked FIRST — otherwise the queue-card handler would swallow the
     // click and open the wrong (parent agent) stream. The subagent node
@@ -2322,6 +2324,7 @@
     }
     const row = active && active.closest && active.closest('.log-clickable');
     if (!row) return;
+    if (active.closest('a.qlink')) return;
     if (ev.key === 'Enter' || ev.key === ' ') {
       ev.preventDefault();
       open(row);

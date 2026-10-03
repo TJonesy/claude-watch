@@ -54,6 +54,7 @@ import shlex
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -61,6 +62,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from markupsafe import Markup, escape
 
 # Shared loader / dedup logic — see claude_agents.py alongside this file.
 from claude_agents import agent_records_by_queue_id as _agent_records_by_qid
@@ -438,6 +440,119 @@ SITE_LOGO_DEFAULT = os.environ.get("QUEUE_SITE_LOGO_DEFAULT", "").strip() in (
 )
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Item links + linkified free text.
+#
+# `links` is the optional per-item field `session-task queue add/update/links`
+# writes: {chat, issues: [{url,label}], related: [{url,label,kind}]}.
+# queue.json is a plain file anyone can edit, so it is re-validated here:
+# only absolute http(s) URLs survive, everything else is dropped. Each entry
+# gains a server-computed `text` so the template and static/refresh.js render
+# identical link text without duplicating the shortening rules.
+#
+# `_linkify` turns bare http(s) URLs in description / block_reason into
+# anchors. It splits the RAW text on _LINKIFY_RE and escapes every piece
+# (the plain runs and the URL, separately for text and href) — no raw input
+# ever reaches the markup. linkify() in static/refresh.js MUST use the same
+# regex + trailing-punctuation rule so the morphdom merge stays a no-op.
+# ---------------------------------------------------------------------------
+
+_LINKIFY_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+_LINKIFY_TRAILING = ".,;:!?)]}"
+_LINK_TEXT_MAX = 60
+_ISSUE_PR_PATH_RE = re.compile(
+    r"^/([^/]+)/([^/]+)(?:/-)?/(issues|pulls?|merge_requests)/(\d+)/?$"
+)
+
+
+def _safe_http_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or len(url) > 2048:
+        return None
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:  # e.g. an unbalanced IPv6 bracket
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return None
+    return url
+
+
+def _link_text(url: str, label: str | None) -> str:
+    """Visible text for a link: label, `owner/repo#N`, or a trimmed URL."""
+    if label:
+        return label
+    parts = urllib.parse.urlsplit(url)
+    m = _ISSUE_PR_PATH_RE.match(parts.path or "")
+    if m:
+        sep = "!" if m.group(3) == "merge_requests" else "#"
+        return f"{m.group(1)}/{m.group(2)}{sep}{m.group(4)}"
+    text = parts.netloc + (parts.path or "")
+    if parts.query or parts.fragment:
+        text += "…"
+    text = text.rstrip("/") or url
+    if len(text) > _LINK_TEXT_MAX:
+        text = text[: _LINK_TEXT_MAX - 1] + "…"
+    return text
+
+
+def _shape_links(raw: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"chat": None, "issues": [], "related": []}
+    if not isinstance(raw, dict):
+        return out
+    out["chat"] = _safe_http_url(raw.get("chat"))
+    for key in ("issues", "related"):
+        seen: set[str] = set()
+        entries = raw.get(key)
+        for e in entries if isinstance(entries, list) else []:
+            if isinstance(e, str):
+                e = {"url": e}
+            if not isinstance(e, dict):
+                continue
+            url = _safe_http_url(e.get("url"))
+            if url is None or url in seen:
+                continue
+            seen.add(url)
+            label = e.get("label")
+            label = label.strip() if isinstance(label, str) and label.strip() else None
+            entry: dict[str, Any] = {"url": url, "label": label,
+                                     "text": _link_text(url, label)}
+            if key == "related":
+                kind = e.get("kind")
+                entry["kind"] = (kind.strip() if isinstance(kind, str)
+                                 and kind.strip() else None)
+            out[key].append(entry)
+    return out
+
+
+def _linkify(text: Any) -> Markup:
+    if not text:
+        return Markup("")
+    text = str(text)
+    parts: list[str] = []
+    pos = 0
+    for m in _LINKIFY_RE.finditer(text):
+        url = m.group(0).rstrip(_LINKIFY_TRAILING)
+        if not _safe_http_url(url):
+            continue
+        start = m.start()
+        parts.append(str(escape(text[pos:start])))
+        parts.append(
+            f'<a class="qlink autolink" href="{escape(url)}" target="_blank" '
+            f'rel="noopener noreferrer">{escape(url)}</a>'
+        )
+        pos = start + len(url)
+    parts.append(str(escape(text[pos:])))
+    return Markup("".join(parts))
+
+
+app.jinja_env.filters["linkify"] = _linkify
 
 
 # ---------------------------------------------------------------------------
@@ -2008,6 +2123,9 @@ def _shape(
         "created_by": item.get("created_by", ""),
         "abandon_reason": item.get("abandon_reason", ""),
         "block_reason": item.get("block_reason", ""),
+        # Chat / issues / related links (see _shape_links). Always present,
+        # empty shape for items written before the field existed.
+        "links": _shape_links(item.get("links")),
         # Manual scope-lock (``queue lock``) state. ``locked`` gates the
         # LOCKED badge + suppresses the READY badge / demotes FORCE START in
         # the pending card. ``lock_blockers`` are the overlapping locked

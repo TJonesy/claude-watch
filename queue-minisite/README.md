@@ -174,6 +174,33 @@ render as ABSENT — no chip, no "unknown" placeholder. Resolution is
 memoised on each transcript's (mtime, size), so the archived transcripts
 behind the done section are scanned once rather than on every 5s poll.
 
+## Item links (chat, issues, related)
+
+Items carry an optional `links` field, written by `session-task queue add
+--chat/--issue/--link` or `queue links <id>` (see
+[tools/session-task/README.md](../tools/session-task/README.md)). Every card
+renders:
+
+* a **Chat** pill and an **Issues** row under the summary. These stay
+  visible in compact density;
+* a folded **Links (N)** disclosure listing the related URLs (PRs/MRs, CI
+  runs, Terrakube, dashboards...), each with its `kind` badge.
+
+Bare http(s) URLs in the Prompt body and the `blocker:` line become anchors
+too. Every anchor opens in a new tab (`target=_blank rel="noopener
+noreferrer"`), and clicking or pressing Enter on one never opens the card's
+modal.
+
+`app.py` `_shape_links` re-validates `queue.json` on every render: only
+absolute http(s) URLs reach an href, whatever wrote the file. Each entry
+also gains a display `text` (label, `owner/repo#N`, or a trimmed URL), so
+the template and `refresh.js` cannot disagree on it. `/api/queue` carries
+`links` on every row; items without links get
+`{"chat": null, "issues": [], "related": []}`. Linkified text is built by
+splitting the raw string on one regex (identical in `app.py` and
+`refresh.js`) and escaping every piece, so no input reaches the markup
+unescaped. Tests: `test_item_links.py` and `static/links.test.js`.
+
 ## Multitail mode (all running tails at once)
 
 A whole-window mode that stacks one live tail per RUNNING item, so one glance
