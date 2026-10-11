@@ -856,6 +856,40 @@ html.header-collapsed .topbar .density-control { display: none; }
   gap: 4px;
 }
 
+/* Item links (session-task `links`): a Chat pill + Issues row that survive
+   compact density, and a folded related-links list styled like Prompt. */
+.item-links {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: 0.8rem;
+}
+.item-links .chat-link {
+  font-weight: 600;
+  padding: 1px 8px;
+  border: 1px solid var(--link);
+  border-radius: 10px;
+  text-decoration: none;
+}
+.item-links .chat-link:hover { background: var(--bg-alt); }
+.links-issues { display: inline-flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.links-label { color: var(--fg-mute); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.link-list { margin: 4px 0 0 0; padding-left: 0; list-style: none; font-size: 0.8rem; }
+.link-list li { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.link-list a { overflow-wrap: anywhere; }
+.link-kind {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  color: var(--fg-mute);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.prompt-body a.autolink, .description a.autolink { overflow-wrap: anywhere; }
+html.density-compact .item-links { margin-top: 1px; font-size: 0.7rem; }
+
 .chip {
   display: inline-block;
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;

@@ -490,3 +490,24 @@ if __name__ == "__main__":
         print(f"\n{failed}/{len(tests)} failed")
         sys.exit(1)
     print(f"\n{len(tests)}/{len(tests)} passed")
+
+
+def test_link_flags_are_not_read_as_target_text():
+    """--chat/--issue/--link URLs name other repos all the time (the PR
+    lives in a sibling repo, the issue in a tracker repo). Only the
+    description and summary feed the target heuristic, so links that
+    mention a different repo must not trigger a mismatch warning."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r = _add(
+            env,
+            f"fix pagination in {_ORG}/platform-html-to-pdf renderer",
+            ["repo:platform-html-to-pdf"],
+            "--chat", f"https://chat.example/{_ORG}/platform-typesense",
+            "--issue", f"https://git.example/{_ORG}/botchat/issues/4",
+            "--link", f"https://git.example/{_ORG}/claude-watch/pulls/9=pr",
+        )
+        assert r.returncode == 0, r.stderr
+        assert _WARN_NEEDLE not in r.stderr, r.stderr
+        d = json.loads(r.stdout)
+        assert d["links"]["chat"].endswith("/platform-typesense")

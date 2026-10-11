@@ -66,6 +66,22 @@ pub const DEFAULT_MENU_WAIT_SECS: u64 = 3;
 /// the watch ends as soon as the dialog shows or the switch is applied.
 pub const MODEL_MENU_WAIT_SECS: u64 = 10;
 
+/// Hard cap on how long a `/model` watch keeps waiting when the submit was
+/// QUEUED behind a running turn. Claude Code only processes a queued slash
+/// command at the turn boundary, so the confirmation can appear minutes after
+/// the submit; a fixed 10s window would give up first and leave the dialog
+/// waiting for a human (the failure this guards).
+pub const MODEL_QUEUED_WAIT_SECS: u64 = 120;
+
+/// Pure function: should the phase-1 watch keep waiting past its normal
+/// window? Only for a `/model` payload (the allowlisted case) while the pane
+/// is still busy (the command is queued behind a turn, not applied or
+/// dropped) and the hard cap has not been reached. Idle pane + no menu means
+/// the command is finished or never opened one: stop.
+pub fn should_extend_watch(payload: &str, pane_idle: bool, elapsed: Duration) -> bool {
+    is_model_command(payload) && !pane_idle && elapsed < Duration::from_secs(MODEL_QUEUED_WAIT_SECS)
+}
+
 /// How long to wait for the cursor to move after one Up/Down, and for the
 /// menu to close after Enter.
 const STEP_SETTLE: Duration = Duration::from_millis(1500);
@@ -241,6 +257,13 @@ pub fn is_slash_payload(payload: &str) -> bool {
     payload.trim_start().starts_with('/')
 }
 
+/// Is this inject a slash-command submit? Either the caller said so with
+/// `--slash-command`, or the payload simply starts with `/`. Auto-detecting
+/// means a forgotten flag cannot silently disable the menu watch.
+pub fn effective_slash_command(flag: bool, payload: &str) -> bool {
+    flag || is_slash_payload(payload)
+}
+
 /// Pure function: which option to press on this menu WITHOUT an explicit
 /// `--answer`, or `None` to leave it alone and report it.
 ///
@@ -358,19 +381,31 @@ pub async fn settle_menu(pane: &str, payload: &str, policy: &MenuPolicy) -> Menu
     }
 
     // Phase 1: does a menu appear?
-    let deadline = Instant::now() + wait_window(payload, policy);
+    let started = Instant::now();
+    let deadline = started + wait_window(payload, policy);
     let (frame, menu) = loop {
         if let Some(frame) = tmux::capture_pane(pane).await {
             if let Some(menu) = parse_menu(&frame) {
                 break (frame, menu);
             }
             // `/model` that applied straight away: nothing will appear.
-            if is_model_command(payload) && tmux::model_switch_applied(&frame) {
+            if is_model_command(payload)
+                && tmux::model_switch_applied_after_command(&frame, payload)
+            {
                 return MenuOutcome::None;
             }
         }
         if Instant::now() >= deadline {
-            return MenuOutcome::None;
+            // A `/model` queued behind a running turn confirms later.
+            let idle = match tmux::capture_pane(pane).await {
+                Some(f) => tmux::check_lines_for_idle_prompt(&f),
+                None => true,
+            };
+            if !(policy.wait_secs.is_none()
+                && should_extend_watch(payload, idle, started.elapsed()))
+            {
+                return MenuOutcome::None;
+            }
         }
         sleep(POLL).await;
     };
@@ -595,6 +630,22 @@ mod tests {
     }
 
     #[test]
+    fn leading_slash_payload_is_a_slash_command_without_the_flag() {
+        assert!(effective_slash_command(false, "/model opus[1m]"));
+        assert!(effective_slash_command(false, "  /model opus"));
+        assert!(effective_slash_command(true, "plain text"));
+        assert!(!effective_slash_command(false, "plain text"));
+        // And that arms the menu watch with the default policy.
+        let policy = MenuPolicy {
+            answer: None,
+            wait_secs: None,
+            auto_answer: true,
+        };
+        assert!(should_watch("/model opus[1m]", &policy));
+        assert!(!should_watch("hello", &policy));
+    }
+
+    #[test]
     fn watch_runs_for_slash_commands_or_an_explicit_answer() {
         let p = |answer, wait_secs| MenuPolicy {
             answer,
@@ -617,6 +668,19 @@ mod tests {
             DEFAULT_MENU_WAIT_SECS
         );
         assert_eq!(wait_window("/clear", &p(None, Some(7))).as_secs(), 7);
+    }
+
+    #[test]
+    fn queued_model_watch_extends_only_while_busy_and_under_cap() {
+        let s = Duration::from_secs;
+        assert!(should_extend_watch("/model fable", false, s(11)));
+        assert!(!should_extend_watch("/model fable", true, s(11)));
+        assert!(!should_extend_watch(
+            "/model fable",
+            false,
+            s(MODEL_QUEUED_WAIT_SECS)
+        ));
+        assert!(!should_extend_watch("/compact", false, s(11)));
     }
 
     #[test]

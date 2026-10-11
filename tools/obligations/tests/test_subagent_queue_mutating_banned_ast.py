@@ -109,6 +109,8 @@ def _allow(pred, cmd, **ctx):
     # Read-only + recovery still detected (as their own tokens).
     ("session-task queue register q-1", {"register"}),
     ("session-task queue list", {"list"}),
+    ("cd /w && session-task queue links q-1 --remove https://x.example/",
+     {"links"}),
     # NOT a real command: quoted-arg / echo DATA.
     ("echo session-task queue add", set()),
     ("session-task queue add 'must not run session-task queue done'", {"add"}),
@@ -155,6 +157,9 @@ def test_banned_helper_picks_mutating():
     "session-task queue force-start q-1",
     "session-task queue promote q-1",
     "session-task queue prune",
+    "session-task queue set-summary q-1 x",
+    "session-task queue links q-1 --add-link https://git.example/o/r/pulls/1",
+    "cd /w && session-task queue links q-1 --set-chat https://chat.example/r",
 ])
 def test_subagent_mutation_denied(cmd):
     # Bare predicate (scope guard applied separately).
@@ -222,3 +227,11 @@ def test_empty_command_allowed():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_links_is_classified_mutating_for_both_gates():
+    """`queue links` edits item state like set-summary, so it must sit in
+    both the subagent ban and the main-loop drain gate."""
+    assert "links" in obl.SUBAGENT_BANNED_QUEUE_SUBCOMMANDS
+    assert "links" in obl.MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS
+    assert banned_sub("session-task queue links q-1 --add-issue https://x.example/i/1") == "links"
