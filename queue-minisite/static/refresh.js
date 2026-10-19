@@ -72,6 +72,40 @@
   }
 
   // ---------------------------------------------------------------------
+  // Links. linksRow() / linksList() mirror the item_links_row /
+  // item_links_list macros in templates/index.html; link text comes
+  // precomputed from app.py _shape_links.
+  // ---------------------------------------------------------------------
+  function linkAnchor(cls, url, text) {
+    return `<a class="qlink ${cls}" href="${attr(url)}" target="_blank" rel="noopener noreferrer" title="${attr(url)}">${esc(text)}</a>`;
+  }
+  function linksRow(it) {
+    const L = it.links;
+    if (!L || (!L.chat && !(L.issues && L.issues.length))) return '';
+    let html = '<div class="item-links">';
+    if (L.chat) html += linkAnchor('chat-link', L.chat, 'Chat');
+    if (L.issues && L.issues.length) {
+      html += '<span class="links-issues"><span class="links-label">Issues</span>' +
+        L.issues.map((e) => linkAnchor('issue-link', e.url, e.text)).join('') +
+        '</span>';
+    }
+    return html + '</div>';
+  }
+  function linksList(it) {
+    const L = it.links;
+    if (!L || !L.related || !L.related.length) return '';
+    const rows = L.related.map((e) => (
+      '<li>' +
+      (e.kind ? `<span class="link-kind">${esc(e.kind)}</span>` : '') +
+      linkAnchor('related-link', e.url, e.text) +
+      '</li>'
+    )).join('');
+    return '<details class="prompt-toggle links-toggle">' +
+      `<summary class="prompt-summary">Links (${esc(L.related.length)})</summary>` +
+      `<ul class="link-list">${rows}</ul></details>`;
+  }
+
+  // ---------------------------------------------------------------------
   // Relative-age token wrapper. Mirrors the Jinja template's
   // `<span class="rel-age" data-rel-epoch="<unix seconds>">TEXT</span>`
   // so the shared live-age ticker (static/rel-age.js) picks up
@@ -569,8 +603,10 @@
       `<article id="queue-${attr(it.id)}" class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr}${liveLogAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
       scope +
+      linksList(it) +
       prompt +
       subtree +
       '</article>'
@@ -639,8 +675,10 @@
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
       scope +
+      linksList(it) +
       prompt +
       '</article>'
     );
@@ -723,9 +761,11 @@
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
       renderScope(it) +
       exits +
+      linksList(it) +
       renderPrompt(it) +
       '</article>'
     );
@@ -775,9 +815,11 @@
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
       renderScope(it) +
       exits +
+      linksList(it) +
       renderPrompt(it) +
       '</article>'
     );
@@ -803,8 +845,10 @@
       `<article id="queue-${attr(it.id)}" class="item state-other" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
       renderScope(it) +
+      linksList(it) +
       renderPrompt(it) +
       '</article>'
     );
@@ -912,8 +956,10 @@
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       lockedBody +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
       scope +
+      linksList(it) +
       prompt +
       '</article>'
     );
@@ -994,7 +1040,9 @@
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
+      linksRow(it) +
       `<div class="age">${ageBlock}</div>` +
+      linksList(it) +
       prompt +
       '</article>'
     );
@@ -1670,6 +1718,8 @@
   // exercise buildQueueDOM + the merge with synthetic JSON snapshots.
   window.__queueRefresh = {
     relAge,
+    linksRow,
+    linksList,
     applyBuildVersion,
     pageAssetVersion,
     buildQueueDOM,
