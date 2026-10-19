@@ -456,10 +456,10 @@ subagent mutating it races the loop and orphans items. As a subagent you
 return follow-up work in your final value instead), NEVER `done`/`abandon`
 (the loop closes the item after verifying you, per `agent_ack_pending`),
 and NEVER `block`/`unblock`/`wedge`/`unwedge`/`force-start`/`promote`/
-`depend`/`prune`/`set-summary`/`update-scope`/`resurrect`/`pop`/
+`depend`/`prune`/`set-summary`/`links`/`update-scope`/`resurrect`/`pop`/
 `heartbeat`/`lock`/`unlock`/`migrate`. The ONLY queue subcommands you may
 run are read-only (`list`/`show`/`scope`/`groups`/`ready`/`spawn-check`/
-`banner`/`locks`/`status`) and `register` — and `register` ONLY to
+`banner`/`locks`/`status`) and `register` — ONLY to
 re-claim a ROTATED q-id the loop already created (it refuses a q-id the
 queue has no record of, so it is never a back-door to `add`).
 
