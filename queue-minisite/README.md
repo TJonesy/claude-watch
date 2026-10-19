@@ -186,7 +186,8 @@ renders:
 * a folded **Links (N)** disclosure listing the related URLs (PRs/MRs, CI
   runs, Terrakube, dashboards...), each with its `kind` badge.
 
-Every anchor opens in a new tab (`target=_blank rel="noopener
+Bare http(s) URLs in the Prompt body and the `blocker:` line become anchors
+too. Every anchor opens in a new tab (`target=_blank rel="noopener
 noreferrer"`), and clicking or pressing Enter on one never opens the card's
 modal.
 
@@ -195,8 +196,10 @@ absolute http(s) URLs reach an href, whatever wrote the file. Each entry
 also gains a display `text` (label, `owner/repo#N`, or a trimmed URL), so
 the template and `refresh.js` cannot disagree on it. `/api/queue` carries
 `links` on every row; items without links get
-`{"chat": null, "issues": [], "related": []}`. Tests: `test_item_links.py`
-and `static/links.test.js`.
+`{"chat": null, "issues": [], "related": []}`. Linkified text is built by
+splitting the raw string on one regex (identical in `app.py` and
+`refresh.js`) and escaping every piece, so no input reaches the markup
+unescaped. Tests: `test_item_links.py` and `static/links.test.js`.
 
 ## Multitail mode (all running tails at once)
 

@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Tests for per-item links (chat / issues / related).
+"""Tests for per-item links (chat / issues / related) and linkified text.
 
 `session-task queue add/update/links` write an optional `links` field onto a
 queue item. The minisite renders it on every card:
 
 * a Chat pill and an Issues row (``.item-links``), kept in compact density;
-* a folded ``Links (N)`` disclosure for related URLs, with a kind badge.
+* a folded ``Links (N)`` disclosure for related URLs, with a kind badge;
+* bare http(s) URLs in the Prompt body and the blocker line as anchors.
 
 Load-bearing details these tests pin:
 
 * Every anchor is ``target="_blank" rel="noopener noreferrer"``.
 * queue.json is re-validated at render time: a non-http(s) URL in `links`
   never reaches an href, whatever wrote it.
+* Linkified text is escaped piecewise: markup in a description stays text.
 * Items written before `links` existed render exactly as before and get the
   empty shape in ``/api/queue``.
 * static/refresh.js mirrors the template (morphdom replaces the first paint
-  within 5s); static/links.test.js pins the JS half.
+  within 5s). The LINKIFY_CASES below are duplicated verbatim in
+  static/links.test.js, which runs them through the JS linkify().
 
 Run::
 
@@ -39,6 +42,23 @@ CHAT = "https://chat.example/#/room/!abc:example.org"
 ISSUE = "https://git.example/org/foo/issues/12"
 PR = "https://git.example/org/foo/pulls/34"
 A = 'target="_blank" rel="noopener noreferrer"'
+
+# (input, expected linkify() output). Kept free of quote characters so the
+# Jinja escaper (&#34;) and refresh.js esc() (leaves quotes in text) agree
+# byte-for-byte; the quote case is asserted structurally instead.
+LINKIFY_CASES = [
+    ("see https://git.example/o/r/pulls/7.",
+     f'see <a class="qlink autolink" href="https://git.example/o/r/pulls/7" {A}>'
+     'https://git.example/o/r/pulls/7</a>.'),
+    ("<b>x</b> (https://x.example/?a=1&b=2)",
+     f'&lt;b&gt;x&lt;/b&gt; (<a class="qlink autolink" href="https://x.example/?a=1&amp;b=2" {A}>'
+     'https://x.example/?a=1&amp;b=2</a>)'),
+    ("javascript:alert(1) https:///nohost ftp://x.example/",
+     "javascript:alert(1) https:///nohost ftp://x.example/"),
+    ("HTTP://Upper.example/x\nnext line",
+     f'<a class="qlink autolink" href="HTTP://Upper.example/x" {A}>'
+     'HTTP://Upper.example/x</a>\nnext line'),
+]
 
 
 def _item(item_id: str, status: str, **extra) -> dict:
@@ -199,12 +219,44 @@ class ItemLinksTest(unittest.TestCase):
         self.assertEqual(links["issues"][1]["text"], "deploy flake")
         self.assertEqual(links["related"][0]["kind"], "pr")
 
+    # ---------- linkify ----------
+
+    def test_description_is_linkified_and_escaped(self):
+        card = self._card(self._html(), "q-pend")
+        self.assertIn(
+            f'PR: <a class="qlink autolink" href="{PR}" {A}>{PR}</a>. '
+            "&lt;script&gt;x&lt;/script&gt;", card)
+        self.assertNotIn("<script>", card)
+
+    def test_block_reason_is_linkified(self):
+        card = self._card(self._html(), "q-blk")
+        self.assertIn(
+            f'<strong>blocker:</strong> waiting on <a class="qlink autolink" '
+            f'href="{ISSUE}" {A}>{ISSUE}</a>, then merge', card)
+
+    def test_linkify_cases(self):
+        for text, want in LINKIFY_CASES:
+            with self.subTest(text=text):
+                self.assertEqual(str(self.appmod._linkify(text)), want)
+
+    def test_linkify_quote_cannot_break_out_of_href(self):
+        out = str(self.appmod._linkify('https://x.example/"onmouseover="alert(1)'))
+        self.assertEqual(out.count("<a "), 1)
+        self.assertIn('href="https://x.example/"', out)
+        self.assertNotIn('" onmouseover', out)
+        self.assertNotIn("onmouseover=\"alert", out.split("</a>")[0])
+
     # ---------- SPA mirror + click wiring ----------
 
     def test_refresh_js_mirrors_template(self):
         js = (HERE / "static/refresh.js").read_text()
         self.assertEqual(js.count("linksRow(it) +"), 7)
         self.assertEqual(js.count("linksList(it) +"), 7)
+        self.assertIn("${linkify(it.block_reason)}", js)
+        self.assertNotIn("${esc(it.description)}</pre>", js)
+        # Same regex + trailing rule as app.py.
+        self.assertIn(r"""const LINKIFY_RE = /https?:\/\/[^\s<>"'`]+/gi;""", js)
+        self.assertIn(f"const LINKIFY_TRAILING = '{self.appmod._LINKIFY_TRAILING}';", js)
 
     def test_link_clicks_do_not_open_the_card_modal(self):
         live = (HERE / "static/live-log.js").read_text()

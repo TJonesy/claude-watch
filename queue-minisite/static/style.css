@@ -887,6 +887,7 @@ html.header-collapsed .topbar .density-control { display: none; }
   border-radius: 3px;
   padding: 0 4px;
 }
+.prompt-body a.autolink, .description a.autolink { overflow-wrap: anywhere; }
 html.density-compact .item-links { margin-top: 1px; font-size: 0.7rem; }
 
 .chip {

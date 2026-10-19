@@ -72,10 +72,40 @@
   }
 
   // ---------------------------------------------------------------------
-  // Links. linksRow() / linksList() mirror the item_links_row /
-  // item_links_list macros in templates/index.html; link text comes
-  // precomputed from app.py _shape_links.
+  // Links. linkify() mirrors app.py _linkify (same regex, same trailing-
+  // punctuation trim, same validity check): it splits the RAW text and
+  // escapes every piece, so no input reaches the markup unescaped.
+  // linksRow() / linksList() mirror the item_links_row / item_links_list
+  // macros in templates/index.html; link text comes precomputed from
+  // app.py _shape_links.
   // ---------------------------------------------------------------------
+  const LINKIFY_RE = /https?:\/\/[^\s<>"'`]+/gi;
+  const LINKIFY_TRAILING = '.,;:!?)]}';
+  function isSafeHttpUrl(url) {
+    if (!url || url.length > 2048) return false;
+    if (/[\u0000-\u001f\u007f]/.test(url)) return false;
+    const m = /^https?:\/\/([^/?#]*)/i.exec(url);
+    return !!(m && m[1]);
+  }
+  function linkify(text) {
+    if (!text) return '';
+    const s = String(text);
+    let out = '';
+    let pos = 0;
+    LINKIFY_RE.lastIndex = 0;
+    let m;
+    while ((m = LINKIFY_RE.exec(s)) !== null) {
+      let url = m[0];
+      while (url && LINKIFY_TRAILING.indexOf(url[url.length - 1]) !== -1) {
+        url = url.slice(0, -1);
+      }
+      if (!isSafeHttpUrl(url)) continue;
+      out += esc(s.slice(pos, m.index));
+      out += `<a class="qlink autolink" href="${attr(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`;
+      pos = m.index + url.length;
+    }
+    return out + esc(s.slice(pos));
+  }
   function linkAnchor(cls, url, text) {
     return `<a class="qlink ${cls}" href="${attr(url)}" target="_blank" rel="noopener noreferrer" title="${attr(url)}">${esc(text)}</a>`;
   }
@@ -570,7 +600,7 @@
     if (it.description) {
       prompt = '<details class="prompt-toggle">' +
         `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
-        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        `<pre class="prompt-body">${linkify(it.description)}</pre>` +
         '</details>';
     }
 
@@ -650,14 +680,14 @@
 
     let reasonHtml = '';
     if (it.block_reason) {
-      reasonHtml = `<p class="description"><strong>blocker:</strong> ${esc(it.block_reason)}</p>`;
+      reasonHtml = `<p class="description"><strong>blocker:</strong> ${linkify(it.block_reason)}</p>`;
     }
 
     let prompt = '';
     if (it.description) {
       prompt = '<details class="prompt-toggle">' +
         `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
-        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        `<pre class="prompt-body">${linkify(it.description)}</pre>` +
         '</details>';
     }
 
@@ -697,7 +727,7 @@
     if (!it.description) return '';
     return '<details class="prompt-toggle">' +
       `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
-      `<pre class="prompt-body">${esc(it.description)}</pre>` +
+      `<pre class="prompt-body">${linkify(it.description)}</pre>` +
       '</details>';
   }
 
@@ -931,7 +961,7 @@
     if (it.description) {
       prompt = '<details class="prompt-toggle">' +
         `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
-        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        `<pre class="prompt-body">${linkify(it.description)}</pre>` +
         '</details>';
     }
 
@@ -1031,7 +1061,7 @@
     if (it.description) {
       prompt = '<details class="prompt-toggle">' +
         `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
-        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        `<pre class="prompt-body">${linkify(it.description)}</pre>` +
         '</details>';
     }
 
@@ -1718,6 +1748,7 @@
   // exercise buildQueueDOM + the merge with synthetic JSON snapshots.
   window.__queueRefresh = {
     relAge,
+    linkify,
     linksRow,
     linksList,
     applyBuildVersion,

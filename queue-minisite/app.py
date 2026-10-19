@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from markupsafe import Markup, escape
 
 # Shared loader / dedup logic — see claude_agents.py alongside this file.
 from claude_agents import agent_records_by_queue_id as _agent_records_by_qid
@@ -442,7 +443,7 @@ app = Flask(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Item links.
+# Item links + linkified free text.
 #
 # `links` is the optional per-item field `session-task queue add/update/links`
 # writes: {chat, issues: [{url,label}], related: [{url,label,kind}]}.
@@ -450,8 +451,16 @@ app = Flask(__name__)
 # only absolute http(s) URLs survive, everything else is dropped. Each entry
 # gains a server-computed `text` so the template and static/refresh.js render
 # identical link text without duplicating the shortening rules.
+#
+# `_linkify` turns bare http(s) URLs in description / block_reason into
+# anchors. It splits the RAW text on _LINKIFY_RE and escapes every piece
+# (the plain runs and the URL, separately for text and href) — no raw input
+# ever reaches the markup. linkify() in static/refresh.js MUST use the same
+# regex + trailing-punctuation rule so the morphdom merge stays a no-op.
 # ---------------------------------------------------------------------------
 
+_LINKIFY_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+_LINKIFY_TRAILING = ".,;:!?)]}"
 _LINK_TEXT_MAX = 60
 _ISSUE_PR_PATH_RE = re.compile(
     r"^/([^/]+)/([^/]+)(?:/-)?/(issues|pulls?|merge_requests)/(\d+)/?$"
@@ -520,6 +529,30 @@ def _shape_links(raw: Any) -> dict[str, Any]:
                                  and kind.strip() else None)
             out[key].append(entry)
     return out
+
+
+def _linkify(text: Any) -> Markup:
+    if not text:
+        return Markup("")
+    text = str(text)
+    parts: list[str] = []
+    pos = 0
+    for m in _LINKIFY_RE.finditer(text):
+        url = m.group(0).rstrip(_LINKIFY_TRAILING)
+        if not _safe_http_url(url):
+            continue
+        start = m.start()
+        parts.append(str(escape(text[pos:start])))
+        parts.append(
+            f'<a class="qlink autolink" href="{escape(url)}" target="_blank" '
+            f'rel="noopener noreferrer">{escape(url)}</a>'
+        )
+        pos = start + len(url)
+    parts.append(str(escape(text[pos:])))
+    return Markup("".join(parts))
+
+
+app.jinja_env.filters["linkify"] = _linkify
 
 
 # ---------------------------------------------------------------------------

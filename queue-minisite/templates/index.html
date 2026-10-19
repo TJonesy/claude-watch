@@ -490,7 +490,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
           {# ---------- NESTED SUBAGENT TREE ----------
@@ -584,7 +584,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -652,7 +652,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -765,7 +765,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -821,7 +821,7 @@
             {{ model_tag(it) }}
           </header>
           <p class="summary">{{ it.summary }}</p>
-          {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason }}</p>{% endif %}
+          {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason|linkify }}</p>{% endif %}
           {{ item_links_row(it) }}
           <div class="age">
             <span
@@ -838,7 +838,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -898,7 +898,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -949,7 +949,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
@@ -1008,7 +1008,7 @@
           {% if it.description %}
             <details class="prompt-toggle">
               <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
+              <pre class="prompt-body">{{ it.description|linkify }}</pre>
             </details>
           {% endif %}
         </article>
